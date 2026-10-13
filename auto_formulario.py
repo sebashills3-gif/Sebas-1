@@ -770,7 +770,7 @@ def responder_pregunta(pregunta: Locator, n: int, backend: str) -> None:
         print(f"     -> {resumen_sel}")
 
 
-def procesar_pagina(page: Page, backend: str) -> None:
+def procesar_pagina(page: Page, backend: str, max_preguntas: int | None = None) -> None:
     global SELECTOR_PREGUNTA
     preguntas = page.locator(SELECTOR_PREGUNTA)
     if preguntas.count() == 0:
@@ -785,7 +785,11 @@ def procesar_pagina(page: Page, backend: str) -> None:
         print(f"No se encontró ninguna pregunta visible con el selector '{SELECTOR_PREGUNTA}'.")
         print("Ajusta SELECTOR_PREGUNTA al inicio del script.")
         return
-    print(f"\nSe encontraron {len(visibles)} preguntas.\n")
+    print(f"\nSe encontraron {len(visibles)} preguntas.")
+    if max_preguntas and len(visibles) > max_preguntas:
+        print(f"(Modo prueba: solo se responderán las primeras {max_preguntas}.)")
+        visibles = visibles[:max_preguntas]
+    print()
 
     for n, i in enumerate(visibles, 1):
         try:
@@ -1021,6 +1025,8 @@ def main() -> None:
     ap.add_argument("--model", help="un solo modelo para TODAS las preguntas (desactiva el enrutamiento)")
     ap.add_argument("--model-facil", help=f"modelo para preguntas fáciles (activa el enrutamiento si difiere del difícil; por defecto {MODELO_FACIL})")
     ap.add_argument("--model-dificil", help=f"modelo para preguntas difíciles (por defecto {MODELO_DIFICIL})")
+    ap.add_argument("--max-preguntas", type=int, metavar="N",
+                    help="responde solo las primeras N preguntas de la página (útil para probar gastando poco)")
     ap.add_argument("--demo-formatos", action="store_true",
                     help="formulario local con desplegables V/F, fórmulas, editor enriquecido y gráficas")
     ap.add_argument("--demo-material", action="store_true",
@@ -1072,7 +1078,7 @@ def main() -> None:
 
         if not args.auto_start:
             esperar_activador()
-        procesar_pagina(page, backend)
+        procesar_pagina(page, backend, args.max_preguntas)
         if args.demo_material:
             evaluar_demo_material(page)
         if args.demo_formatos:
