@@ -46,19 +46,23 @@ from playwright.sync_api import Locator, Page, sync_playwright
 # CONFIGURACIÓN — PERSONALIZA ESTOS SELECTORES SEGÚN EL SITIO REAL
 # ════════════════════════════════════════════════════════════════════════════
 
+# Valores por defecto para CANVAS CLÁSICO (escritos de memoria, sin verificar contra tu instancia:
+# si no encuentra preguntas, inspecciona el HTML y ajústalos).
 # Contenedor de CADA pregunta (el bloque que agrupa enunciado + campos/opciones).
 # Ej.: ".pregunta", ".question", "div.que", "fieldset", "[data-qa='question']"
-SELECTOR_PREGUNTA = ".pregunta"
+SELECTOR_PREGUNTA = "div.display_question"
+# Si el anterior no encuentra nada, se prueban estos en orden (solo bloques visibles).
+SELECTORES_PREGUNTA_ALTERNOS = ["div.question", ".question_holder", "fieldset"]
 
 # Elemento (dentro del contenedor) con el texto del enunciado.
 # Ej.: ".enunciado", ".qtext", "legend", "h3". Si no existe, se usa el texto
 # completo del contenedor menos el de las opciones.
-SELECTOR_ENUNCIADO = ".enunciado"
+SELECTOR_ENUNCIADO = ".question_text"
 
 # Contenedor de CADA opción (radio/checkbox + su texto). Es opcional: si no
 # coincide nada, se usan directamente los <input> y se deduce su etiqueta.
 # Ej.: ".opcion", ".answer label", "li.choice"
-SELECTOR_OPCION = ".opcion"
+SELECTOR_OPCION = ".answer"
 
 # Campos de las posibles respuestas (normalmente no hace falta cambiarlos).
 # Editores de texto enriquecido (p. ej. TinyMCE en Canvas) viven en un <iframe> o en un [contenteditable].
@@ -70,7 +74,10 @@ SELECTOR_RADIO = "input[type='radio'], [role='radio']"
 SELECTOR_CHECKBOX = "input[type='checkbox'], [role='checkbox']"
 
 # Botón de enviar. Déjalo en None para NO enviar (recomendado: revisa tú).
-SELECTOR_BOTON_ENVIAR = None  # Ej.: "button[type='submit']"
+SELECTOR_BOTON_ENVIAR = None  # Ej.: "#submit_quiz_button" (Canvas clásico)
+
+# Selectores de los formularios de demostración locales (--demo*). No hace falta tocarlos.
+PERFIL_DEMO = {"SELECTOR_PREGUNTA": ".pregunta", "SELECTOR_ENUNCIADO": ".enunciado", "SELECTOR_OPCION": ".opcion"}
 
 # Por defecto se usa Sonnet para TODO (más seguro para acertar). Enrutamiento opcional: si
 # MODELO_FACIL != MODELO_DIFICIL (ej. --model-facil claude-haiku-5-5), una consulta barata
@@ -341,6 +348,13 @@ def _nota_imagenes(imagenes: list[bytes] | None) -> str:
             "([IMAGEN n] en el texto): úsalas, pueden contener datos, gráficas o fórmulas.)\n")
 
 
+_DATOS = (
+    "Empieza con una línea 'Datos:' donde replantees todos los datos que vas a usar (valores numéricos, funciones "
+    "y cualquier dato leído de las imágenes) y marca como 'Supuesto:' lo que no venga en el enunciado y hayas "
+    "tenido que asumir. Después desarrolla el procedimiento paso a paso de forma ordenada y compacta y termina "
+    "con una línea 'Respuesta final: ...'."
+)
+
 _REGLAS_ABIERTA = (
     "Si tiene incisos (a, b, c…), responde cada uno etiquetado con su letra, p. ej. 'a) ...'. "
     "Escribe las fórmulas en texto plano (ej. sqrt(x), x^2, a/b, derivada parcial dU/dX_A), sin markdown ni LaTeX. "
@@ -357,27 +371,22 @@ def _respuesta_final(texto: str) -> str:
 
 def pedir_abierta(enunciado: str, backend: str, modelo: str, dificil: bool = False,
                   imagenes: list[bytes] | None = None, corta: bool = False) -> str:
+    """Devuelve el texto completo de Claude. Con corta=True el desarrollo incluye una línea final
+    'Respuesta final: ...' de la que el llamador extrae solo el valor para el campo de una línea."""
     base = f"{enunciado}{_nota_imagenes(imagenes)}"
-    if corta:  # el campo es de una sola línea: se razona, pero solo se escribe el resultado final
+    if corta:
         prompt = (
-            f"Resuelve:\n\n{base}\n\n"
-            "Razona paso a paso de forma compacta y termina con una última línea 'Respuesta final: ...' que "
-            "contenga SOLO el valor o la respuesta final (un número, expresión corta o palabra), sin explicación. "
+            f"Resuelve:\n\n{base}\n\n{_DATOS} La línea 'Respuesta final:' debe contener SOLO el valor o la "
+            "respuesta final (un número, expresión corta o palabra), sin explicación. "
             "Texto plano, sin markdown ni LaTeX."
         )
-        return _respuesta_final(consultar_claude(prompt, backend, modelo, max_tokens=2048, imagenes=imagenes))
-    if dificil:
-        prompt = (
-            f"Resuelve este ejercicio:\n\n{base}\n\n"
-            "Desarrolla el procedimiento paso a paso de forma ordenada y compacta (fórmulas y cálculos "
-            f"clave, sin explicaciones largas) y termina con una línea 'Respuesta final: ...'. {_REGLAS_ABIERTA}"
-        )
+    elif dificil:
+        prompt = f"Resuelve este ejercicio:\n\n{base}\n\n{_DATOS} {_REGLAS_ABIERTA}"
     else:
         prompt = (
             f"Responde a:\n\n{base}\n\n"
             "Si es una pregunta de datos, definiciones o conceptos, responde de forma concisa y directa "
-            "(máximo 2-3 frases). Si pide cálculos, un desarrollo o una demostración, resuélvelo paso a paso "
-            f"de forma ordenada y compacta y termina con una línea 'Respuesta final: ...'. {_REGLAS_ABIERTA}"
+            f"(máximo 2-3 frases). Si pide cálculos, un desarrollo o una demostración: {_DATOS} {_REGLAS_ABIERTA}"
         )
     return consultar_claude(prompt, backend, modelo, max_tokens=2048, imagenes=imagenes)
 
@@ -680,6 +689,15 @@ def marcar(campo: Locator) -> None:
         campo.check(force=True, timeout=TIMEOUT_ACCION_MS)
 
 
+def _mostrar_bloque(titulo: str, texto: str, max_lineas: int = 40) -> None:
+    lineas = texto.strip().splitlines()
+    print(f"     {titulo}:")
+    for l in lineas[:max_lineas]:
+        print(f"       | {l}")
+    if len(lineas) > max_lineas:
+        print(f"       | ... ({len(lineas) - max_lineas} líneas más)")
+
+
 def responder_pregunta(pregunta: Locator, n: int, backend: str) -> None:
     tipo = clasificar(pregunta)
     if tipo is None:
@@ -707,9 +725,17 @@ def responder_pregunta(pregunta: Locator, n: int, backend: str) -> None:
     print(f"[{n}] ({tipo.upper()} | {etiqueta} | {modelo}{extra}) {resumen}")
 
     if tipo == "abierta":
-        respuesta = pedir_abierta(enunciado, backend, modelo, dificil, imagenes, corta=es_campo_corto(pregunta))
+        corta = es_campo_corto(pregunta)
+        completo = pedir_abierta(enunciado, backend, modelo, dificil, imagenes, corta=corta)
+        respuesta = _respuesta_final(completo) if corta else completo
         escribir_abierta(pregunta, respuesta)
-        print(f"     -> {respuesta[:90]}")
+        if corta:  # el campo solo recibe el resultado; el desarrollo (con los datos) se ve aquí para revisarlo
+            print(f"     -> escrito en el campo: {respuesta}")
+            _mostrar_bloque("Datos y procedimiento (solo en pantalla)", completo)
+        elif "\n" in respuesta or len(respuesta) > 90:
+            _mostrar_bloque("Respuesta escrita", respuesta)
+        else:
+            print(f"     -> {respuesta}")
 
     elif tipo == "unica":
         idx = pedir_unica(enunciado, textos, backend, modelo, imagenes)
@@ -745,19 +771,27 @@ def responder_pregunta(pregunta: Locator, n: int, backend: str) -> None:
 
 
 def procesar_pagina(page: Page, backend: str) -> None:
+    global SELECTOR_PREGUNTA
     preguntas = page.locator(SELECTOR_PREGUNTA)
-    total = preguntas.count()
-    if total == 0:
-        print(f"No se encontró ninguna pregunta con el selector '{SELECTOR_PREGUNTA}'.")
+    if preguntas.count() == 0:
+        for alterno in SELECTORES_PREGUNTA_ALTERNOS:
+            if page.locator(alterno).count() > 0:
+                print(f"AVISO: '{SELECTOR_PREGUNTA}' no encontró nada; se usará '{alterno}'.")
+                SELECTOR_PREGUNTA = alterno
+                preguntas = page.locator(alterno)
+                break
+    visibles = [i for i in range(preguntas.count()) if preguntas.nth(i).is_visible()]  # omite plantillas ocultas
+    if not visibles:
+        print(f"No se encontró ninguna pregunta visible con el selector '{SELECTOR_PREGUNTA}'.")
         print("Ajusta SELECTOR_PREGUNTA al inicio del script.")
         return
-    print(f"\nSe encontraron {total} preguntas.\n")
+    print(f"\nSe encontraron {len(visibles)} preguntas.\n")
 
-    for i in range(total):
+    for n, i in enumerate(visibles, 1):
         try:
-            responder_pregunta(preguntas.nth(i), i + 1, backend)
+            responder_pregunta(preguntas.nth(i), n, backend)
         except Exception as e:  # un fallo en una pregunta no detiene las demás
-            print(f"[{i + 1}] ERROR: {type(e).__name__}: {str(e)[:150]}")
+            print(f"[{n}] ERROR: {type(e).__name__}: {str(e)[:150]}")
 
     if SELECTOR_BOTON_ENVIAR:
         try:
@@ -979,6 +1013,7 @@ def elegir_backend(pedido: str) -> str:
 
 def main() -> None:
     global MODELO_FACIL, MODELO_DIFICIL, ENRUTAR, CONTEXTO_MATERIAL
+    global SELECTOR_PREGUNTA, SELECTOR_ENUNCIADO, SELECTOR_OPCION
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--url", help="URL inicial a abrir (opcional)")
     ap.add_argument("--backend", choices=["auto", "api", "cli", "mock"], default="auto")
@@ -1002,6 +1037,10 @@ def main() -> None:
         MODELO_FACIL = args.model_facil
     if args.model_dificil:
         MODELO_DIFICIL = args.model_dificil
+    if args.demo or args.demo_material or args.demo_formatos:  # las demos locales usan sus propios selectores
+        SELECTOR_PREGUNTA = PERFIL_DEMO["SELECTOR_PREGUNTA"]
+        SELECTOR_ENUNCIADO = PERFIL_DEMO["SELECTOR_ENUNCIADO"]
+        SELECTOR_OPCION = PERFIL_DEMO["SELECTOR_OPCION"]
     ENRUTAR = MODELO_FACIL != MODELO_DIFICIL
     backend = elegir_backend(args.backend)
     if args.demo_formatos:
