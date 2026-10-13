@@ -559,14 +559,36 @@ def _limpiar(t: str) -> str:
     return re.sub(r"\s+", " ", t or "").strip()
 
 
+# Canvas (y otros) incluyen un control para "marcar/flaggear" la pregunta (role=checkbox o <a>/<input>) que NO es
+# una opción de respuesta. Se excluye por clase o por su texto accesible.
+_JS_ES_BANDERA = r"""el => !!el.closest('.flag_question, .question_flag, [class*="flag" i]') ||
+  /pregunta de la marca|marcar (la )?pregunta|flag question|marcar para revisar|pregunta marcada/i.test(
+    (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.innerText || ''))"""
+
+
+def campos_respuesta(pregunta: Locator, selector: str) -> list[Locator]:
+    """Radios/checkboxes de la pregunta, sin el control de marcar pregunta."""
+    campos = pregunta.locator(selector)
+    out = []
+    for i in range(campos.count()):
+        c = campos.nth(i)
+        try:
+            if c.evaluate(_JS_ES_BANDERA):
+                continue
+        except Exception:
+            pass
+        out.append(c)
+    return out
+
+
 def clasificar(pregunta: Locator) -> str | None:
     """Devuelve 'desplegable', 'multiple', 'unica', 'abierta' o None si no se reconoce."""
     # El orden importa: listas, checkbox y radio tienen prioridad sobre texto libre.
     if pregunta.locator(SELECTOR_DESPLEGABLE).count() > 0:
         return "desplegable"
-    if pregunta.locator(SELECTOR_CHECKBOX).count() > 0:
+    if campos_respuesta(pregunta, SELECTOR_CHECKBOX):
         return "multiple"
-    if pregunta.locator(SELECTOR_RADIO).count() > 0:
+    if campos_respuesta(pregunta, SELECTOR_RADIO):
         return "unica"
     if pregunta.locator(SELECTOR_ABIERTA).count() > 0:
         return "abierta"
@@ -658,10 +680,9 @@ def escribir_abierta(pregunta: Locator, texto: str) -> None:
 
 def extraer_opciones(pregunta: Locator, selector_campo: str) -> tuple[list[str], list[Locator]]:
     """Devuelve (textos, campos) de las opciones, en el mismo orden."""
-    campos = pregunta.locator(selector_campo)
     textos, locs = [], []
-    for i in range(campos.count()):
-        campo = campos.nth(i)
+    for campo in campos_respuesta(pregunta, selector_campo):
+        i = len(locs)
         try:
             texto = _limpiar(campo.evaluate(_JS_ETIQUETA))
         except Exception:
