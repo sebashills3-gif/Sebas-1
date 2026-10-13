@@ -469,7 +469,11 @@ def main() -> None:
             browser = p.chromium.launch(headless=args.headless, executable_path=ruta)
         page = browser.new_page()
         if url:
-            page.goto(url)
+            try:
+                page.goto(url)
+            except Exception as e:  # URL mal escrita o sin conexión: no abortar, navegas tú a mano
+                print(f"AVISO: no se pudo abrir '{url}' ({str(e).splitlines()[0][:80]}).")
+                print("Navega manualmente en el navegador a la página correcta.")
 
         if not args.auto_start:
             esperar_activador()
