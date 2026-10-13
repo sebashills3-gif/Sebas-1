@@ -29,6 +29,7 @@ Usa esta herramienta solo en formularios/evaluaciones donde esté permitido
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -37,6 +38,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 from playwright.sync_api import Locator, Page, sync_playwright
 
@@ -59,7 +61,11 @@ SELECTOR_ENUNCIADO = ".enunciado"
 SELECTOR_OPCION = ".opcion"
 
 # Campos de las posibles respuestas (normalmente no hace falta cambiarlos).
-SELECTOR_ABIERTA = "textarea, input[type='text'], input:not([type])"
+# Editores de texto enriquecido (p. ej. TinyMCE en Canvas) viven en un <iframe> o en un [contenteditable].
+SELECTOR_EDITOR_IFRAME = "iframe[id$='_ifr'], iframe.tox-edit-area__iframe"
+SELECTOR_ABIERTA = ("textarea, input[type='text'], input[type='number'], input:not([type]), "
+                    "[contenteditable='true'], " + SELECTOR_EDITOR_IFRAME)
+SELECTOR_DESPLEGABLE = "select"  # listas desplegables (p. ej. Verdadero/Falso por fila)
 SELECTOR_RADIO = "input[type='radio'], [role='radio']"
 SELECTOR_CHECKBOX = "input[type='checkbox'], [role='checkbox']"
 
@@ -216,11 +222,19 @@ def imprimir_consumo() -> None:
     print("-" * 60)
 
 
+def _bloques_imagen(imagenes: list[bytes]) -> list[dict]:
+    return [{"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": base64.b64encode(img).decode()}} for img in imagenes]
+
+
 def consultar_claude(prompt: str, backend: str = "api", modelo: str | None = None,
-                     usar_material: bool = True, max_tokens: int = 1024) -> str:
-    """Envía `prompt` a Claude y devuelve el texto de la respuesta."""
+                     usar_material: bool = True, max_tokens: int = 1024,
+                     imagenes: list[bytes] | None = None) -> str:
+    """Envía `prompt` (y opcionalmente imágenes PNG) a Claude y devuelve el texto de la respuesta."""
     modelo = modelo or MODELO_FACIL
     system = construir_system() if usar_material else SYSTEM_PROMPT
+    imagenes = imagenes or []
+
     if backend == "api":
         import anthropic  # import perezoso: solo si se usa
 
@@ -229,30 +243,30 @@ def consultar_claude(prompt: str, backend: str = "api", modelo: str | None = Non
             model=modelo,
             max_tokens=max_tokens,
             system=system,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": _bloques_imagen(imagenes) + [{"type": "text", "text": prompt}]}],
         )
         return "".join(b.text for b in resp.content if b.type == "text").strip()
 
     if backend == "cli":
         # Requiere tener instalado y autenticado el CLI de Claude Code.
-        # El prompt va por stdin (sin límite de longitud del comando, importante
-        # si usas --material) y se desactivan las herramientas del agente.
         # El material va como system prompt (archivo): así Claude puede reutilizarlo desde su caché
         # entre preguntas (≈20x menos consumo que mandarlo dentro de cada pregunta).
-        cmd = ["claude", "-p", "--tools", "", "--model", modelo, "--output-format", "json",
+        cmd = ["claude", "-p", "--tools", "", "--model", modelo,
                "--append-system-prompt-file", _archivo_system(system)]
+        if imagenes:  # con imágenes la entrada es JSON por stdin (stream-json)
+            cmd += ["--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+            entrada = json.dumps({"type": "user", "message": {"role": "user",
+                                  "content": _bloques_imagen(imagenes) + [{"type": "text", "text": prompt}]}}) + "\n"
+        else:
+            cmd += ["--output-format", "json"]
+            entrada = prompt
         error = ""
         for intento in (1, 2):  # un reintento si el CLI se cuelga o devuelve vacío
             try:
-                res = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                res = subprocess.run(cmd, input=entrada, capture_output=True, text=True,
                                      encoding="utf-8", timeout=240)
                 if res.returncode == 0 and res.stdout.strip():
-                    try:
-                        datos = json.loads(res.stdout)
-                        _registrar_consumo(datos.get("usage") or {}, datos.get("total_cost_usd"))
-                        texto = (datos.get("result") or "").strip()
-                    except json.JSONDecodeError:
-                        texto = res.stdout.strip()
+                    texto = _leer_resultado_cli(res.stdout, stream=bool(imagenes))
                     if texto:
                         return texto
                 error = res.stderr.strip() or "respuesta vacía"
@@ -266,6 +280,8 @@ def consultar_claude(prompt: str, backend: str = "api", modelo: str | None = Non
         # Respuestas falsas SOLO para probar el flujo sin gastar API.
         if "SOLO la palabra FACIL o DIFICIL" in prompt:
             return "FACIL"
+        if "una letra por hueco" in prompt:
+            return '["B", "B", "A", "B", "B", "B", "A", "B"]'
         if "arreglo JSON" in prompt:
             return '["A", "C"]'
         if "SOLO la letra" in prompt:
@@ -273,6 +289,28 @@ def consultar_claude(prompt: str, backend: str = "api", modelo: str | None = Non
         return "Respuesta de prueba (mock)."
 
     raise ValueError(f"backend desconocido: {backend}")
+
+
+def _leer_resultado_cli(stdout: str, stream: bool) -> str:
+    """Extrae el texto final (y registra consumo) de la salida JSON / stream-json del CLI."""
+    datos = None
+    if stream:
+        for linea in stdout.splitlines():
+            try:
+                ev = json.loads(linea)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "result":
+                datos = ev
+    else:
+        try:
+            datos = json.loads(stdout)
+        except json.JSONDecodeError:
+            return stdout.strip()
+    if not datos:
+        return ""
+    _registrar_consumo(datos.get("usage") or {}, datos.get("total_cost_usd"))
+    return (datos.get("result") or "").strip()
 
 
 def clasificar_dificultad(enunciado: str, opciones: list[str], backend: str) -> bool:
@@ -296,23 +334,52 @@ def clasificar_dificultad(enunciado: str, opciones: list[str], backend: str) -> 
         return True
 
 
-def pedir_abierta(enunciado: str, backend: str, modelo: str, dificil: bool = False) -> str:
-    if dificil:
+def _nota_imagenes(imagenes: list[bytes] | None) -> str:
+    if not imagenes:
+        return ""
+    return (f"\n(Se adjuntan {len(imagenes)} imagen(es) de la pregunta, en orden de aparición "
+            "([IMAGEN n] en el texto): úsalas, pueden contener datos, gráficas o fórmulas.)\n")
+
+
+_REGLAS_ABIERTA = (
+    "Si tiene incisos (a, b, c…), responde cada uno etiquetado con su letra, p. ej. 'a) ...'. "
+    "Escribe las fórmulas en texto plano (ej. sqrt(x), x^2, a/b, derivada parcial dU/dX_A), sin markdown ni LaTeX. "
+    "Devuelve SOLO la respuesta."
+)
+
+
+def _respuesta_final(texto: str) -> str:
+    """Toma lo que sigue a la última 'Respuesta final:' (o la última línea) para campos de una línea."""
+    m = re.findall(r"respuesta final\s*:\s*(.+)", texto, re.I)
+    res = m[-1] if m else (texto.strip().splitlines() or [""])[-1]
+    return res.strip().strip("*").strip().rstrip(".")
+
+
+def pedir_abierta(enunciado: str, backend: str, modelo: str, dificil: bool = False,
+                  imagenes: list[bytes] | None = None, corta: bool = False) -> str:
+    base = f"{enunciado}{_nota_imagenes(imagenes)}"
+    if corta:  # el campo es de una sola línea: se razona, pero solo se escribe el resultado final
         prompt = (
-            f"Resuelve este ejercicio:\n\n{enunciado}\n\n"
-            "Desarrolla el procedimiento paso a paso de forma ordenada y compacta (fórmulas y cálculos "
-            "clave, sin explicaciones largas) y termina con una línea 'Respuesta final: ...'. "
+            f"Resuelve:\n\n{base}\n\n"
+            "Razona paso a paso de forma compacta y termina con una última línea 'Respuesta final: ...' que "
+            "contenga SOLO el valor o la respuesta final (un número, expresión corta o palabra), sin explicación. "
             "Texto plano, sin markdown ni LaTeX."
         )
-        return consultar_claude(prompt, backend, modelo, max_tokens=2048)
-    prompt = (
-        f"Responde a:\n\n{enunciado}\n\n"
-        "Si es una pregunta de datos, definiciones o conceptos, responde de forma concisa y directa "
-        "(máximo 2-3 frases). Si pide cálculos, un desarrollo o una demostración, resuélvelo paso a paso "
-        "de forma ordenada y compacta (fórmulas y cálculos clave) y termina con una línea "
-        "'Respuesta final: ...'. Texto plano, sin markdown ni LaTeX. Devuelve SOLO la respuesta."
-    )
-    return consultar_claude(prompt, backend, modelo, max_tokens=2048)
+        return _respuesta_final(consultar_claude(prompt, backend, modelo, max_tokens=2048, imagenes=imagenes))
+    if dificil:
+        prompt = (
+            f"Resuelve este ejercicio:\n\n{base}\n\n"
+            "Desarrolla el procedimiento paso a paso de forma ordenada y compacta (fórmulas y cálculos "
+            f"clave, sin explicaciones largas) y termina con una línea 'Respuesta final: ...'. {_REGLAS_ABIERTA}"
+        )
+    else:
+        prompt = (
+            f"Responde a:\n\n{base}\n\n"
+            "Si es una pregunta de datos, definiciones o conceptos, responde de forma concisa y directa "
+            "(máximo 2-3 frases). Si pide cálculos, un desarrollo o una demostración, resuélvelo paso a paso "
+            f"de forma ordenada y compacta y termina con una línea 'Respuesta final: ...'. {_REGLAS_ABIERTA}"
+        )
+    return consultar_claude(prompt, backend, modelo, max_tokens=2048, imagenes=imagenes)
 
 
 def _letra(i: int) -> str:
@@ -340,46 +407,143 @@ def _letras_a_indices(texto: str, opciones: list[str]) -> list[int]:
     return [i for i, op in enumerate(opciones) if op.strip().lower() in partes]
 
 
-def pedir_unica(enunciado: str, opciones: list[str], backend: str, modelo: str) -> int | None:
+def pedir_unica(enunciado: str, opciones: list[str], backend: str, modelo: str,
+                imagenes: list[bytes] | None = None) -> int | None:
     """Devuelve el índice (0-based) de la opción elegida, o None si no se pudo."""
     prompt = (
-        f"Pregunta:\n{enunciado}\n\nOpciones:\n{_lista_letras(opciones)}\n\n"
+        f"Pregunta:\n{enunciado}\n{_nota_imagenes(imagenes)}\nOpciones:\n{_lista_letras(opciones)}\n\n"
         "Elige la ÚNICA opción correcta. Devuelve SOLO la letra de la opción "
         "(por ejemplo: B). Nada más."
     )
-    idx = _letras_a_indices(consultar_claude(prompt, backend, modelo), opciones)
+    idx = _letras_a_indices(consultar_claude(prompt, backend, modelo, imagenes=imagenes), opciones)
     return idx[0] if idx else None
 
 
-def pedir_multiple(enunciado: str, opciones: list[str], backend: str, modelo: str) -> list[int]:
+def pedir_multiple(enunciado: str, opciones: list[str], backend: str, modelo: str,
+                   imagenes: list[bytes] | None = None) -> list[int]:
     """Devuelve la lista de índices (0-based) de las opciones correctas."""
     prompt = (
-        f"Pregunta:\n{enunciado}\n\nOpciones:\n{_lista_letras(opciones)}\n\n"
+        f"Pregunta:\n{enunciado}\n{_nota_imagenes(imagenes)}\nOpciones:\n{_lista_letras(opciones)}\n\n"
         "Selecciona TODAS las opciones correctas (una o más). Devuelve SOLO un "
         'arreglo JSON con las letras, por ejemplo: ["A", "C"]. Nada más.'
     )
-    return _letras_a_indices(consultar_claude(prompt, backend, modelo), opciones)
+    return _letras_a_indices(consultar_claude(prompt, backend, modelo, imagenes=imagenes), opciones)
+
+
+def _letras_en_orden(texto: str, n: int) -> list[str]:
+    """Letras de la respuesta en el orden en que aparecen (se pueden repetir), máximo n."""
+    letras: list[str] = []
+    try:
+        m = re.search(r"\[.*\]", texto, re.S)
+        letras = [str(x).strip().upper()[:1] for x in (json.loads(m.group()) if m else [])]
+    except (json.JSONDecodeError, TypeError):
+        letras = []
+    if not letras:
+        letras = [l.upper() for l in re.findall(r"(?<![A-Za-zÁ-ú0-9])([A-Za-z])(?![A-Za-zÁ-ú0-9])", texto)]
+    return letras[:n]
+
+
+def pedir_desplegables(enunciado: str, huecos: list[dict], backend: str, modelo: str,
+                       imagenes: list[bytes] | None = None) -> list[int | None]:
+    """Un índice de opción (0-based, dentro de las opciones reales de cada hueco) por cada <select>."""
+    listas = [h["textos"] for h in huecos]
+    iguales = all(l == listas[0] for l in listas)
+    if iguales:
+        opciones = f"Opciones (iguales en todos los huecos):\n{_lista_letras(listas[0])}"
+    else:
+        opciones = "\n\n".join(f"Opciones del hueco [[{i}]]:\n{_lista_letras(l)}" for i, l in enumerate(listas, 1))
+    contextos = "\n".join(f"[[{i}]] corresponde a: {h['contexto']}" for i, h in enumerate(huecos, 1) if h["contexto"])
+    prompt = (
+        "Pregunta con listas desplegables. Cada hueco aparece como [[1]], [[2]]… junto al texto al que se refiere:\n\n"
+        f"{enunciado}\n{_nota_imagenes(imagenes)}\n"
+        f"{contextos + chr(10) if contextos else ''}\n{opciones}\n\n"
+        f"Elige la opción correcta de CADA uno de los {len(huecos)} huecos. Devuelve SOLO un arreglo JSON con "
+        'una letra por hueco, en orden, por ejemplo: ["B", "A", "A"]. Nada más.'
+    )
+    letras = _letras_en_orden(consultar_claude(prompt, backend, modelo, imagenes=imagenes), len(huecos))
+    out: list[int | None] = []
+    for i, h in enumerate(huecos):
+        k = ord(letras[i]) - 65 if i < len(letras) else -1
+        out.append(k if 0 <= k < len(h["textos"]) else None)
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # c) DETECTAR EL TIPO DE PREGUNTA E INTERACTUAR CON LA PÁGINA
 # ════════════════════════════════════════════════════════════════════════════
-_JS_ETIQUETA = """
-el => {
-  // Texto asociado a un radio/checkbox: <label for>, label padre, aria-label,
-  // o el texto del contenedor más cercano que no incluya otros inputs.
-  if (el.labels && el.labels.length) return el.labels[0].innerText;
-  const lab = el.closest('label'); if (lab) return lab.innerText;
-  const aria = el.getAttribute('aria-label'); if (aria) return aria;
-  let n = el;
-  for (let i = 0; i < 3 && n.parentElement; i++) {
-    n = n.parentElement;
-    const inputs = n.querySelectorAll('input[type=radio],input[type=checkbox],[role=radio],[role=checkbox]');
-    if (inputs.length === 1 && n.innerText.trim()) return n.innerText;
+# Función JS que lee el texto de un bloque de forma fiable:
+#  - fórmulas (KaTeX, MathJax, <math>, imágenes de ecuación de Canvas) -> su código LaTeX original, sin duplicados
+#    (copiar/pegar lo renderizado puede perder signos o duplicar símbolos);
+#  - imágenes reales (gráficas, diagramas) -> marcador [IMAGEN n] y se devuelven sus ids para capturarlas;
+#  - <select> -> "____", o [[n]] si marcarSelects es true.
+_JS_TEXTO_FN = r"""function (el, marcarSelects) {
+  window.__afImg = window.__afImg || 0;
+  const MATH = '.katex, mjx-container, .MathJax, .MathJax_Preview, .MathJax_SVG, .MathJax_Display, .MathJax_SVG_Display, math';
+  const esEcuacion = n => n.matches('img.equation_image, img[data-equation-content]') || /^latex/i.test(n.getAttribute('alt') || '');
+  const ids = [];
+  el.querySelectorAll('img, canvas, svg').forEach(n => {
+    if (n.closest(MATH)) return;                                   // gráficos internos de fórmulas
+    if (n.tagName.toLowerCase() === 'img' && esEcuacion(n)) return; // imágenes de ecuación
+    if (n.parentElement && n.parentElement.closest('svg')) return;  // svg anidado
+    const r = n.getBoundingClientRect();
+    if (r.width < 40 || r.height < 40) return;                      // iconos
+    let id = n.getAttribute('data-af-img');
+    if (id === null) { id = String(window.__afImg++); n.setAttribute('data-af-img', id); }
+    ids.push(id);
+  });
+  const clon = el.cloneNode(true);
+  const T = s => document.createTextNode(' ' + String(s).replace(/\s+/g, ' ').trim() + ' ');
+  const tex = n => { const a = n.querySelector('annotation[encoding="application/x-tex"]') || n.querySelector('annotation'); return a ? a.textContent : null; };
+  clon.querySelectorAll('.katex').forEach(k => { const t = tex(k); k.replaceWith(T(t !== null ? t : k.textContent)); });
+  clon.querySelectorAll('mjx-container').forEach(m => {
+    const t = tex(m), mm = m.querySelector('mjx-assistive-mml');
+    m.replaceWith(T(t !== null ? t : (mm ? mm.textContent : (m.getAttribute('aria-label') || m.textContent))));
+  });
+  const scripts = clon.querySelectorAll('script[type^="math/tex"]');
+  scripts.forEach(sc => sc.replaceWith(T(sc.textContent)));
+  if (scripts.length) clon.querySelectorAll('.MathJax_Preview, .MathJax, .MathJax_Display, .MathJax_SVG, .MathJax_SVG_Display').forEach(m => m.remove());
+  clon.querySelectorAll('img').forEach(i => {
+    if (esEcuacion(i)) i.replaceWith(T(i.getAttribute('data-equation-content') || (i.getAttribute('alt') || '').replace(/^latex:\s*/i, '') || i.getAttribute('title') || ''));
+  });
+  clon.querySelectorAll('math').forEach(m => { const t = tex(m); m.replaceWith(T(t !== null ? t : m.textContent)); });
+  let k = 0;
+  clon.querySelectorAll('select').forEach(sl => sl.replaceWith(T(marcarSelects ? '[[' + (++k) + ']]' : '____')));
+  clon.querySelectorAll('[data-af-img]').forEach((n, i) => n.replaceWith(T('[IMAGEN ' + (i + 1) + ']')));
+  clon.querySelectorAll('script, style, noscript, textarea, iframe').forEach(n => n.remove());
+  clon.style.cssText = 'position:absolute;left:-99999px;top:0;width:' + Math.max(el.getBoundingClientRect().width, 300) + 'px';
+  document.body.appendChild(clon);
+  const texto = clon.innerText;
+  clon.remove();
+  return { texto: texto, ids: ids };
+}"""
+_JS_CONTENIDO = "(el, marcar) => (" + _JS_TEXTO_FN + ")(el, marcar)"
+
+# Texto asociado a un radio/checkbox: <label for>, label padre, aria-label, o el contenedor más
+# cercano que no incluya otros inputs (con fórmulas convertidas a LaTeX).
+_JS_ETIQUETA = r"""el => {
+  const fn = """ + _JS_TEXTO_FN + r""";
+  let t = (el.labels && el.labels.length) ? el.labels[0] : el.closest('label');
+  if (!t) { const aria = el.getAttribute('aria-label'); if (aria) return aria; }
+  if (!t) {
+    let n = el;
+    for (let i = 0; i < 3 && n.parentElement; i++) {
+      n = n.parentElement;
+      const inputs = n.querySelectorAll('input[type=radio],input[type=checkbox],[role=radio],[role=checkbox]');
+      if (inputs.length === 1 && n.innerText.trim()) { t = n; break; }
+    }
   }
-  return el.innerText || el.value || '';
-}
-"""
+  return t ? fn(t, false).texto : (el.innerText || el.value || '');
+}"""
+
+# Datos de un <select>: opciones y el texto de su "fila" (ancestro más alto que solo contiene ese select).
+_JS_HUECO = r"""(sel, selPregunta) => {
+  const fn = """ + _JS_TEXTO_FN + r""";
+  const ops = Array.from(sel.options).map((o, i) => ({ texto: o.text.trim(), valor: o.value, ind: i, dis: o.disabled }));
+  let n = sel.parentElement, fila = null;
+  while (n && !n.matches(selPregunta) && n.tagName !== 'BODY' && n.querySelectorAll('select').length === 1) { fila = n; n = n.parentElement; }
+  const ctx = fila ? fn(fila, false).texto.replace(/\s+/g, ' ').trim() : '';
+  return { ops: ops, ctx: ctx.length <= 400 ? ctx : '' };
+}"""
 
 
 def _limpiar(t: str) -> str:
@@ -387,8 +551,10 @@ def _limpiar(t: str) -> str:
 
 
 def clasificar(pregunta: Locator) -> str | None:
-    """Devuelve 'multiple', 'unica', 'abierta' o None si no se reconoce."""
-    # El orden importa: checkbox y radio tienen prioridad sobre texto libre.
+    """Devuelve 'desplegable', 'multiple', 'unica', 'abierta' o None si no se reconoce."""
+    # El orden importa: listas, checkbox y radio tienen prioridad sobre texto libre.
+    if pregunta.locator(SELECTOR_DESPLEGABLE).count() > 0:
+        return "desplegable"
     if pregunta.locator(SELECTOR_CHECKBOX).count() > 0:
         return "multiple"
     if pregunta.locator(SELECTOR_RADIO).count() > 0:
@@ -398,14 +564,87 @@ def clasificar(pregunta: Locator) -> str | None:
     return None
 
 
-def extraer_enunciado(pregunta: Locator) -> str:
+def _texto_lineas(t: str) -> str:
+    """Conserva los saltos de línea (útil para incisos a), b), c)...) pero sin espacios sobrantes."""
+    return "\n".join(l for l in (re.sub(r"[ \t\u00a0]+", " ", x).strip() for x in (t or "").splitlines()) if l)
+
+
+def capturar_imagenes(pregunta: Locator, ids: list[str], maximo: int = 4) -> list[bytes]:
+    """Captura (PNG) las imágenes/gráficas marcadas por _JS_TEXTO_FN, tal como se ven en pantalla."""
+    out: list[bytes] = []
+    for id_ in ids[:maximo]:
+        try:
+            png = pregunta.locator(f'[data-af-img="{id_}"]').first.screenshot(timeout=TIMEOUT_ACCION_MS)
+            if len(png) <= 4_500_000:
+                out.append(png)
+        except Exception as e:
+            print(f"     (no se pudo capturar una imagen: {str(e).splitlines()[0][:70]})")
+    return out
+
+
+def extraer_contenido(pregunta: Locator, huecos: bool = False,
+                      solo_enunciado: bool = True) -> tuple[str, list[bytes]]:
+    """Enunciado (fórmulas en LaTeX, huecos como [[n]]) e imágenes de la pregunta.
+
+    solo_enunciado=True lee únicamente SELECTOR_ENUNCIADO (para no mezclar el texto de las opciones);
+    con False lee todo el bloque (preguntas abiertas: así no se pierden incisos fuera del enunciado)."""
     try:
-        el = pregunta.locator(SELECTOR_ENUNCIADO).first
-        if el.count() > 0:
-            return _limpiar(el.inner_text(timeout=TIMEOUT_ACCION_MS))
+        cont = pregunta.evaluate(_JS_CONTENIDO, huecos)
+        texto, ids = cont["texto"], cont["ids"]
+        if not huecos and solo_enunciado:  # si hay un elemento de enunciado, el texto sale solo de ahí
+            el = pregunta.locator(SELECTOR_ENUNCIADO).first
+            if el.count() > 0:
+                texto = el.evaluate(_JS_CONTENIDO, False)["texto"]
+        return _texto_lineas(texto), capturar_imagenes(pregunta, ids)
     except Exception:
-        pass
-    return _limpiar(pregunta.inner_text(timeout=TIMEOUT_ACCION_MS))  # respaldo
+        return _texto_lineas(pregunta.inner_text(timeout=TIMEOUT_ACCION_MS)), []  # respaldo
+
+
+_PLACEHOLDER = re.compile(r"^[\s\[\(\-–—_.]*(elegir|selecciona|seleccione|escoge|choose|select)?[\s\]\)\-–—_.…]*$", re.I)
+
+
+def extraer_huecos(pregunta: Locator) -> list[dict]:
+    """Por cada <select>: opciones reales (sin el '[ Elegir ]'), su posición real y el texto de su fila."""
+    selects = pregunta.locator(SELECTOR_DESPLEGABLE)
+    huecos = []
+    for i in range(selects.count()):
+        sel = selects.nth(i)
+        datos = sel.evaluate(_JS_HUECO, SELECTOR_PREGUNTA)
+        reales = [o for o in datos["ops"]
+                  if o["valor"] != "" and not o["dis"] and not _PLACEHOLDER.match(o["texto"] or "")]
+        if reales:
+            huecos.append({"campo": sel, "textos": [_limpiar(o["texto"]) for o in reales],
+                           "indices": [o["ind"] for o in reales], "contexto": datos["ctx"]})
+    return huecos
+
+
+def es_campo_corto(pregunta: Locator) -> bool:
+    """True si la respuesta va en un campo de una sola línea (no en un textarea/editor)."""
+    largos = pregunta.locator("textarea:visible, [contenteditable='true']:visible, " + SELECTOR_EDITOR_IFRAME)
+    cortos = pregunta.locator("input[type='text']:visible, input[type='number']:visible, input:not([type]):visible")
+    return largos.count() == 0 and cortos.count() > 0
+
+
+def escribir_abierta(pregunta: Locator, texto: str) -> None:
+    """Escribe en un campo de texto normal o, si no hay, en un editor enriquecido (contenteditable / iframe)."""
+    normales = pregunta.locator("textarea:visible, input[type='text']:visible, input[type='number']:visible, "
+                                "input:not([type]):visible")
+    if normales.count() > 0:
+        normales.first.fill(texto, timeout=TIMEOUT_ACCION_MS)
+        return
+    js = ("(el, t) => { el.focus(); el.innerHTML = t.split('\\n').map(l => '<p>' + l.replace(/&/g, '&amp;')"
+          ".replace(/</g, '&lt;') + '</p>').join(''); "
+          "el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); }")
+    editor = pregunta.locator("[contenteditable='true']:visible")
+    if editor.count() > 0:
+        editor.first.evaluate(js, texto)
+        return
+    if pregunta.locator(SELECTOR_EDITOR_IFRAME).count() > 0:  # TinyMCE (Canvas): el editor vive en un iframe
+        pregunta.frame_locator(SELECTOR_EDITOR_IFRAME).first.locator("body").evaluate(js, texto)
+        return
+    pregunta.locator("textarea").first.evaluate(  # último recurso: textarea oculto
+        "(el, t) => { el.value = t; el.dispatchEvent(new Event('input', {bubbles: true})); "
+        "el.dispatchEvent(new Event('change', {bubbles: true})); }", texto)
 
 
 def extraer_opciones(pregunta: Locator, selector_campo: str) -> tuple[list[str], list[Locator]]:
@@ -447,25 +686,33 @@ def responder_pregunta(pregunta: Locator, n: int, backend: str) -> None:
         print(f"[{n}] Tipo no reconocido; se omite.")
         return
 
-    enunciado = extraer_enunciado(pregunta)
-    textos, campos = [], []
+    enunciado, imagenes = extraer_contenido(pregunta, huecos=(tipo == "desplegable"),
+                                            solo_enunciado=(tipo in ("unica", "multiple")))
+    textos, campos, huecos = [], [], []
     if tipo == "unica":
         textos, campos = extraer_opciones(pregunta, SELECTOR_RADIO)
     elif tipo == "multiple":
         textos, campos = extraer_opciones(pregunta, SELECTOR_CHECKBOX)
+    elif tipo == "desplegable":
+        huecos = extraer_huecos(pregunta)
+        if not huecos:
+            print(f"[{n}] (DESPLEGABLE) sin opciones reales; se omite.")
+            return
 
     dificil = clasificar_dificultad(enunciado, textos, backend)
     modelo = MODELO_DIFICIL if dificil else MODELO_FACIL
     etiqueta = ("DIFÍCIL" if dificil else "fácil") if ENRUTAR else "modelo único"
-    print(f"[{n}] ({tipo.upper()} | {etiqueta} | {modelo}) {enunciado[:80]}")
+    extra = f" +{len(imagenes)} img" if imagenes else ""
+    resumen = enunciado.replace("\n", " ")[:80]
+    print(f"[{n}] ({tipo.upper()} | {etiqueta} | {modelo}{extra}) {resumen}")
 
     if tipo == "abierta":
-        respuesta = pedir_abierta(enunciado, backend, modelo, dificil)
-        pregunta.locator(SELECTOR_ABIERTA).first.fill(respuesta, timeout=TIMEOUT_ACCION_MS)
+        respuesta = pedir_abierta(enunciado, backend, modelo, dificil, imagenes, corta=es_campo_corto(pregunta))
+        escribir_abierta(pregunta, respuesta)
         print(f"     -> {respuesta[:90]}")
 
     elif tipo == "unica":
-        idx = pedir_unica(enunciado, textos, backend, modelo)
+        idx = pedir_unica(enunciado, textos, backend, modelo, imagenes)
         if idx is None:
             print("     -> Claude no devolvió una opción válida; se omite.")
             return
@@ -473,13 +720,28 @@ def responder_pregunta(pregunta: Locator, n: int, backend: str) -> None:
         print(f"     -> {textos[idx][:90]}")
 
     elif tipo == "multiple":
-        indices = pedir_multiple(enunciado, textos, backend, modelo)
+        indices = pedir_multiple(enunciado, textos, backend, modelo, imagenes)
         if not indices:
             print("     -> Claude no devolvió opciones válidas; se omite.")
             return
         for idx in indices:
             marcar(campos[idx])
         print(f"     -> {[textos[i][:40] for i in indices]}")
+
+    elif tipo == "desplegable":
+        elegidas = pedir_desplegables(enunciado, huecos, backend, modelo, imagenes)
+        resumen_sel = []
+        for h, e in zip(huecos, elegidas):
+            if e is None:
+                resumen_sel.append("?")
+                continue
+            try:
+                h["campo"].select_option(index=h["indices"][e], timeout=TIMEOUT_ACCION_MS)
+                resumen_sel.append(h["textos"][e][:20])
+            except Exception as ex:
+                resumen_sel.append("ERROR")
+                print(f"     (no se pudo elegir en un desplegable: {str(ex).splitlines()[0][:60]})")
+        print(f"     -> {resumen_sel}")
 
 
 def procesar_pagina(page: Page, backend: str) -> None:
@@ -575,6 +837,93 @@ DEMO_MATERIAL = [
 ]
 
 
+def _svg_url(svg: str) -> str:
+    return "data:image/svg+xml;utf8," + quote(svg)
+
+
+def _svg_grafica(etiqueta_b: str) -> str:
+    """Isocosto (recta roja) tangente a una isocuanta (curva negra); a y b son puntos de los ejes."""
+    return (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='480' height='320' font-family='serif' font-size='26'>"
+        "<rect width='480' height='320' fill='white'/>"
+        "<line x1='60' y1='20' x2='60' y2='270' stroke='black' stroke-width='3'/>"
+        "<line x1='40' y1='270' x2='450' y2='270' stroke='black' stroke-width='3'/>"
+        "<text x='20' y='40'>K</text><text x='440' y='300'>L</text>"
+        "<line x1='60' y1='70' x2='300' y2='270' stroke='#e5483f' stroke-width='3'/>"
+        "<path d='M110 40 Q150 190 300 235 T440 262' fill='none' stroke='black' stroke-width='3'/>"
+        "<text x='30' y='78'>a</text>"
+        f"<text x='290' y='305'>{etiqueta_b}</text></svg>")
+
+
+def crear_demo_formatos() -> str:
+    """Formulario local con los formatos típicos de Canvas: desplegables V/F, ejercicio con fórmula
+    (imagen de ecuación) y editor enriquecido en iframe, y preguntas con gráficas."""
+    ecuacion = ("<img class='equation_image' alt='LaTeX: U(X_A,X_B)=\\sqrt{X_AX_B+400}' "
+                "data-equation-content='U(X_A,X_B)=\\sqrt{X_AX_B+400}' width='220' height='30' "
+                f"src=\"{_svg_url('<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'220\' height=\'30\'/>')}\">")
+    ec_iso = ("<img class='equation_image' alt='LaTeX: C=wL+rK' data-equation-content='C=wL+rK' width='110' height='24' "
+              f"src=\"{_svg_url('<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'110\' height=\'24\'/>')}\">")
+    filas = "".join(
+        f"<div class=fila><span>{txt}</span><select><option value=''>[ Elegir ]</option>"
+        "<option>Verdadero</option><option>Falso</option></select></div>"
+        for txt, _ in DEMO_VF)
+    html = f"""<!doctype html><meta charset=utf-8><title>Demo formatos</title>
+<style>.fila{{display:flex;justify-content:space-between;gap:20px;padding:8px;border-top:1px solid #ccc}}</style>
+<div class=pregunta><p class=enunciado>Verdadero o falso</p>{filas}</div>
+<div class=pregunta><div class=enunciado><p>La función de utilidad del Pato Lucas es:</p><p>{ecuacion}</p>
+<p>a) Obtén las condiciones de primer orden. (4 puntos)</p><p>b) Obtén la tasa marginal de sustitución. (4 puntos)</p>
+<p>c) Obtén la función de demanda del bien A. (4 puntos)</p><p>d) Obtén la demanda del bien B. (4 puntos)</p>
+<p>e) Determina si el bien A y el bien B son sustitutos o complementos. (4 puntos)</p></div>
+<iframe id=q2_ifr style='width:600px;height:140px' srcdoc="<body contenteditable=true></body>"></iframe></div>
+<div class=pregunta><div class=enunciado><p>La recta roja representa la curva de isocosto: {ec_iso}</p>
+<img src="{_svg_url(_svg_grafica('b'))}" width=480 height=320>
+<p>Si C=600, w=4 y r=3, determina el valor del punto a.</p></div><input type=text></div>
+<div class=pregunta><div class=enunciado><p>Según la gráfica, ¿cuánto vale el punto b?</p>
+<img src="{_svg_url(_svg_grafica('b = 150'))}" width=480 height=320></div><input type=text></div>"""
+    ruta = Path(tempfile.mkdtemp()) / "demo_formatos.html"
+    ruta.write_text(html, encoding="utf-8")
+    return ruta.as_uri()
+
+
+# Verdadero/falso del demo de formatos (respuestas según la clave del examen de ejemplo).
+DEMO_VF = [
+    ("La función de costos es igual que la recta de isocosto", "Falso"),
+    ("Si tengo pérdidas, siempre debo dejar de producir.", "Falso"),
+    ("Solamente tengo costos fijos en el corto plazo.", "Verdadero"),
+    ("La producción óptima se encuentra en el punto de intersección entre costos e ingresos.", "Falso"),
+    ("Una empresa en un mercado competitivo que no tenga costos fijos y que tenga un costo marginal constante y "
+     "positivo, producirá hasta que su ingreso marginal sea cero.", "Falso"),
+    ("La derivada de la función de beneficios debe ser positiva para garantizar una producción eficiente y óptima.",
+     "Falso"),
+    ("En el corto plazo, hay al menos un factor de producción fijo.", "Verdadero"),
+    ("Un rendimiento decreciente de escala implica que obtengo pérdidas si aumento la producción.", "Falso"),
+]
+
+
+def evaluar_demo_formatos(page: Page) -> None:
+    preguntas = page.locator(SELECTOR_PREGUNTA)
+    print("\n" + "=" * 60 + "\n RESULTADO DE LA DEMO DE FORMATOS\n" + "=" * 60)
+    # P1: desplegables
+    selects = preguntas.nth(0).locator("select")
+    ok_vf = 0
+    for i, (txt, esperado) in enumerate(DEMO_VF):
+        elegido = selects.nth(i).evaluate("s => s.options[s.selectedIndex].text")
+        ok_vf += elegido == esperado
+        print(f"   {'✔' if elegido == esperado else '✘'} {txt[:55]:<55} -> {elegido} (esperado {esperado})")
+    print(f" P1 desplegables V/F: {ok_vf}/{len(DEMO_VF)}")
+    # P2: ejercicio con fórmula en editor iframe
+    cuerpo = preguntas.nth(1).frame_locator("iframe").locator("body").inner_text().lower()
+    checks = {"escribió en el editor": len(cuerpo) > 40,
+              "respondió los incisos a) a e)": all(f"{c})" in cuerpo for c in "abcde"),
+              "vio la fórmula (aparece 400)": "400" in cuerpo}
+    print(f" P2 Pato Lucas: " + " | ".join(f"{'✔' if v else '✘'} {k}" for k, v in checks.items()))
+    # P3 / P4: gráficas
+    v3 = preguntas.nth(2).locator("input").input_value()
+    v4 = preguntas.nth(3).locator("input").input_value()
+    print(f" P3 isocosto (a = C/r = 200): {'✔' if '200' in v3 else '✘'} -> {v3[:60]!r}")
+    print(f" P4 valor leído solo de la imagen (b = 150): {'✔' if '150' in v4 else '✘'} -> {v4[:60]!r}")
+
+
 def crear_demo_material() -> str:
     bloques = []
     for n, q in enumerate(DEMO_MATERIAL, 1):
@@ -637,6 +986,8 @@ def main() -> None:
     ap.add_argument("--model", help="un solo modelo para TODAS las preguntas (desactiva el enrutamiento)")
     ap.add_argument("--model-facil", help=f"modelo para preguntas fáciles (activa el enrutamiento si difiere del difícil; por defecto {MODELO_FACIL})")
     ap.add_argument("--model-dificil", help=f"modelo para preguntas difíciles (por defecto {MODELO_DIFICIL})")
+    ap.add_argument("--demo-formatos", action="store_true",
+                    help="formulario local con desplegables V/F, fórmulas, editor enriquecido y gráficas")
     ap.add_argument("--demo-material", action="store_true",
                     help="formulario local con preguntas que solo se contestan con tu material, y lo califica")
     ap.add_argument("--demo", action="store_true", help="usa un formulario local de ejemplo")
@@ -653,7 +1004,10 @@ def main() -> None:
         MODELO_DIFICIL = args.model_dificil
     ENRUTAR = MODELO_FACIL != MODELO_DIFICIL
     backend = elegir_backend(args.backend)
-    url = crear_demo_material() if args.demo_material else (crear_demo() if args.demo else args.url)
+    if args.demo_formatos:
+        url = crear_demo_formatos()
+    else:
+        url = crear_demo_material() if args.demo_material else (crear_demo() if args.demo else args.url)
     modelos = MODELO_FACIL if not ENRUTAR else f"fácil={MODELO_FACIL}, difícil={MODELO_DIFICIL}"
     print(f"Backend de Claude: {backend} | modelos: {modelos}")
     if args.material:
@@ -682,6 +1036,8 @@ def main() -> None:
         procesar_pagina(page, backend)
         if args.demo_material:
             evaluar_demo_material(page)
+        if args.demo_formatos:
+            evaluar_demo_formatos(page)
         imprimir_consumo()
 
         if not args.headless:
