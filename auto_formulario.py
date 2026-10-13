@@ -197,10 +197,10 @@ def consultar_claude(prompt: str, backend: str = "api") -> str:
 
     if backend == "mock":
         # Respuestas falsas SOLO para probar el flujo sin gastar API.
-        if "SOLO el número" in prompt:
-            return "2"
         if "arreglo JSON" in prompt:
-            return "[1, 3]"
+            return '["A", "C"]'
+        if "SOLO la letra" in prompt:
+            return "B"
         return "Respuesta de prueba (mock)."
 
     raise ValueError(f"backend desconocido: {backend}")
@@ -214,45 +214,50 @@ def pedir_abierta(enunciado: str, backend: str) -> str:
     return consultar_claude(prompt, backend)
 
 
-def _lista_numerada(opciones: list[str]) -> str:
-    return "\n".join(f"{i}. {t}" for i, t in enumerate(opciones, 1))
+def _letra(i: int) -> str:
+    return chr(ord("A") + i) if i < 26 else str(i + 1)
+
+
+def _lista_letras(opciones: list[str]) -> str:
+    # Letras (A, B, C...) en vez de números: así no se confunden con opciones numéricas.
+    return "\n".join(f"{_letra(i)}) {t}" for i, t in enumerate(opciones))
+
+
+def _letras_a_indices(texto: str, opciones: list[str]) -> list[int]:
+    """Convierte la respuesta de Claude (letras, o el texto de las opciones) en índices 0-based."""
+    n = len(opciones)
+    # Se quitan comillas/corchetes y se buscan letras sueltas: A, B, "C", [A, C], A) ...
+    limpio = texto.replace("\n", " ")
+    for patron in (r"(?<![A-Za-zÁ-ú0-9])([A-Z])(?![A-Za-zÁ-ú0-9])",   # primero mayúsculas
+                   r"(?<![A-Za-zÁ-ú0-9])([a-z])(?![A-Za-zÁ-ú0-9])"):  # luego minúsculas ("b.")
+        idx = sorted({ord(l.upper()) - 65 for l in re.findall(patron, limpio)
+                      if 0 <= ord(l.upper()) - 65 < n})
+        if idx:
+            return idx
+    # Respaldo: Claude devolvió el texto exacto de las opciones.
+    partes = {x.strip().strip("\"'[]").lower() for x in re.split(r"[,\n;]", texto)}
+    return [i for i, op in enumerate(opciones) if op.strip().lower() in partes]
 
 
 def pedir_unica(enunciado: str, opciones: list[str], backend: str) -> int | None:
     """Devuelve el índice (0-based) de la opción elegida, o None si no se pudo."""
     prompt = (
-        f"Pregunta:\n{enunciado}\n\nOpciones:\n{_lista_numerada(opciones)}\n\n"
-        "Elige la ÚNICA opción correcta. Devuelve SOLO el número de la opción "
-        "(por ejemplo: 2). Nada más."
+        f"Pregunta:\n{enunciado}\n\nOpciones:\n{_lista_letras(opciones)}\n\n"
+        "Elige la ÚNICA opción correcta. Devuelve SOLO la letra de la opción "
+        "(por ejemplo: B). Nada más."
     )
-    texto = consultar_claude(prompt, backend)
-    m = re.search(r"\d+", texto)
-    if m and 1 <= int(m.group()) <= len(opciones):
-        return int(m.group()) - 1
-    # Respaldo: Claude devolvió el texto de la opción en vez del número.
-    t = texto.strip().lower()
-    for i, op in enumerate(opciones):
-        if op.strip().lower() == t:
-            return i
-    return None
+    idx = _letras_a_indices(consultar_claude(prompt, backend), opciones)
+    return idx[0] if idx else None
 
 
 def pedir_multiple(enunciado: str, opciones: list[str], backend: str) -> list[int]:
     """Devuelve la lista de índices (0-based) de las opciones correctas."""
     prompt = (
-        f"Pregunta:\n{enunciado}\n\nOpciones:\n{_lista_numerada(opciones)}\n\n"
+        f"Pregunta:\n{enunciado}\n\nOpciones:\n{_lista_letras(opciones)}\n\n"
         "Selecciona TODAS las opciones correctas (una o más). Devuelve SOLO un "
-        "arreglo JSON con los números, por ejemplo: [1, 3]. Nada más."
+        'arreglo JSON con las letras, por ejemplo: ["A", "C"]. Nada más.'
     )
-    texto = consultar_claude(prompt, backend)
-    try:
-        m = re.search(r"\[.*?\]", texto, re.S)
-        nums = json.loads(m.group()) if m else []
-    except json.JSONDecodeError:
-        nums = []
-    if not nums:  # respaldo: separado por comas / cualquier número suelto
-        nums = [int(n) for n in re.findall(r"\d+", texto)]
-    return sorted({int(n) - 1 for n in nums if 1 <= int(n) <= len(opciones)})
+    return _letras_a_indices(consultar_claude(prompt, backend), opciones)
 
 
 # ════════════════════════════════════════════════════════════════════════════
