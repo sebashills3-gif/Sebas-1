@@ -20,9 +20,9 @@ Uso:
     python auto_formulario.py --demo            # prueba con un formulario local de ejemplo
     python auto_formulario.py --demo-material --backend cli --material ./material   # verifica que usa TU material
 
-Modelos: las preguntas fáciles (recordar un dato) usan Haiku y las difíciles (cálculos,
-desarrollo matemático) usan Sonnet automáticamente. Cámbialo con --model-facil / --model-dificil
-(ej. --model-dificil claude-opus-5-5) o fuerza un solo modelo con --model.
+Modelos: por defecto Sonnet para todo. Opciones: --model X (un solo modelo), o enrutar por
+dificultad con --model-facil claude-haiku-5-5 --model-dificil claude-sonnet-5-5 (o claude-opus-5-5).
+Al final se imprime el consumo de tokens de la sesión.
 
 Usa esta herramienta solo en formularios/evaluaciones donde esté permitido
 (prácticas, encuestas, formularios propios, etc.).
@@ -66,11 +66,12 @@ SELECTOR_CHECKBOX = "input[type='checkbox'], [role='checkbox']"
 # Botón de enviar. Déjalo en None para NO enviar (recomendado: revisa tú).
 SELECTOR_BOTON_ENVIAR = None  # Ej.: "button[type='submit']"
 
-# Enrutamiento por dificultad: una consulta barata a Haiku (sin el material) decide si la
-# pregunta es FÁCIL (recordar/ubicar un dato) o DIFÍCIL (cálculo, desarrollo, varios pasos).
-MODELO_FACIL = os.getenv("CLAUDE_MODEL_FACIL", "claude-haiku-5-5")
+# Por defecto se usa Sonnet para TODO (más seguro para acertar). Enrutamiento opcional: si
+# MODELO_FACIL != MODELO_DIFICIL (ej. --model-facil claude-haiku-5-5), una consulta barata
+# (sin el material) clasifica cada pregunta como FÁCIL o DIFÍCIL y elige el modelo.
+MODELO_FACIL = os.getenv("CLAUDE_MODEL_FACIL", "claude-sonnet-5-5")
 MODELO_DIFICIL = os.getenv("CLAUDE_MODEL_DIFICIL", "claude-sonnet-5-5")  # o "claude-opus-5-5"
-ENRUTAR = True  # pasa a False con --model (un solo modelo para todo)
+ENRUTAR = False  # se activa solo si los dos modelos son distintos (ver main)
 
 # Si el enunciado contiene estas palabras se considera DIFÍCIL sin gastar la consulta de clasificación.
 PATRON_DIFICIL = re.compile(
@@ -182,6 +183,39 @@ def construir_system() -> str:
 # ════════════════════════════════════════════════════════════════════════════
 # b) CONSULTAR A CLAUDE
 # ════════════════════════════════════════════════════════════════════════════
+CONSUMO = {"llamadas": 0, "nuevos": 0, "cache": 0, "salida": 0, "usd": 0.0}
+_ARCHIVOS_SYSTEM: dict[str, str] = {}
+
+
+def _archivo_system(texto: str) -> str:
+    """Guarda el system prompt (con el material) en un archivo temporal, una sola vez."""
+    if texto not in _ARCHIVOS_SYSTEM:
+        ruta = Path(tempfile.mkdtemp()) / "system.txt"
+        ruta.write_text(texto, encoding="utf-8")
+        _ARCHIVOS_SYSTEM[texto] = str(ruta)
+    return _ARCHIVOS_SYSTEM[texto]
+
+
+def _registrar_consumo(uso: dict, usd: float | None) -> None:
+    CONSUMO["llamadas"] += 1
+    CONSUMO["nuevos"] += (uso.get("input_tokens") or 0) + (uso.get("cache_creation_input_tokens") or 0)
+    CONSUMO["cache"] += uso.get("cache_read_input_tokens") or 0
+    CONSUMO["salida"] += uso.get("output_tokens") or 0
+    CONSUMO["usd"] += usd or 0.0
+
+
+def imprimir_consumo() -> None:
+    c = CONSUMO
+    if not c["llamadas"]:
+        return
+    print("\n" + "-" * 60)
+    print(f" Consumo de esta sesión: {c['llamadas']} llamadas a Claude")
+    print(f"   tokens de entrada nuevos: {c['nuevos']:,}   (caché leído: {c['cache']:,})")
+    print(f"   tokens de salida: {c['salida']:,}   | costo equivalente en API: ${c['usd']:.2f}")
+    print("   (Tu límite de suscripción no se mide en dólares; revisa /usage en `claude` antes y después.)")
+    print("-" * 60)
+
+
 def consultar_claude(prompt: str, backend: str = "api", modelo: str | None = None,
                      usar_material: bool = True, max_tokens: int = 1024) -> str:
     """Envía `prompt` a Claude y devuelve el texto de la respuesta."""
@@ -203,16 +237,24 @@ def consultar_claude(prompt: str, backend: str = "api", modelo: str | None = Non
         # Requiere tener instalado y autenticado el CLI de Claude Code.
         # El prompt va por stdin (sin límite de longitud del comando, importante
         # si usas --material) y se desactivan las herramientas del agente.
+        # El material va como system prompt (archivo): así Claude puede reutilizarlo desde su caché
+        # entre preguntas (≈20x menos consumo que mandarlo dentro de cada pregunta).
+        cmd = ["claude", "-p", "--tools", "", "--model", modelo, "--output-format", "json",
+               "--append-system-prompt-file", _archivo_system(system)]
         error = ""
         for intento in (1, 2):  # un reintento si el CLI se cuelga o devuelve vacío
             try:
-                res = subprocess.run(
-                    ["claude", "-p", "--tools", "", "--model", modelo],
-                    input=f"{system}\n\n---\n\n{prompt}",
-                    capture_output=True, text=True, encoding="utf-8", timeout=240,
-                )
+                res = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                                     encoding="utf-8", timeout=240)
                 if res.returncode == 0 and res.stdout.strip():
-                    return res.stdout.strip()
+                    try:
+                        datos = json.loads(res.stdout)
+                        _registrar_consumo(datos.get("usage") or {}, datos.get("total_cost_usd"))
+                        texto = (datos.get("result") or "").strip()
+                    except json.JSONDecodeError:
+                        texto = res.stdout.strip()
+                    if texto:
+                        return texto
                 error = res.stderr.strip() or "respuesta vacía"
             except subprocess.TimeoutExpired:
                 error = "tiempo de espera agotado"
@@ -264,10 +306,13 @@ def pedir_abierta(enunciado: str, backend: str, modelo: str, dificil: bool = Fal
         )
         return consultar_claude(prompt, backend, modelo, max_tokens=2048)
     prompt = (
-        f"Responde de forma concisa y directa (máximo 2-3 frases) a:\n\n{enunciado}\n\n"
-        "Devuelve SOLO la respuesta."
+        f"Responde a:\n\n{enunciado}\n\n"
+        "Si es una pregunta de datos, definiciones o conceptos, responde de forma concisa y directa "
+        "(máximo 2-3 frases). Si pide cálculos, un desarrollo o una demostración, resuélvelo paso a paso "
+        "de forma ordenada y compacta (fórmulas y cálculos clave) y termina con una línea "
+        "'Respuesta final: ...'. Texto plano, sin markdown ni LaTeX. Devuelve SOLO la respuesta."
     )
-    return consultar_claude(prompt, backend, modelo)
+    return consultar_claude(prompt, backend, modelo, max_tokens=2048)
 
 
 def _letra(i: int) -> str:
@@ -590,7 +635,7 @@ def main() -> None:
     ap.add_argument("--backend", choices=["auto", "api", "cli", "mock"], default="auto")
     ap.add_argument("--material", help="archivo o carpeta (.pptx/.pdf/.txt/.md) que Claude usará como base")
     ap.add_argument("--model", help="un solo modelo para TODAS las preguntas (desactiva el enrutamiento)")
-    ap.add_argument("--model-facil", help=f"modelo para preguntas fáciles (por defecto {MODELO_FACIL})")
+    ap.add_argument("--model-facil", help=f"modelo para preguntas fáciles (activa el enrutamiento si difiere del difícil; por defecto {MODELO_FACIL})")
     ap.add_argument("--model-dificil", help=f"modelo para preguntas difíciles (por defecto {MODELO_DIFICIL})")
     ap.add_argument("--demo-material", action="store_true",
                     help="formulario local con preguntas que solo se contestan con tu material, y lo califica")
@@ -606,6 +651,7 @@ def main() -> None:
         MODELO_FACIL = args.model_facil
     if args.model_dificil:
         MODELO_DIFICIL = args.model_dificil
+    ENRUTAR = MODELO_FACIL != MODELO_DIFICIL
     backend = elegir_backend(args.backend)
     url = crear_demo_material() if args.demo_material else (crear_demo() if args.demo else args.url)
     modelos = MODELO_FACIL if not ENRUTAR else f"fácil={MODELO_FACIL}, difícil={MODELO_DIFICIL}"
@@ -636,6 +682,7 @@ def main() -> None:
         procesar_pagina(page, backend)
         if args.demo_material:
             evaluar_demo_material(page)
+        imprimir_consumo()
 
         if not args.headless:
             input("\nPresiona ENTER para cerrar el navegador... ")
