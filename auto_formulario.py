@@ -61,7 +61,7 @@ SELECTOR_CHECKBOX = "input[type='checkbox'], [role='checkbox']"
 # Botón de enviar. Déjalo en None para NO enviar (recomendado: revisa tú).
 SELECTOR_BOTON_ENVIAR = None  # Ej.: "button[type='submit']"
 
-MODELO = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+MODELO = os.getenv("CLAUDE_MODEL", "claude-haiku-5-5")  # cámbialo con --model; Sonnet: claude-sonnet-5-5
 TIMEOUT_ACCION_MS = 5000
 
 SYSTEM_PROMPT = (
@@ -187,7 +187,7 @@ def consultar_claude(prompt: str, backend: str = "api") -> str:
         # El prompt va por stdin (sin límite de longitud del comando, importante
         # si usas --material) y se desactivan las herramientas del agente.
         res = subprocess.run(
-            ["claude", "-p", "--tools", ""],
+            ["claude", "-p", "--tools", "", "--model", MODELO],
             input=f"{construir_system()}\n\n---\n\n{prompt}",
             capture_output=True, text=True, encoding="utf-8", timeout=300,
         )
@@ -436,14 +436,18 @@ def main() -> None:
     ap.add_argument("--url", help="URL inicial a abrir (opcional)")
     ap.add_argument("--backend", choices=["auto", "api", "cli", "mock"], default="auto")
     ap.add_argument("--material", help="archivo o carpeta (.pptx/.pdf/.txt/.md) que Claude usará como base")
+    ap.add_argument("--model", help="modelo de Claude (por defecto claude-haiku-5-5; ej. claude-sonnet-5-5)")
     ap.add_argument("--demo", action="store_true", help="usa un formulario local de ejemplo")
     ap.add_argument("--headless", action="store_true", help="sin ventana (solo pruebas)")
     ap.add_argument("--auto-start", action="store_true", help="no espera ENTER (solo pruebas)")
     args = ap.parse_args()
 
+    global MODELO
+    if args.model:
+        MODELO = args.model
     backend = elegir_backend(args.backend)
     url = crear_demo() if args.demo else args.url
-    print(f"Backend de Claude: {backend}")
+    print(f"Backend de Claude: {backend} | modelo: {MODELO}")
     if args.material:
         global CONTEXTO_MATERIAL
         print("Cargando material de consulta...")
