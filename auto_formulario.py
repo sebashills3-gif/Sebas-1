@@ -9,13 +9,14 @@ Flujo:
      consulta a Claude y rellena las respuestas.
 
 Instalación:
-    pip install playwright anthropic
+    pip install playwright anthropic python-pptx pypdf   # (python-pptx/pypdf solo si usas --material)
     playwright install chromium
     export ANTHROPIC_API_KEY="sk-ant-..."      # (Windows PowerShell: $env:ANTHROPIC_API_KEY="...")
 
 Uso:
     python auto_formulario.py --url "https://tu-sitio.com/formulario"
     python auto_formulario.py --backend cli     # usa el CLI `claude -p` en vez de la API
+    python auto_formulario.py --backend cli --material ./presentaciones   # responde usando tus .pptx/.pdf/.txt/.md
     python auto_formulario.py --demo            # prueba con un formulario local de ejemplo
 
 Usa esta herramienta solo en formularios/evaluaciones donde esté permitido
@@ -86,6 +87,85 @@ def esperar_activador() -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# MATERIAL DE CONSULTA (presentaciones, PDFs, notas) — opcional con --material
+# ════════════════════════════════════════════════════════════════════════════
+CONTEXTO_MATERIAL = ""  # se llena en main() si usas --material
+MAX_CHARS_MATERIAL = 400_000  # ~100k tokens; evita desbordar el contexto de Claude
+
+
+def _texto_pptx(ruta: Path) -> str:
+    from pptx import Presentation  # pip install python-pptx
+
+    def textos(shapes):
+        for sh in shapes:
+            if sh.shape_type == 6:  # grupo de formas
+                yield from textos(sh.shapes)
+            if sh.has_text_frame and sh.text_frame.text.strip():
+                yield sh.text_frame.text.strip()
+            if getattr(sh, "has_table", False) and sh.has_table:
+                for fila in sh.table.rows:
+                    yield " | ".join(c.text.strip() for c in fila.cells)
+
+    partes = []
+    for n, sl in enumerate(Presentation(str(ruta)).slides, 1):
+        lineas = list(textos(sl.shapes))
+        if sl.has_notes_slide and sl.notes_slide.notes_text_frame.text.strip():
+            lineas.append("Notas: " + sl.notes_slide.notes_text_frame.text.strip())
+        partes.append(f"[Diapositiva {n}]\n" + "\n".join(lineas))
+    return "\n\n".join(partes)
+
+
+def _texto_pdf(ruta: Path) -> str:
+    from pypdf import PdfReader  # pip install pypdf
+
+    return "\n\n".join(f"[Página {n}]\n{(pg.extract_text() or '').strip()}"
+                        for n, pg in enumerate(PdfReader(str(ruta)).pages, 1))
+
+
+def cargar_material(ruta: str) -> str:
+    """Lee un archivo o carpeta (.pptx, .pdf, .txt, .md) y devuelve todo su texto."""
+    base = Path(ruta).expanduser()
+    if not base.exists():
+        sys.exit(f"--material: no existe la ruta '{ruta}'")
+    archivos = [base] if base.is_file() else sorted(p for p in base.rglob("*") if p.is_file())
+    bloques = []
+    for a in archivos:
+        ext = a.suffix.lower()
+        try:
+            if ext == ".pptx":
+                txt = _texto_pptx(a)
+            elif ext == ".pdf":
+                txt = _texto_pdf(a)
+            elif ext in (".txt", ".md"):
+                txt = a.read_text(encoding="utf-8", errors="ignore")
+            else:
+                continue  # .ppt antiguo, imágenes, etc.: se ignoran
+        except Exception as e:
+            print(f"  (no se pudo leer {a.name}: {type(e).__name__}: {e})")
+            continue
+        if txt.strip():
+            print(f"  Material cargado: {a.name} ({len(txt):,} caracteres)")
+            bloques.append(f"=== ARCHIVO: {a.name} ===\n{txt.strip()}")
+    texto = "\n\n".join(bloques)
+    if not texto:
+        sys.exit("--material: no se encontró texto legible (.pptx/.pdf/.txt/.md).")
+    if len(texto) > MAX_CHARS_MATERIAL:
+        print(f"  AVISO: material muy largo; se recorta a {MAX_CHARS_MATERIAL:,} caracteres.")
+        texto = texto[:MAX_CHARS_MATERIAL]
+    return texto
+
+
+def construir_system() -> str:
+    if not CONTEXTO_MATERIAL:
+        return SYSTEM_PROMPT
+    return (
+        f"{SYSTEM_PROMPT}\n\nTu fuente principal es el MATERIAL DE REFERENCIA de abajo. "
+        "Basa tus respuestas en él; si la respuesta no aparece ahí, usa tu conocimiento general.\n\n"
+        f"<material_de_referencia>\n{CONTEXTO_MATERIAL}\n</material_de_referencia>"
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # b) CONSULTAR A CLAUDE
 # ════════════════════════════════════════════════════════════════════════════
 def consultar_claude(prompt: str, backend: str = "api") -> str:
@@ -97,16 +177,19 @@ def consultar_claude(prompt: str, backend: str = "api") -> str:
         resp = cliente.messages.create(
             model=MODELO,
             max_tokens=1024,
-            system=SYSTEM_PROMPT,
+            system=construir_system(),
             messages=[{"role": "user", "content": prompt}],
         )
         return "".join(b.text for b in resp.content if b.type == "text").strip()
 
     if backend == "cli":
         # Requiere tener instalado y autenticado el CLI de Claude Code.
+        # El prompt va por stdin (sin límite de longitud del comando, importante
+        # si usas --material) y se desactivan las herramientas del agente.
         res = subprocess.run(
-            ["claude", "-p", f"{SYSTEM_PROMPT}\n\n{prompt}"],
-            capture_output=True, text=True, timeout=120,
+            ["claude", "-p", "--tools", ""],
+            input=f"{construir_system()}\n\n---\n\n{prompt}",
+            capture_output=True, text=True, encoding="utf-8", timeout=300,
         )
         if res.returncode != 0:
             raise RuntimeError(f"claude CLI falló: {res.stderr.strip()}")
@@ -352,6 +435,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--url", help="URL inicial a abrir (opcional)")
     ap.add_argument("--backend", choices=["auto", "api", "cli", "mock"], default="auto")
+    ap.add_argument("--material", help="archivo o carpeta (.pptx/.pdf/.txt/.md) que Claude usará como base")
     ap.add_argument("--demo", action="store_true", help="usa un formulario local de ejemplo")
     ap.add_argument("--headless", action="store_true", help="sin ventana (solo pruebas)")
     ap.add_argument("--auto-start", action="store_true", help="no espera ENTER (solo pruebas)")
@@ -360,6 +444,10 @@ def main() -> None:
     backend = elegir_backend(args.backend)
     url = crear_demo() if args.demo else args.url
     print(f"Backend de Claude: {backend}")
+    if args.material:
+        global CONTEXTO_MATERIAL
+        print("Cargando material de consulta...")
+        CONTEXTO_MATERIAL = cargar_material(args.material)
 
     with sync_playwright() as p:
         try:
