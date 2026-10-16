@@ -15,8 +15,9 @@ Instalación (Windows):
     (si rapidocr no instala, usa Python 3.10–3.12)
 
 Uso (en este orden la primera vez):
-    1) Abre en Sophis la ventana "Listed market ..." y déjala donde la vas a usar (NO la muevas después).
-    2) python sophis_auto.py calibrar          # una sola vez: apuntas con el mouse a 8 puntos
+    1) Abre en Sophis la ventana "Listed market ..." (puede abrirse en cualquier posición: el script la
+       vuelve a encontrar cada vez buscando el encabezado de la tabla; debe estar visible, no minimizada).
+    2) python sophis_auto.py calibrar          # una sola vez: apuntas con el mouse a 12 puntos
     3) python sophis_auto.py diagnostico ZYS   # prueba cómo se lee tu pantalla (mándame lo que imprime)
     4) python sophis_auto.py abrir ZYS ZTS YY  # busca, iguala el dropdown y abre la ventana de cada código
 
@@ -32,7 +33,7 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PIL import Image
@@ -56,22 +57,39 @@ TERMS = [
 # Orden del dropdown (solo se usa como respaldo por teclado si el OCR no encuentra la opción).
 ORDEN_DROPDOWN = TERMS
 
-# Puntos que se calibran (nombre, instrucción). Todos son coordenadas absolutas de TU pantalla.
+# La ventana no siempre se abre en la misma posición, así que NADA se guarda como posición fija de pantalla:
+# se guardan dos "anclas" (recortes de imagen de zonas fijas del encabezado) y cada punto se calcula
+# relativo a ellas. En cada ejecución se busca el ancla en la pantalla y se mueven todos los puntos.
+ARCHIVO_ANCLAS = Path("sophis_anclas")
+UMBRAL_ANCLA = 0.80   # parecido mínimo (0-1) para dar por encontrada una ancla
+
+# Puntos que se calibran (nombre, instrucción). Se apunta con el mouse en TU pantalla, una sola vez.
 PUNTOS_CALIBRACION = [
+    ("ancla_grid_a", "ANCLA 1 (esquina SUPERIOR IZQUIERDA): el encabezado gris de la tabla, solo 'Mnemo | Extended Mnemo | "
+                     "Description' (NO incluyas RIC ni Term). Mouse en la esquina superior izquierda de 'Mnemo'"),
+    ("ancla_grid_b", "ANCLA 1 (esquina INFERIOR DERECHA): esquina inferior derecha de ese encabezado, al final de 'Description'"),
     ("fila1", "Mouse sobre el TEXTO de la celda Mnemo de la PRIMERA fila visible (parte izquierda del texto)"),
     ("fila2", "Mouse sobre el texto de la celda Mnemo de la SEGUNDA fila (misma posición horizontal)"),
     ("filaN", "Mouse sobre el texto de la celda Mnemo de la ÚLTIMA fila completamente visible"),
     ("ext", "Mouse sobre la columna 'Extended Mnemo' (vacía), parte izquierda, en cualquier fila"),
     ("term_borde", "Mouse en el ENCABEZADO, justo en la línea que separa RIC | Term (borde izquierdo de Term)"),
     ("term_der", "Mouse en el ENCABEZADO, en el borde derecho de la columna Term (antes de 'Cyc')"),
+    ("ancla_der_a", "ANCLA 2 (esquina SUPERIOR IZQUIERDA): encabezado de la tabla de la derecha 'Date | Cycle | Name'"),
+    ("ancla_der_b", "ANCLA 2 (esquina INFERIOR DERECHA): esquina inferior derecha de ese encabezado (después de 'Name')"),
     ("dd_izq", "Mouse DENTRO del dropdown ('Short term index'), al inicio del texto y centrado verticalmente"),
     ("dd_flecha", "Mouse sobre el botón/flecha del dropdown"),
 ]
+# Esquina que cierra cada ancla (al capturarla se guarda el recorte de imagen).
+ANCLA_CIERRE = {"ancla_grid_b": "grid", "ancla_der_b": "der"}
+# A qué ancla pertenece cada punto (los puntos se mueven junto con su ancla).
+PUNTO_ANCLA = {"fila1": "grid", "fila2": "grid", "filaN": "grid", "ext": "grid", "term_borde": "grid",
+               "term_der": "grid", "dd_izq": "der", "dd_flecha": "der"}
 
 
 @dataclass
 class Config:
-    puntos: dict
+    puntos: dict                   # posiciones (de pantalla) al momento de calibrar
+    anclas: dict = field(default_factory=dict)   # {"grid": {"archivo": ..., "origen": [x, y]}, "der": {...}}
     ensanchar_px: int = 140        # cuánto se ensancha la columna Term hacia la izquierda (0 = no tocar)
     intervalo_tecla: float = 0.12  # segundos entre teclas (Citrix puede perder teclas si es muy rápido)
     pausa: float = 1.0             # multiplicador de todas las esperas (súbelo si Citrix va lento)
@@ -86,6 +104,9 @@ class Config:
         faltan = [n for n, _ in PUNTOS_CALIBRACION if n not in d.get("puntos", {})]
         if faltan:
             raise ErrorSophis(f"Calibración incompleta (faltan {faltan}). Corre:  python sophis_auto.py calibrar")
+        if set(d.get("anclas", {})) != {"grid", "der"}:
+            raise ErrorSophis("La calibración es de una versión anterior (sin anclas de imagen). "
+                              "Corre de nuevo:  python sophis_auto.py calibrar")
         return Config(**d)
 
     def guardar(self, ruta: Path = ARCHIVO_CONFIG) -> None:
@@ -141,8 +162,11 @@ def clasificar_term(texto: str, umbral: float = 0.82, margen: float = 0.06) -> s
 
 def term_truncado(texto: str) -> bool:
     """True si parece 'Short ter...' (la columna Term está angosta)."""
-    n = _norm(texto)
-    return clasificar_term(texto) is None and (n.startswith("short") or n.startswith("long")) and len(n) < 12
+    for trozo in texto.split(" | "):      # varias lecturas del mismo recorte van unidas con ' | '
+        n = _norm(trozo)
+        if clasificar_term(trozo) is None and (n.startswith("short") or n.startswith("long")) and len(n) < 12:
+            return True
+    return False
 
 
 def contiene_palabra(texto: str, palabra: str, umbral: float = 0.8) -> bool:
@@ -167,6 +191,42 @@ def colores_filas(img: Image.Image, alto_fila: float, n: int) -> list[tuple]:
 
 def filas_con_color(colores: list[tuple], ref: tuple, tol: int) -> list[int]:
     return [i for i, c in enumerate(colores) if distancia_color(c, ref) <= tol]
+
+
+def localizar_plantilla(captura: Image.Image, plantilla: Image.Image) -> tuple[int, int, float]:
+    """Busca `plantilla` dentro de `captura`. Devuelve (x, y, parecido 0-1) de su esquina superior izquierda."""
+    import cv2
+    import numpy as np
+
+    a = cv2.cvtColor(np.asarray(captura.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    t = cv2.cvtColor(np.asarray(plantilla.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    if t.shape[0] > a.shape[0] or t.shape[1] > a.shape[1]:
+        return 0, 0, 0.0
+    res = cv2.matchTemplate(a, t, cv2.TM_CCOEFF_NORMED)
+    _, mejor, _, pos = cv2.minMaxLoc(res)
+    return int(pos[0]), int(pos[1]), float(mejor)
+
+
+def calcular_puntos(captura: Image.Image, cfg: "Config") -> tuple[dict, dict]:
+    """Encuentra las anclas en la captura y devuelve (puntos en coordenadas ACTUALES, info por ancla).
+    Lanza ErrorSophis si no está la ventana a la vista."""
+    puntos, info = {}, {}
+    for nombre, anc in cfg.anclas.items():
+        ruta = Path(anc["archivo"])
+        if not ruta.exists():
+            raise ErrorSophis(f"Falta la imagen de ancla {ruta}. Corre de nuevo:  python sophis_auto.py calibrar")
+        x, y, score = localizar_plantilla(captura, Image.open(ruta))
+        info[nombre] = (x - anc["origen"][0], y - anc["origen"][1], score)
+        if score < UMBRAL_ANCLA:
+            raise ErrorSophis(
+                f"No encuentro la ventana de Sophis en pantalla (ancla '{nombre}', parecido {score:.2f} < {UMBRAL_ANCLA}). "
+                "¿Está visible (no minimizada ni tapada) y en el monitor principal? Si cambió el zoom/resolución "
+                "de Citrix, vuelve a calibrar.")
+    for pt, nombre in PUNTO_ANCLA.items():
+        dx, dy, _ = info[nombre]
+        px, py = cfg.puntos[pt]
+        puntos[pt] = [px + dx, py + dy]
+    return puntos, info
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -347,6 +407,7 @@ class Lectura:
     texto: str
     verificado: bool = True
     vistos: tuple = ()   # mnemos leídos en la fila (para detectar coincidencia solo por prefijo)
+    term_txt: str = ""   # texto crudo leído de la celda Term (para detectar columna truncada)
 
 
 @dataclass
@@ -363,7 +424,8 @@ class Automatizador:
         self.ocr = ocr
         self.cfg = cfg
         self.log = log
-        self.g = self._geometria()
+        self.abs: dict = {}
+        self.g: Geometria
         self._ancho_aplicado = False
         self._color_sel: tuple | None = None
         self._tol = 30
@@ -373,8 +435,15 @@ class Automatizador:
         time.sleep(seg * self.cfg.pausa)
 
     def _pt(self, nombre: str) -> tuple[int, int]:
-        x, y = self.cfg.puntos[nombre]
+        x, y = self.abs[nombre]
         return int(x), int(y)
+
+    def localizar(self) -> None:
+        """Encuentra la ventana en pantalla (puede estar en otra posición que al calibrar) y recalcula los puntos."""
+        self.abs, info = calcular_puntos(self.p.captura(), self.cfg)
+        self.g = self._geometria()
+        mov = ", ".join(f"{n}: desplazada ({dx:+d},{dy:+d}) parecido {sc:.2f}" for n, (dx, dy, sc) in info.items())
+        self.log(f"  ventana localizada -> {mov}")
 
     def _geometria(self) -> Geometria:
         f1, f2, fn = self._pt("fila1"), self._pt("fila2"), self._pt("filaN")
@@ -426,7 +495,7 @@ class Automatizador:
         self.log(f"Color de fila seleccionada: {sel} (tolerancia {self._tol})")
 
     def preparar(self) -> None:
-        self.ensanchar_term()
+        self.localizar()
         self.calibrar_color_seleccion()
 
     # ── grid ────────────────────────────────────────────────────────────────
@@ -491,19 +560,19 @@ class Automatizador:
             if txt:
                 celdas = [c.strip() for c in re.split(r"[\t\r\n]+", txt) if c.strip()]
                 if any(_norm_codigo(c) == _norm_codigo(codigo) for c in celdas[:3]):
-                    return Lectura(True, clasificar_term(txt), "portapapeles", txt)
+                    return Lectura(True, clasificar_term(txt), "portapapeles", txt, term_txt=txt)
                 if celdas:
-                    ultima = Lectura(False, clasificar_term(txt), "portapapeles", txt, vistos=(celdas[0],))
+                    ultima = Lectura(False, clasificar_term(txt), "portapapeles", txt, vistos=(celdas[0],), term_txt=txt)
         if modo in ("auto", "ocr"):
             ok, vistos = self._mnemo_por_ocr(i, codigo)
             term, txt_t = self._term_por_ocr(i)
             texto = f"mnemo={vistos} term='{txt_t}'"
             if ok:
-                return Lectura(True, term, "ocr", texto, vistos=tuple(vistos))
+                return Lectura(True, term, "ocr", texto, vistos=tuple(vistos), term_txt=txt_t)
             if not self.cfg.verificar_mnemo and term:
                 self.log("  ⚠ Mnemo NO verificado (verificar_mnemo=False)")
-                return Lectura(True, term, "ocr", texto, verificado=False)
-            return Lectura(False, term, "ocr", texto, vistos=tuple(vistos))
+                return Lectura(True, term, "ocr", texto, verificado=False, term_txt=txt_t)
+            return Lectura(False, term, "ocr", texto, vistos=tuple(vistos), term_txt=txt_t)
         return ultima or Lectura(False, None, modo, "")
 
     # ── búsqueda ────────────────────────────────────────────────────────────
@@ -601,15 +670,15 @@ class Automatizador:
         t0 = time.time()
         while time.time() - t0 < timeout * max(1.0, self.cfg.pausa):
             self._esp(1.0)
-            lineas = self.ocr.leer(self.p.captura(), escala=1, margen=8)
-            hallado = {}
-            for palabra in ("Maturity", "Minimum", "Maximum"):
-                for l in lineas:
-                    if contiene_palabra(l.texto, palabra):
-                        hallado[palabra] = (l.cx, l.cy)
-                        break
-            if len(hallado) >= 2:
-                return hallado
+            img = self.p.captura()
+            for escala in (1, 2):      # pasada rápida y, si no alcanza, una más precisa (el texto es pequeño)
+                hallado = {}
+                for l in self.ocr.leer(img, escala=escala, margen=8):
+                    for palabra in ("Maturity", "Minimum", "Maximum"):
+                        if palabra not in hallado and contiene_palabra(l.texto, palabra):
+                            hallado[palabra] = (l.cx, l.cy)
+                if len(hallado) >= 2:
+                    return hallado
         ruta = self.guardar_debug("ventana_no_abrio")
         raise ErrorSophis(f"No apareció la ventana Maturity/Minimum/Maximum. Captura: {ruta}")
 
@@ -617,10 +686,16 @@ class Automatizador:
     def abrir_contrato(self, codigo: str) -> Resultado:
         codigo = codigo.strip().upper()
         self.log(f"[{codigo}] buscando ...")
+        self.localizar()      # la ventana pudo moverse desde el código anterior
         i, lect = self.buscar(codigo)
+        if not lect.term and self.cfg.ensanchar_px > 0 and not self._ancho_aplicado:
+            # Term ilegible (normalmente porque sale truncado: "Short ter..."): se ensancha la columna una vez
+            # por sesión. Con el lector de portapapeles esto casi nunca hace falta.
+            self.ensanchar_term()
+            lect = self.leer_fila(i, codigo)
         if not lect.term:
-            if term_truncado(lect.texto):
-                raise ErrorSophis(f"[{codigo}] la columna Term está truncada ('{lect.texto}'). "
+            if term_truncado(lect.term_txt):
+                raise ErrorSophis(f"[{codigo}] la columna Term está truncada ('{lect.term_txt}'). "
                                   f"Aumenta ensanchar_px en {ARCHIVO_CONFIG} o ensánchala a mano.")
             ruta = self.guardar_debug(f"term_ilegible_{codigo}")
             raise ErrorSophis(f"[{codigo}] no pude leer el Term ('{lect.texto}'). Captura: {ruta}")
@@ -645,8 +720,9 @@ class Automatizador:
 def cmd_calibrar(args) -> None:
     p = Pantalla()
     print("CALIBRACIÓN: para cada punto pon el mouse donde se indica y NO lo muevas.")
-    print(f"Se captura automáticamente al terminar la cuenta regresiva de {args.espera}s.\n")
-    puntos = {}
+    print(f"Se captura automáticamente al terminar la cuenta regresiva de {args.espera}s.")
+    print("La ventana puede estar en cualquier posición, pero debe estar completa y visible.\n")
+    puntos, anclas = {}, {}
     for k, (nombre, texto) in enumerate(PUNTOS_CALIBRACION, 1):
         print(f"[{k}/{len(PUNTOS_CALIBRACION)}] {texto}")
         for s in range(args.espera, 0, -1):
@@ -655,13 +731,33 @@ def cmd_calibrar(args) -> None:
         x, y = p.posicion()
         puntos[nombre] = [x, y]
         print(f"   {nombre} = ({x}, {y})        ")
-    previa = Config.cargar() if ARCHIVO_CONFIG.exists() else None
-    cfg = Config(puntos=puntos)
+        if nombre in ANCLA_CIERRE:
+            nom = ANCLA_CIERRE[nombre]
+            ax, ay = puntos[f"ancla_{nom}_a"]
+            x0, y0, x1, y1 = min(ax, x), min(ay, y), max(ax, x), max(ay, y)
+            if x1 - x0 < 40 or y1 - y0 < 8:
+                raise ErrorSophis(f"La ancla '{nom}' quedó muy pequeña ({x1 - x0}x{y1 - y0}px). "
+                                  "Marca bien las dos esquinas del encabezado y repite 'calibrar'.")
+            ARCHIVO_ANCLAS.mkdir(exist_ok=True)
+            ruta = ARCHIVO_ANCLAS / f"{nom}.png"
+            p.captura((x0, y0, x1, y1)).save(ruta)
+            anclas[nom] = {"archivo": str(ruta), "origen": [x0, y0]}
+    previa = None
+    try:
+        previa = Config.cargar()
+    except ErrorSophis:
+        pass
+    cfg = Config(puntos=puntos, anclas=anclas)
     if previa:
         cfg.ensanchar_px, cfg.intervalo_tecla = previa.ensanchar_px, previa.intervalo_tecla
         cfg.pausa, cfg.lector, cfg.verificar_mnemo = previa.pausa, previa.lector, previa.verificar_mnemo
     cfg.guardar()
-    print(f"\nGuardado en {ARCHIVO_CONFIG}. Siguiente:  python sophis_auto.py diagnostico <CODIGO>")
+    # Comprobación inmediata: las anclas deben encontrarse a sí mismas con parecido ~1.0
+    _, info = calcular_puntos(p.captura(), cfg)
+    for nom, (dx, dy, sc) in info.items():
+        print(f"Ancla '{nom}': parecido {sc:.2f}, desplazamiento ({dx:+d},{dy:+d})  <- debe ser ~1.00 y (0,0)")
+    print(f"\nGuardado en {ARCHIVO_CONFIG} y {ARCHIVO_ANCLAS}/. Ahora puedes mover la ventana de lugar.")
+    print("Siguiente:  python sophis_auto.py diagnostico <CODIGO>")
 
 
 def _crear(args) -> Automatizador:
