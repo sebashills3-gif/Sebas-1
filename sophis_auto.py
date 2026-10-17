@@ -532,9 +532,8 @@ class Automator:
         self._widened = True
         self._wait(0.6)
 
-    def calibrate_selection_color(self) -> None:
-        self.click_row(0)
-        self._wait(0.4)
+    def _sample_selection_color(self) -> None:
+        """Learns what a selected row looks like. Must run right after row 0 was clicked (so it is selected)."""
         colors = self._colors()
         selected, others = colors[0], colors[1:3]
         dist = min(color_distance(selected, o) for o in others)
@@ -549,7 +548,13 @@ class Automator:
 
     def prepare(self) -> None:
         self.locate()
-        self.calibrate_selection_color()
+
+    def focus_first_row(self) -> None:
+        """The ONE click made before typing: focuses the grid, resets the incremental-search buffer and, since
+        row 0 is now selected, learns the selection color from it. No other click happens before typing."""
+        self.click_row(0)
+        self._wait(0.4)
+        self._sample_selection_color()
 
     # ── grid ────────────────────────────────────────────────────────────────
     def click_row(self, i: int, double: bool = False) -> None:
@@ -655,8 +660,7 @@ class Automator:
     def search(self, code: str, attempts: int = 3) -> tuple[int, Reading]:
         last = ""
         for k in range(1, attempts + 1):
-            self.click_row(0)       # focuses the grid and resets the incremental-search buffer
-            self._wait(0.4)
+            self.focus_first_row()
             self.s.type_text(code)
             self._wait(0.8)
             i = self.selected_row()
@@ -853,8 +857,7 @@ def cmd_diagnose(args) -> None:
     DEBUG_DIR.mkdir(exist_ok=True)
     a.save_debug("diag_screen")
     a.prepare()
-    a.click_row(0)       # prepare()'s earlier click is kept apart by the anti-double-click wait
-    a._wait(0.4)
+    a.focus_first_row()
     a.s.type_text(code)
     a._wait(0.8)
     i = a.selected_row()

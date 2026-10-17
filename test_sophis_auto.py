@@ -75,6 +75,7 @@ class FakeSophis:
         self.clipboard, self.popup_visible = clipboard, popup_visible
         self._clip = None
         self.key_interval = 0
+        self.events = []       # ("click" | "double" | "type", ...) in the order they happened
 
     # drawing
     def _image(self):
@@ -120,6 +121,10 @@ class FakeSophis:
         return None
 
     def click(self, x, y):
+        self.events.append(("click", x, y))
+        self._click(x, y)
+
+    def _click(self, x, y):
         x, y = x - self.dx, y - self.dy
         if self.popup:
             if 700 <= x <= 850 and 76 <= y <= 76 + 110:
@@ -134,11 +139,13 @@ class FakeSophis:
             self.sel, self.typed = i, ""
 
     def double_click(self, x, y):
-        self.click(x, y)
+        self.events.append(("double", x, y))
+        self._click(x, y)
         if self._row_at(x - self.dx, y - self.dy) is not None:
             self.dialog = True
 
     def type_text(self, text):
+        self.events.append(("type", text))
         for ch in text:
             self.typed += ch.upper()
             for i, (m, _) in enumerate(ROWS):
@@ -236,6 +243,24 @@ def test_unknown_code_aborts_without_opening(ocr, anchors, tmp_path, monkeypatch
     with pytest.raises(SophisError):
         a.open_contract("QQQ")
     assert not fake.dialog
+
+
+# ── exactly one click before typing ─────────────────────────────────────────
+
+@pytest.mark.parametrize("reader,clipboard", [("ocr", False), ("auto", True)])
+def test_a_single_click_before_typing(ocr, anchors, reader, clipboard):
+    a, fake = make(ocr, anchors, reader=reader, clipboard=clipboard)
+    assert fake.events == []                      # preparing must not click anything
+    a.search("ZS")
+    kinds = [e[0] for e in fake.events]
+    assert kinds[:2] == ["click", "type"], kinds  # one click, then straight to typing
+
+
+def test_each_code_gets_one_click_then_typing_until_the_window_opens(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    a.open_contract("ZYS")
+    first_type = [e[0] for e in fake.events].index("type")
+    assert [e[0] for e in fake.events[:first_type]] == ["click"]
 
 
 # ── the window is NOT always in the same position ───────────────────────────
