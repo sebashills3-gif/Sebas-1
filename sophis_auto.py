@@ -213,8 +213,25 @@ def row_colors(img: Image.Image, row_height: float, n: int) -> list[tuple]:
     return colors
 
 
-def rows_with_color(colors: list[tuple], ref: tuple, tol: int) -> list[int]:
-    return [i for i, c in enumerate(colors) if color_distance(c, ref) <= tol]
+def find_selected_row(colors: list[tuple], tol: int = 30) -> int | None:
+    """Index of the one row whose color stands out from the grid's own row colors, or None.
+
+    Needs no reference color: grids alternate two stripe colors, so each row is compared with the median
+    color of the rows of the same parity (the median ignores the single selected row). The selected row is
+    the only one that differs by more than `tol`."""
+    def median(values):
+        values = sorted(values)
+        mid = len(values) // 2
+        return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+    refs = {}
+    for parity in (0, 1):
+        group = [c[:3] for j, c in enumerate(colors) if j % 2 == parity]
+        if not group:
+            return None
+        refs[parity] = tuple(median([c[k] for c in group]) for k in range(3))
+    outliers = [i for i, c in enumerate(colors) if color_distance(c, refs[i % 2]) > tol]
+    return outliers[0] if len(outliers) == 1 else None
 
 
 def locate_template(screenshot: Image.Image, template: Image.Image) -> tuple[int, int, float]:
@@ -475,8 +492,6 @@ class Automator:
         self.pts: dict = {}
         self.g: Geometry
         self._widened = False
-        self._selected_color: tuple | None = None
-        self._tol = 30
 
     # ── helpers ─────────────────────────────────────────────────────────────
     def _wait(self, seconds: float) -> None:
@@ -532,29 +547,14 @@ class Automator:
         self._widened = True
         self._wait(0.6)
 
-    def _sample_selection_color(self) -> None:
-        """Learns what a selected row looks like. Must run right after row 0 was clicked (so it is selected)."""
-        colors = self._colors()
-        selected, others = colors[0], colors[1:3]
-        dist = min(color_distance(selected, o) for o in others)
-        if dist < 30:
-            path = self.save_debug("selection_not_distinguishable")
-            raise SophisError(
-                f"Cannot tell the selected row from the others by color (difference={dist}). "
-                f"Check that 'ext' and 'row1' are calibrated correctly. Screenshot: {path}")
-        self._selected_color = selected
-        self._tol = max(12, min(40, dist // 2))
-        self.log(f"Selected-row color: {selected} (tolerance {self._tol})")
-
     def prepare(self) -> None:
         self.locate()
 
     def focus_first_row(self) -> None:
-        """The ONE click made before typing: focuses the grid, resets the incremental-search buffer and, since
-        row 0 is now selected, learns the selection color from it. No other click happens before typing."""
+        """The ONE click made before typing: focuses the grid and resets the incremental-search buffer.
+        Nothing else happens between this click and typing, so typing can never be skipped."""
         self.click_row(0)
         self._wait(0.4)
-        self._sample_selection_color()
 
     # ── grid ────────────────────────────────────────────────────────────────
     def click_row(self, i: int, double: bool = False) -> None:
@@ -568,10 +568,7 @@ class Automator:
         return row_colors(img, g.h, g.n)
 
     def selected_row(self) -> int | None:
-        if self._selected_color is None:
-            raise SophisError("prepare() has not run (selection color is unknown).")
-        idx = rows_with_color(self._colors(), self._selected_color, self._tol)
-        return idx[0] if len(idx) == 1 else None
+        return find_selected_row(self._colors())
 
     def _cell_region(self, i: int, x0: int, x1: int) -> tuple[int, int, int, int]:
         yc = self.g.row_y(i)

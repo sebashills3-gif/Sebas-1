@@ -45,11 +45,28 @@ def test_the_five_terms_are_told_apart():
         assert sa.classify_term(t) == t
 
 
-def test_rows_with_color():
-    img = Image.new("RGB", (7, 72), (255, 255, 255))
-    ImageDraw.Draw(img).rectangle((0, 24, 6, 47), fill=(170, 195, 235))
-    colors = sa.row_colors(img, 24, 3)
-    assert sa.rows_with_color(colors, (170, 195, 235), 20) == [1]
+@pytest.mark.parametrize("selected", [0, 1, 4, 7])
+def test_find_selected_row_needs_no_reference_color(selected):
+    stripes = [(255, 255, 255), (235, 235, 235)]
+    colors = [stripes[i % 2] for i in range(8)]
+    colors[selected] = (170, 195, 235)
+    assert sa.find_selected_row(colors) == selected
+
+
+def test_find_selected_row_none_or_ambiguous():
+    stripes = [(255, 255, 255), (235, 235, 235)]
+    plain = [stripes[i % 2] for i in range(8)]
+    assert sa.find_selected_row(plain) is None                       # nothing selected
+    two = list(plain)
+    two[1] = two[4] = (170, 195, 235)
+    assert sa.find_selected_row(two) is None                         # ambiguous
+
+
+def test_find_selected_row_with_compression_noise():
+    colors = [(255, 255, 255) if i % 2 == 0 else (236, 235, 234) for i in range(10)]
+    colors[3] = (168, 196, 233)
+    colors[6] = (254, 255, 254)
+    assert sa.find_selected_row(colors) == 3
 
 
 # ── fake screen ─────────────────────────────────────────────────────────────
@@ -250,7 +267,7 @@ def test_unknown_code_aborts_without_opening(ocr, anchors, tmp_path, monkeypatch
 @pytest.mark.parametrize("reader,clipboard", [("ocr", False), ("auto", True)])
 def test_a_single_click_before_typing(ocr, anchors, reader, clipboard):
     a, fake = make(ocr, anchors, reader=reader, clipboard=clipboard)
-    assert fake.events == []                      # preparing must not click anything
+    assert fake.events == []                      # preparing must not click anything or type
     a.search("ZS")
     kinds = [e[0] for e in fake.events]
     assert kinds[:2] == ["click", "type"], kinds  # one click, then straight to typing
@@ -399,3 +416,11 @@ def test_clicks_that_are_already_apart_do_not_wait(monkeypatch):
     clock["t"] += 5
     screen.click(10, 10)
     assert not waits
+
+
+def test_typing_is_never_skipped_after_the_click(ocr, anchors):
+    """Whatever the screen looks like, the click is followed by typing (no pre-check can abort before it)."""
+    a, fake = make(ocr, anchors, reader="ocr")
+    a.focus_first_row()
+    a.s.type_text("ZS")
+    assert [e[0] for e in fake.events] == ["click", "type"]
