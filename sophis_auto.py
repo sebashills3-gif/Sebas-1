@@ -1564,9 +1564,12 @@ class Automator:
         self._wait(0.6)
         self._trace(f"{column}_1b_selected")
         base = median_color(self.s.capture(box))
+        self._open_debug = f"cell color after selecting it {base}"
 
         def editing() -> bool:
-            return color_distance(median_color(self.s.capture(box)), base) > 45
+            now = median_color(self.s.capture(box))
+            self._open_debug += f"; later {now}"
+            return color_distance(now, base) > 45
 
         if editing():                                   # (a click on an already selected cell can open it)
             return True
@@ -1597,13 +1600,23 @@ class Automator:
         self.log(f"  {column} of {row.date:%d %b %Y}: opening the cell at ({x}, {row.cy}) to type {value!r}")
         self._trace(f"{column}_1_before")
         existing, _ = self._read_cell_number(win, x, row.cy, half) if verify else (None, [])
-        if not self._open_cell_for_editing(win, row, column, x, half):
+        opened = self._open_cell_for_editing(win, row, column, x, half)
+        if not opened and win.title:
+            # An editor may have been left open somewhere (some grids keep editing after Enter), which also hides
+            # the "cell changed" signal. Clicking the window's title closes it without changing anything.
+            self.log("    the cell did not open; clicking the window title (closes any editor left open) and retrying")
+            self.s.click(*win.title)
+            self._wait(0.7)
+            self._trace(f"{column}_1c_title_clicked")
+            opened = self._open_cell_for_editing(win, row, column, x, half)
+        if not opened:
             if check_edit:
                 path = self.save_debug(f"cell_would_not_open_{column}", self.s.capture())
                 raise SophisError(
                     f"The {column} cell of {row.date:%d %b %Y} did not open for editing (tried: select + double click, "
-                    "slower double click, F2). NOTHING was typed. If your editor does not look different when it is "
-                    f"open, run again with --no-edit-check. Screenshot: {path}")
+                    "slower double click, F2; also after clicking the window title). NOTHING was typed. If your "
+                    f"editor does not look different when it is open, run again with --no-edit-check. "
+                    f"({getattr(self, '_open_debug', '')}) Screenshot: {path}")
             self.log("    WARNING: could not tell whether the cell opened; typing anyway (--no-edit-check)")
         if existing is not None:
             self.s.hotkey("ctrl", "a")              # the cell already held a value: replace it
@@ -1630,6 +1643,20 @@ class Automator:
                               f"(OCR readings: {readings}). Stopped before touching anything else. Screenshot: {path}")
         self.log(f"    {column} reads back as {seen:g}")
         return "ok"
+
+    def _reuse_row(self, previous: CellTarget, view) -> CellTarget | None:
+        """Same row, next cell: one quick read is enough IF the list looks exactly as before. Enter may have moved
+        the selection or scrolled the list by a row (then the rows are shifted); in that case, or if the quick read
+        fails for any reason, it returns None and the caller searches the date again."""
+        try:
+            win = self.read_update_window()
+        except SophisError as e:
+            self.log(f"  (quick re-read failed: {e}; searching the date again)")
+            return None
+        if view(win) != view(previous.win):
+            return None
+        return CellTarget(previous.row, (win.x_minimum, previous.row.cy), (win.x_maximum, previous.row.cy),
+                          previous.matches, ambiguous=False, win=win)
 
     def fill_values(self, entries: list, verify: bool = True, dry_run: bool = False, commit: str = "enter",
                     check_edit: bool = True) -> list:
@@ -1663,15 +1690,7 @@ class Automator:
             for column, value in (("minimum", e.minimum), ("maximum", e.maximum)):
                 if value is None:
                     continue
-                t = None
-                if previous is not None:
-                    # Same row, next cell: one quick read is enough IF the list looks exactly as before (Enter may
-                    # have moved the selection or scrolled the list by a row; then the rows would be shifted and
-                    # the full search below finds the date again).
-                    win = self.read_update_window()
-                    if view(win) == view(previous.win):
-                        t = CellTarget(previous.row, (win.x_minimum, previous.row.cy), (win.x_maximum, previous.row.cy),
-                                       previous.matches, ambiguous=False, win=win)
+                t = self._reuse_row(previous, view) if previous is not None else None
                 if t is None:
                     t = self.locate_date(e.date, e.occurrence)
                     if t.ambiguous:

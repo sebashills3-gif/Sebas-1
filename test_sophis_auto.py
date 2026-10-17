@@ -157,6 +157,7 @@ class FakeSophis:
         self.keys = []         # hotkeys / key presses seen by the update window
         self.enter_moves = True      # Enter commits the edit AND moves the selection to the next row (like real grids)
         self.enter_scrolls = False   # ...and, on the last visible row, scrolls the list by one row
+        self.enter_opens_next = False  # ...and opens the NEXT cell of the row (Maximum) for editing, like some grids
 
     # drawing
     def _image(self):
@@ -263,6 +264,9 @@ class FakeSophis:
         return (self.dscroll + k, col) if col else None
 
     def _commit_cell(self):
+        if self.cell_edit is not None and self.cell_buf == self.values.get(self.cell_edit, ""):
+            self.cell_edit, self.cell_buf, self.sel_all = None, "", False        # nothing was typed: nothing changes
+            return
         if self.cell_edit is not None:
             v = self.cell_buf
             if self.corrupt:
@@ -288,8 +292,10 @@ class FakeSophis:
         if self.dialog:                                         # the update window is modal: only it reacts
             if 520 <= x <= 600 and 415 <= y <= 435:
                 self.ok_clicks += 1                             # (the script must never do this for now)
-            self._commit_cell()                                 # any click outside an edit box commits it
             cell = self._dialog_cell(x, y)
+            if cell is not None and cell == self.cell_edit:     # a click inside the open edit box keeps editing
+                return
+            self._commit_cell()                                 # any click outside an edit box commits it
             if cell:                                            # a click on a cell selects its row and focuses it
                 self.dsel, self.dcell = cell[0], cell
             return
@@ -361,7 +367,11 @@ class FakeSophis:
             self.keys.append(key)
             if key == "enter":
                 row = self.cell_edit[0] if self.cell_edit else None
+                just = self.cell_edit
                 self._commit_cell()
+                if self.enter_opens_next and just and just[1] == "minimum":
+                    nxt = (just[0], "maximum")
+                    self.dcell, self.cell_edit, self.cell_buf, self.sel_all = nxt, nxt, self.values.get(nxt, ""), False
                 if self.enter_moves:
                     self.dsel = min(len(DATES) - 1, self.dsel + 1)
                 if self.enter_scrolls and row is not None and row == self.dscroll + VISIBLE - 1:
@@ -1624,3 +1634,37 @@ def test_a_repeated_date_is_safe_with_the_fast_second_cell(ocr, anchors):
     fake.enter_scrolls = False
     a.fill_values([sa.parse_entry("20 Nov 2026#1", "5", "6")])   # the second of two identical dates
     assert fake.values == {(6, "minimum"): "5", (6, "maximum"): "6"}
+
+
+# ── after Enter: an editor left open must not stop the Maximum cell from being filled ──
+
+def test_enter_that_leaves_the_maximum_cell_open_still_gets_both_values(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "double")
+    fake.enter_opens_next = True
+    a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
+    assert fake.values == {(7, "minimum"): "95", (7, "maximum"): "130"} and fake.stray == ""
+    assert any("clicking the window title" in l for l in lines)             # the way out it used
+
+
+def test_the_normal_case_does_not_click_the_title_at_all(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "double")
+    a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
+    assert not any("clicking the window title" in l for l in lines)
+    assert not [e for e in fake.events if e[0] == "click" and abs(e[2] - 158) <= 8]
+
+
+def test_a_failed_quick_reread_falls_back_to_searching_the_date(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "double")
+    target = a.locate_date(D("27 Nov 2026"))
+    def boom():
+        raise SophisError("header not read this time")
+    a.read_update_window = boom
+    assert a._reuse_row(target, lambda w: ()) is None
+    assert any("quick re-read failed" in l for l in lines)
+
+
+def test_the_error_when_a_cell_never_opens_says_what_the_cell_looked_like(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, lines = _grid(ocr, anchors, "never")
+    with pytest.raises(SophisError, match="cell color after selecting it"):
+        a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
