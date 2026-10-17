@@ -114,8 +114,11 @@ ANCHOR_RIGHT = (700, 188, 850, 208)  # header "Date | Cycle | Name"
 
 
 class FakeSophis:
-    def __init__(self, clipboard=False, popup_visible=True, shift=(0, 0), hidden=False):
+    def __init__(self, clipboard=False, popup_visible=True, shift=(0, 0), hidden=False, always_edit=False):
         self.dx, self.dy = shift
+        self.editing = None          # row whose Mnemo cell is open for editing (a click on a SELECTED row does it)
+        self.edited = ""             # what was typed into that edit box (i.e. what would overwrite the data)
+        self.always_edit = always_edit
         self.hidden = hidden
         self.sel, self.typed, self.dd = 0, "", "Short term index"
         self.popup, self.dialog = False, False
@@ -140,6 +143,9 @@ class FakeSophis:
             d.line((135, y, 135, y + H - 1), fill=(90, 90, 90))               # border between Mnemo and Extended
             if i == self.sel:                                                  # focus rectangle of the selection
                 d.rectangle((36, y + 1, 84, y + H - 3), outline=(0, 0, 0))
+            if i == self.editing:                                              # edit box in the Mnemo cell
+                d.rectangle((21, y + 1, 133, y + H - 2), fill=(255, 255, 255), outline=(0, 0, 0))
+                d.text((24, y + 4), self.edited, fill=(0, 0, 0), font=FONT)
             d.text((200, y + 4), "VANECK OIL SERVIC...", fill=(0, 0, 160), font=FONT)   # Description
             d.text((300, y + 4), "US92189H6071", fill=(0, 0, 160), font=FONT)           # Code
             d.text((term_left + 6, y + 4), t if term_width >= 110 else t[:9] + "...", fill=(0, 0, 160), font=FONT)
@@ -191,16 +197,23 @@ class FakeSophis:
             return
         i = self._row_at(x, y)
         if i is not None:
-            self.sel, self.typed = i, ""
+            if self.always_edit or (i == self.sel and self.editing is None):
+                self.editing = i                       # clicking an already selected cell opens it for editing
+            else:
+                self.sel, self.typed, self.editing = i, "", None
 
     def double_click(self, x, y):
         self.events.append(("double", x, y))
+        self.editing = None
         self._click(x, y)
         if self._row_at(x - self.dx, y - self.dy) is not None:
             self.dialog = True
 
     def type_text(self, text):
         self.events.append(("type", text))
+        if self.editing is not None:                   # typing into the open edit box overwrites the cell
+            self.edited += text
+            return
         for ch in text:
             self.typed += ch.upper()
             for i, (m, _) in enumerate(ROWS):
@@ -261,7 +274,7 @@ def make(ocr, anchors, **kw):
         "row1": [45, Y1], "row2": [45, Y1 + H], "rowN": [45, Y1 + 7 * H], "ext": [140, Y1],
         "ric_left": [RIC_LEFT, 70], "term_left": [BORDER, 70], "term_right": [RIGHT, 70], "dd_left": [706, 62], "dd_arrow": list(ARROW),
     }, slowdown=0.01, **{k: v for k, v in kw.items() if k in ("reader", "verify_mnemonic")})
-    screen = FakeSophis(**{k: v for k, v in kw.items() if k in ("clipboard", "popup_visible", "shift", "hidden")})
+    screen = FakeSophis(**{k: v for k, v in kw.items() if k in ("clipboard", "popup_visible", "shift", "hidden", "always_edit")})
     a = Automator(screen, ocr, cfg, log=lambda *_: None)
     a.prepare()
     return a, screen
@@ -468,7 +481,7 @@ def test_clicks_that_are_already_apart_do_not_wait(monkeypatch):
 def test_typing_is_never_skipped_after_the_click(ocr, anchors):
     """Whatever the screen looks like, the click is followed by typing (no pre-check can abort before it)."""
     a, fake = make(ocr, anchors, reader="ocr")
-    a.focus_first_row()
+    a.focus_grid()
     a.s.type_text("ZS")
     assert [e[0] for e in fake.events] == ["click", "type"]
 
@@ -609,3 +622,44 @@ def test_text_from_ocr_result(result, expected):
 
 def test_match_code_survives_non_string_readings():
     assert sa.match_code([0.0, None, "ZJO"], 3, "ZJO") == "exact"
+
+
+# ── a click on an already selected cell opens it for editing: never do that ──
+
+def test_the_click_never_lands_on_the_row_that_is_already_selected(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")            # the fake starts with row 0 selected
+    clicked = a.focus_grid()
+    assert clicked == 1 and fake.editing is None
+    assert fake.events[0] == ("click", 45, Y1 + H)        # row 1, not the selected row 0
+
+
+def test_when_row_one_is_the_selected_one_it_clicks_another(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    fake.sel = 1
+    assert a.focus_grid() == 2 and fake.editing is None
+
+
+@pytest.mark.parametrize("code", ["ZS", "ZQK", "ZYS", "ZM"])
+def test_repeated_searches_never_overwrite_a_cell(ocr, anchors, code):
+    """The reported bug: after a search the found row sits selected at the top; clicking it again opened it for
+    editing and the next search was typed INTO the cell."""
+    a, fake = make(ocr, anchors, reader="ocr")
+    for c in ("ZJO", code, "ZTS", code):
+        a.search(c)
+    assert fake.edited == "" and fake.editing is None
+
+
+def test_edit_mode_is_detected_and_nothing_is_typed(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake = make(ocr, anchors, reader="ocr", always_edit=True)   # every click opens the cell for editing
+    with pytest.raises(SophisError, match="NOTHING was typed"):
+        a.search("ZS")
+    assert not [e for e in fake.events if e[0] == "type"] and fake.edited == ""
+
+
+def test_row_in_edit_mode_detection(ocr, anchors):
+    a, fake = make(ocr, anchors)
+    assert not a._row_in_edit_mode(0)                     # selected normally: every cell has the highlight color
+    assert not a._row_in_edit_mode(3)                     # an ordinary row
+    fake.editing = 0                                      # the Mnemo cell became a white edit box
+    assert a._row_in_edit_mode(0)

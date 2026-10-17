@@ -294,6 +294,13 @@ def text_from_ocr_result(result) -> str:
     return ""
 
 
+def median_color(img: Image.Image) -> tuple:
+    """Per-channel median color of an image (robust to a few text pixels)."""
+    import numpy as np
+    a = np.asarray(img.convert("RGB")).reshape(-1, 3)
+    return tuple(int(v) for v in np.median(a, axis=0))
+
+
 def color_distance(a, b) -> int:
     return sum(abs(int(x) - int(y)) for x, y in zip(a[:3], b[:3]))
 
@@ -694,16 +701,47 @@ class Automator:
     def prepare(self) -> None:
         self.locate()
 
-    def focus_first_row(self) -> None:
-        """The ONE click made before typing: focuses the grid and resets the incremental-search buffer.
-        Nothing else happens between this click and typing, so typing can never be skipped."""
-        self.click_row(0)
+    def focus_grid(self) -> int:
+        """Gives the grid keyboard focus with ONE click and returns the row that was clicked.
+
+        IMPORTANT: in this grid a click on a row that is ALREADY SELECTED opens its cell for editing, and
+        whatever is typed next overwrites the cell. So the click always goes to a row that is not selected
+        (a click on an unselected row only selects it, after which typing jumps through the list). Before
+        returning, it checks that the grid is not in edit mode; if it cannot get a safe selection it raises
+        and nothing is typed."""
+        selected = self.selected_row()
+        candidates = [i for i in (1, 2, 3) if i != selected and i < self.g.n]
+        target = candidates[0]
+        self.click_row(target)
         self._wait(0.4)
         if not self._first_click_done:
             # The very first click may only bring the Citrix window to the front; give it a moment so the
             # first characters are not typed into a window that is not ready yet.
             self._first_click_done = True
             self._wait(1.0)
+        if self.selected_row() == target and not self._row_in_edit_mode(target):
+            return target
+        # Either the click did not select the row (window not active yet) or the cell went into edit mode.
+        # Click a different, unselected row (this ends any edit without typing anything) and check again.
+        alt = next(i for i in (1, 2, 3, 4) if i not in (target, selected) and i < self.g.n)
+        self.log(f"  row {target} did not end up cleanly selected; clicking row {alt} instead")
+        self.click_row(alt)
+        self._wait(0.5)
+        if self.selected_row() == alt and not self._row_in_edit_mode(alt):
+            return alt
+        path = self.save_debug("cannot_select_safely")
+        raise SophisError(
+            "Could not select a row safely (a click on an already selected cell opens it for editing, and "
+            f"typing would overwrite it). NOTHING was typed. Check the Sophis window. Screenshot: {path}")
+
+    def _row_in_edit_mode(self, i: int) -> bool:
+        """True if the Mnemo cell of row i is an edit box. In a selected row every cell has the highlight
+        color; an edit box shows up as a different (usually white) cell next to the highlighted ones."""
+        g = self.g
+        yc = g.row_y(i)
+        cell = self.s.capture(self._cell_region(i, g.x_mnemo0, g.x_mnemo1))
+        beside = self.s.capture((g.x_ext - 3, yc - 3, g.x_ext + 4, yc + 4))
+        return color_distance(median_color(cell), median_color(beside)) > 60
 
     # ── grid ────────────────────────────────────────────────────────────────
     def click_row(self, i: int, double: bool = False) -> None:
@@ -819,15 +857,16 @@ class Automator:
         return None
 
     def search(self, code: str, attempts: int = 3) -> tuple[int, Reading]:
-        """One click on the first row, then type the code. If the row cannot be confirmed, the next attempt
+        """One click on an unselected row, then type the code. If the row cannot be confirmed, the next attempt
         first just re-reads (the grid may still have been scrolling); only the last attempt, or one that
         found no selected row at all, clicks and types again."""
         last = ""
         retype = True
         moved = False
+        clicked = -1
         for k in range(1, attempts + 1):
             if retype or k == attempts:
-                self.focus_first_row()
+                clicked = self.focus_grid()
                 before = self._column_image()
                 self.s.type_text(code)
                 self._wait(0.8)
@@ -842,7 +881,7 @@ class Automator:
             retype = False
             # A match by shape alone is only allowed if typing really moved the grid (otherwise the code was
             # probably not found and the highlighted row is just where it already was).
-            reading = self.read_row(i, code, allow_weak=moved or i != 0)
+            reading = self.read_row(i, code, allow_weak=moved or i != clicked)
             if not reading.mnemo_ok and self._is_extension(reading, code):
                 self.log(f"  landed on {list(reading.seen)[:1]}; walking down to '{code}' ...")
                 found = self._walk_down_to(code)
@@ -1032,17 +1071,23 @@ def cmd_diagnose(args) -> None:
     DEBUG_DIR.mkdir(exist_ok=True)
     a.save_debug("diag_screen")
     a.prepare()
-    a.focus_first_row()
+    clicked = a.focus_grid()
+    print(f"Clicked row {clicked} (never an already selected one) and the grid is not in edit mode.")
     a.s.type_text(code)
     a._wait(0.8)
     i = a.selected_row()
     print(f"\nSelected row after typing '{code}': {i}")
     if i is not None:
         g = a.g
-        a.save_debug("diag_mnemo", a.s.capture(a._cell_region(i, g.x_mnemo0, g.x_mnemo1)))
+        raw = a.s.capture(a._cell_region(i, g.x_mnemo0, g.x_mnemo1))
+        a.save_debug("diag_mnemo", raw)
+        a.save_debug("diag_mnemo_x6", raw.resize((raw.width * 6, raw.height * 6), Image.NEAREST))
         a.save_debug("diag_term", a.s.capture(a._cell_region(i, g.term_x0, g.term_x1)))
-        cleaned, _ = clean_cell(a.s.capture(a._cell_region(i, g.x_mnemo0, g.x_mnemo1)))
+        cleaned, _ = clean_cell(raw)
         a.save_debug("diag_mnemo_cleaned", Image.fromarray(cleaned))
+        print("Mnemo crop size          :", raw.size, "| background color:", median_color(raw),
+              "| ext color:", median_color(a.s.capture((g.x_ext - 3, g.row_y(i) - 3, g.x_ext + 4, g.row_y(i) + 4))))
+        print("Edit mode on this row    :", a._row_in_edit_mode(i))
         readings, glyphs = a._mnemonic_by_ocr(i)
         try:
             from importlib.metadata import version
