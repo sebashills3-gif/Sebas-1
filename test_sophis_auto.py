@@ -69,13 +69,44 @@ def test_find_selected_row_with_compression_noise():
     assert sa.find_selected_row(colors) == 3
 
 
+@pytest.mark.parametrize("readings,glyphs,code,expected", [
+    (["ZJO", "ZJO"], 3, "ZJO", "exact"),
+    (["zs", "zS"], 2, "ZS", "exact"),                 # case does not matter
+    (["ZJ0", ""], 3, "ZJO", "exact"),                 # 0 / O look-alike
+    (["", ""], 1, "Z", "weak"),                       # OCR cannot read a lone 'Z' but one glyph is there
+    (["Y", "Y"], 2, "YY", "weak"),                    # OCR collapses 'YY' into 'Y', two glyphs are there
+    (["", ""], 1, "YY", "weak"),                      # the two Y's touch and count as one glyph
+    (["Z1", "z"], 2, "ZI", "exact"),                  # 1 / I look-alike
+    (["z", "z"], 2, "ZI", "weak"),
+    (["ZMH", "ZMH"], 3, "ZM", None),                  # a longer code is not the code
+    (["QS", "QS"], 2, "ZS", None),                    # first character disagrees
+    (["", ""], 0, "ZS", None),                        # nothing in the cell
+])
+def test_match_code(readings, glyphs, code, expected):
+    assert sa.match_code(readings, glyphs, code) == expected
+
+
+def test_match_code_strict_mode_refuses_weak():
+    assert sa.match_code(["", ""], 1, "Z", allow_weak=False) is None
+
+
+@pytest.mark.parametrize("readings,glyphs,code,expected", [
+    (["ZMH", "ZMH"], 3, "ZM", True),
+    (["ZM", "ZM"], 2, "ZM", False),
+    (["[ZJOL]", "ZJOL"], 3, "ZJO", False),            # noise character, but only 3 glyphs: not an extension
+    (["ZMH"], 0, "ZM", True),                         # glyph count unknown: fall back to the text
+])
+def test_looks_like_extension(readings, glyphs, code, expected):
+    assert sa.looks_like_extension(readings, glyphs, code) is expected
+
+
 # ── fake screen ─────────────────────────────────────────────────────────────
 
 FONT = ImageFont.load_default(size=13)
 ROWS = [("ZYS", "Short term share"), ("ZTS", "Short term index"), ("ZTO", "Long term share"),
         ("ZS", "Long term index"), ("ZQK", "Future"), ("ZMH", "Short term share"),
         ("ZM", "Long term share"), ("ZJO", "Short term index")]
-Y1, H, BORDER, RIGHT = 100, 24, 470, 620
+Y1, H, BORDER, RIGHT, RIC_LEFT = 100, 24, 470, 540, 400
 ARROW = (836, 62)
 
 ANCHOR_GRID = (22, 62, 330, 84)      # header "Mnemo | Extended Mnemo | Description"
@@ -87,7 +118,8 @@ class FakeSophis:
         self.dx, self.dy = shift
         self.hidden = hidden
         self.sel, self.typed, self.dd = 0, "", "Short term index"
-        self.popup, self.widened, self.dialog = False, False, False
+        self.popup, self.dialog = False, False
+        self.term_extra, self.ric_shift = 0, 0        # how much the Term column was widened / the RIC column shrunk
         self.popup_idx = 0
         self.clipboard, self.popup_visible = clipboard, popup_visible
         self._clip = None
@@ -98,18 +130,24 @@ class FakeSophis:
     def _image(self):
         im = Image.new("RGB", (1000, 600), (200, 200, 200))
         d = ImageDraw.Draw(im)
-        border = BORDER - (140 if self.widened else 0)
+        term_left = BORDER - self.ric_shift
+        term_width = RIGHT - BORDER + self.term_extra
         for i, (m, t) in enumerate(ROWS):
             y = Y1 - H // 2 + i * H
             color = (170, 195, 235) if i == self.sel else ((255, 255, 255) if i % 2 == 0 else (235, 235, 235))
             d.rectangle((20, y, 640, y + H - 1), fill=color)
             d.text((40, y + 4), m, fill=(0, 0, 160), font=FONT)
-            d.text((border + 6, y + 4), t if self.widened else t[:9] + "...", fill=(0, 0, 160), font=FONT)
+            d.line((135, y, 135, y + H - 1), fill=(90, 90, 90))               # border between Mnemo and Extended
+            if i == self.sel:                                                  # focus rectangle of the selection
+                d.rectangle((36, y + 1, 84, y + H - 3), outline=(0, 0, 0))
+            d.text((200, y + 4), "VANECK OIL SERVIC...", fill=(0, 0, 160), font=FONT)   # Description
+            d.text((300, y + 4), "US92189H6071", fill=(0, 0, 160), font=FONT)           # Code
+            d.text((term_left + 6, y + 4), t if term_width >= 110 else t[:9] + "...", fill=(0, 0, 160), font=FONT)
         d.rectangle(ANCHOR_GRID, fill=(215, 215, 215))
         d.text((30, 66), "Mnemo        Extended Mnemo        Description", fill=(0, 0, 0), font=FONT)
         d.rectangle(ANCHOR_RIGHT, fill=(215, 215, 215))
         d.text((706, 192), "Date     Cycle     Name", fill=(0, 0, 0), font=FONT)
-        d.text((BORDER + 6, 62), "Term", fill=(0, 0, 0), font=FONT)
+        d.text((term_left + 6, 62), "Term", fill=(0, 0, 0), font=FONT)
         d.rectangle((700, 50, 850, 74), fill=(255, 255, 255), outline=(0, 0, 0))
         d.text((706, 55), self.dd, fill=(0, 0, 0), font=FONT)
         d.polygon([(830, 58), (842, 58), (836, 67)], fill=(0, 0, 0))
@@ -186,8 +224,12 @@ class FakeSophis:
             self._clip = f"{m}\t\tDESCRIPTION\tUS0000\t\t{t}"
 
     def drag(self, x0, y0, x1, y1):
-        if abs(x0 - self.dx - BORDER) <= 4:
-            self.widened = True
+        moved = x1 - x0                                            # horizontal movement (same in any frame)
+        x0 -= self.dx
+        if abs(x0 - RIGHT) <= 4:                                   # right border of Term -> Term gets wider
+            self.term_extra += max(0, moved)
+        elif abs(x0 - BORDER) <= 4:                                # RIC | Term border -> RIC shrinks (min ~10px)
+            self.ric_shift = min(self.ric_shift - moved, BORDER - RIC_LEFT - 10)
 
     def clipboard_set(self, text):
         self._clip = text
@@ -217,7 +259,7 @@ def anchors(tmp_path_factory):
 def make(ocr, anchors, **kw):
     cfg = Config(anchors=anchors, points={
         "row1": [45, Y1], "row2": [45, Y1 + H], "rowN": [45, Y1 + 7 * H], "ext": [140, Y1],
-        "term_left": [BORDER, 70], "term_right": [RIGHT, 70], "dd_left": [706, 62], "dd_arrow": list(ARROW),
+        "ric_left": [RIC_LEFT, 70], "term_left": [BORDER, 70], "term_right": [RIGHT, 70], "dd_left": [706, 62], "dd_arrow": list(ARROW),
     }, slowdown=0.01, **{k: v for k, v in kw.items() if k in ("reader", "verify_mnemonic")})
     screen = FakeSophis(**{k: v for k, v in kw.items() if k in ("clipboard", "popup_visible", "shift", "hidden")})
     a = Automator(screen, ocr, cfg, log=lambda *_: None)
@@ -322,7 +364,8 @@ def _calibrate_with(monkeypatch, tmp_path, fake, positions, only=None):
     return Config.load()
 
 
-GOOD_POINTS = [(22, 62), (330, 84), (45, Y1), (45, Y1 + H), (45, Y1 + 7 * H), (140, Y1), (BORDER, 70), (RIGHT, 70),
+GOOD_POINTS = [(22, 62), (330, 84), (45, Y1), (45, Y1 + H), (45, Y1 + 7 * H), (140, Y1), (RIC_LEFT, 70),
+               (BORDER, 70), (RIGHT, 70),
                (700, 188), (850, 208), (706, 62), ARROW]
 
 
@@ -357,6 +400,10 @@ def test_legacy_spanish_config_still_loads_and_works(ocr, anchors, tmp_path):
         "verificar_mnemo": True,
     }
     path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    with pytest.raises(SophisError, match="calibrate --only ric_left"):     # the one point the old version lacked
+        Config.load(path)
+    legacy["puntos"]["ric_left"] = [RIC_LEFT, 70]
     path.write_text(json.dumps(legacy), encoding="utf-8")
     cfg = Config.load(path)
     assert cfg.reader == "clipboard" and cfg.widen_px == 140 and set(cfg.anchors) == {"grid", "right"}
@@ -424,3 +471,73 @@ def test_typing_is_never_skipped_after_the_click(ocr, anchors):
     a.focus_first_row()
     a.s.type_text("ZS")
     assert [e[0] for e in fake.events] == ["click", "type"]
+
+
+# ── reading a Mnemo cell with grid lines and a focus rectangle around the text ──
+
+def _cell(text, selected=True, width=96, height=18):
+    bg = (170, 195, 235) if selected else (255, 255, 255)
+    im = Image.new("RGB", (width, height), bg)
+    d = ImageDraw.Draw(im)
+    d.text((14, 2), text, fill=(0, 0, 160), font=ImageFont.load_default(size=12))
+    d.line((0, 0, 0, height), fill=(90, 90, 90))                # column border at the crop edge
+    d.line((width - 8, 2, width - 8, height - 2), fill=(60, 60, 60))   # column border inside the crop
+    d.rectangle((3, 1, width - 12, height - 2), outline=(0, 0, 0))     # focus rectangle
+    return im
+
+
+@pytest.mark.parametrize("text", ["ZYS", "ZTS", "ZJO", "ZMH", "ZQK", "ZM", "ZS", "ZION", "ZBRA"])
+@pytest.mark.parametrize("selected", [True, False])
+def test_read_cell_confirms_the_code_despite_borders(ocr, text, selected):
+    readings, glyphs = ocr.read_cell(_cell(text, selected))
+    assert len(text) - 1 <= glyphs <= len(text)       # touching letters can merge into one glyph
+    assert sa.match_code(readings, glyphs, text) in ("exact", "weak"), readings
+
+
+@pytest.mark.parametrize("text", ["Z", "YY", "ZI"])
+def test_read_cell_short_codes_are_confirmed_by_shape(ocr, text):
+    readings, glyphs = ocr.read_cell(_cell(text))
+    assert len(text) - 1 <= glyphs <= len(text)       # touching letters can merge into one glyph
+    assert sa.match_code(readings, glyphs, text) in ("exact", "weak"), readings
+
+
+def test_read_cell_does_not_confirm_a_different_code(ocr):
+    readings, glyphs = ocr.read_cell(_cell("ZMH"))
+    assert sa.match_code(readings, glyphs, "ZM") is None
+    assert sa.looks_like_extension(readings, glyphs, "ZM")
+
+
+def test_clean_cell_drops_borders_and_frame():
+    _, glyphs = sa.clean_cell(_cell("ZJO"))
+    assert glyphs == 3
+
+
+# ── widening the Term column and reading only the Term cell ─────────────────
+
+def test_term_strip_does_not_reach_description_or_code(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    assert a.g.term_x0 > RIC_LEFT                         # starts at the RIC column, never in Code/Description
+    a.search("ZYS")
+    term, text = a._term_by_ocr(0 if fake.sel == 0 else fake.sel)
+    assert "VANECK" not in text and "US92189" not in text
+
+
+def test_widen_term_makes_it_readable_and_cyc_stays_put(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    a.search("ZYS")
+    i = a.selected_row()
+    assert a._term_by_ocr(i)[0] is None                   # truncated: "Short ter..."
+    a.widen_term()
+    assert fake.term_extra == fake.ric_shift > 0          # right border back where it was
+    assert a._term_by_ocr(i)[0] == "Short term share"
+
+
+def test_an_unconfirmed_row_is_reread_not_clicked_again(ocr, anchors, tmp_path, monkeypatch):
+    """The repeated-click problem: when the Mnemo cannot be confirmed, attempt 2 only re-reads the screen."""
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake = make(ocr, anchors, reader="ocr")
+    with pytest.raises(SophisError):
+        a.search("QQQ")                                   # not in the list: never confirmed
+    clicks = [e for e in fake.events if e[0] == "click"]
+    types = [e for e in fake.events if e[0] == "type"]
+    assert len(clicks) == len(types) == 2                 # attempt 1 and the last attempt, nothing in between

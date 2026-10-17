@@ -74,6 +74,7 @@ CALIBRATION_POINTS = [
     ("row2", "Mouse on the text of the Mnemo cell of the SECOND row (same horizontal position)"),
     ("rowN", "Mouse on the text of the Mnemo cell of the LAST fully visible row"),
     ("ext", "Mouse on the 'Extended Mnemo' column (empty), left part, on any row"),
+    ("ric_left", "Mouse on the HEADER, exactly on the line that separates Code | RIC (left border of RIC)"),
     ("term_left", "Mouse on the HEADER, exactly on the line that separates RIC | Term (left border of Term)"),
     ("term_right", "Mouse on the HEADER, on the right border of the Term column (before 'Cyc')"),
     ("anchor_right_a", "ANCHOR 2 (TOP-LEFT corner): header of the right-hand table 'Date | Cycle | Name'"),
@@ -84,8 +85,8 @@ CALIBRATION_POINTS = [
 # The corner that closes each anchor (its image crop is saved when it is captured).
 ANCHOR_CLOSING_POINT = {"anchor_grid_b": "grid", "anchor_right_b": "right"}
 # Which anchor each point belongs to (points move together with their anchor).
-POINT_ANCHOR = {"row1": "grid", "row2": "grid", "rowN": "grid", "ext": "grid", "term_left": "grid",
-                "term_right": "grid", "dd_left": "right", "dd_arrow": "right"}
+POINT_ANCHOR = {"row1": "grid", "row2": "grid", "rowN": "grid", "ext": "grid", "ric_left": "grid",
+                "term_left": "grid", "term_right": "grid", "dd_left": "right", "dd_arrow": "right"}
 
 # Names used by the earlier (Spanish) version, so an existing calibration keeps working.
 LEGACY_CONFIG_KEYS = {"puntos": "points", "anclas": "anchors", "ensanchar_px": "widen_px",
@@ -113,6 +114,7 @@ class Config:
     slowdown: float = 1.0         # multiplier for all waits (raise it if Citrix is slow)
     reader: str = "auto"          # auto | clipboard | ocr
     verify_mnemonic: bool = True  # False = accept the row even if its Mnemo cannot be read (NOT recommended)
+    weak_verify: bool = True      # accept a Mnemo OCR could not read exactly if its shape fits (same glyph count)
 
     @staticmethod
     def _migrate(d: dict) -> dict:
@@ -132,7 +134,8 @@ class Config:
         d = Config._migrate(json.loads(path.read_text(encoding="utf-8")))
         missing = [n for n, _ in CALIBRATION_POINTS if n not in d.get("points", {})]
         if missing:
-            raise SophisError(f"Incomplete calibration (missing {missing}). Run:  python sophis_auto.py calibrate")
+            raise SophisError(f"Incomplete calibration (missing {missing}). "
+                              f"Run:  python sophis_auto.py calibrate --only {' '.join(missing)}")
         if set(d.get("anchors", {})) != {"grid", "right"}:
             raise SophisError("The calibration comes from an older version (no image anchors). "
                               "Run again:  python sophis_auto.py calibrate")
@@ -195,6 +198,86 @@ def term_truncated(text: str) -> bool:
 
 def contains_word(text: str, word: str, threshold: float = 0.8) -> bool:
     return _best_window(_norm(text), _norm(word)) >= threshold
+
+
+_LOOKALIKE = str.maketrans({"0": "O", "1": "I", "L": "I", "5": "S", "2": "Z", "8": "B"})
+
+
+def _canon(s: str) -> str:
+    """Upper-case letters/digits only, with look-alikes merged (0/O, 1/I/L, 5/S, 2/Z, 8/B)."""
+    return re.sub(r"[^A-Z0-9]", "", s.upper()).translate(_LOOKALIKE)
+
+
+def match_code(readings: list[str], glyphs: int, code: str, allow_weak: bool = True) -> str | None:
+    """Does what OCR read on a Mnemo cell correspond to `code`?
+
+    "exact": a reading equals the code. The glyph count must not exceed the code's length (an extra glyph means
+             a longer code, e.g. 'ZMH' when searching 'ZM'); one fewer is tolerated because neighbouring
+             letters sometimes touch ('YY').
+    "weak" : OCR could not read it exactly (very short codes like 'Z' often fail) but the cell holds as many
+             glyphs as the code has characters and the readings do not contradict it.
+    None   : no match."""
+    want = _canon(code)
+    cleaned = [_canon(r) for r in readings]
+    if any(c == want for c in cleaned) and (glyphs == 0 or len(want) - 1 <= glyphs <= len(want)):
+        return "exact"
+    doubled = any(a == b for a, b in zip(want, want[1:]))     # 'YY': identical neighbours often touch
+    if allow_weak and (glyphs == len(want) or (doubled and glyphs == len(want) - 1)):
+        readable = [c for c in cleaned if c]
+        if not readable or any(c[:1] == want[:1] or difflib.SequenceMatcher(None, c, want).ratio() > 0.5
+                               for c in readable):
+            return "weak"
+    return None
+
+
+def looks_like_extension(readings: list[str], glyphs: int, code: str) -> bool:
+    """True if the row holds the code plus more characters (searching 'ZM' and landing on 'ZMH')."""
+    want = _canon(code)
+    cleaned = [_canon(r) for r in readings]
+    if glyphs:
+        return glyphs > len(want) and all(c[:1] == want[:1] for c in cleaned if c)
+    return any(c.startswith(want) and len(c) > len(want) for c in cleaned)
+
+
+def clean_cell(img: Image.Image):
+    """Prepares a one-line table cell for OCR. Returns (gray image, glyph count).
+
+    Removes what is not text: the cell background (whatever its color), vertical/horizontal grid lines, the
+    selection's focus rectangle and anything touching the crop edge. That clutter is what made OCR read
+    '[ZJOL]' instead of 'ZJO'. The glyph count is the number of separate characters left."""
+    import cv2
+    import numpy as np
+
+    g = np.asarray(img.convert("L"))
+    background = float(np.median(g))
+    mask = (np.abs(g.astype(np.int16) - background) > 45).astype(np.uint8)
+    h, w = mask.shape
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    keep = np.zeros_like(mask)
+    glyphs = 0
+    for i in range(1, n):
+        x, y, cw, ch, area = stats[i]
+        touches_edge = x <= 0 or y <= 0 or x + cw >= w or y + ch >= h
+        is_line = (cw <= 1 and ch >= 0.7 * h) or (ch <= 1 and cw >= 0.7 * w)
+        is_frame = cw > 0.55 * w and ch > 0.6 * h
+        if touches_edge or is_line or is_frame or area < 2:
+            continue
+        keep[labels == i] = 1
+        glyphs += 1
+    keep = cv2.dilate(keep, np.ones((3, 3), np.uint8))
+    if glyphs == 0:
+        return np.full_like(g, 255), 0
+    # Stretch the contrast so the text is dark on a pure white background whatever the cell color was
+    # (a gray halo around the text confuses the recognizer).
+    ink = g[keep > 0].astype(np.float32)
+    lo = float(np.percentile(ink, 5))
+    if background - lo >= 30:
+        stretched = np.clip((g.astype(np.float32) - lo) * 255.0 / (background - lo), 0, 255)
+    else:                                     # light text on a dark cell: invert instead
+        hi = float(np.percentile(ink, 95))
+        stretched = np.clip((background - g.astype(np.float32)) * 255.0 / max(1.0, background - hi + 255.0), 0, 255)
+        stretched = 255 - stretched
+    return np.where(keep > 0, stretched, 255).astype(np.uint8), glyphs
 
 
 def color_distance(a, b) -> int:
@@ -329,6 +412,38 @@ class OCR:
     def text(self, img: Image.Image, scale: int = 3) -> str:
         lines = sorted(self.read(img, scale), key=lambda l: (l.x0, l.y0))
         return " ".join(l.text for l in lines)
+
+    def read_cell(self, img: Image.Image) -> tuple[list[str], int]:
+        """Reads ONE short line of text (a table cell). Returns (several readings, glyph count).
+
+        The crop is cleaned first (see clean_cell) and sent straight to the text recognizer, skipping the
+        text-detection step, which is what fails on tiny crops such as 'ZS' or 'YY'."""
+        import cv2
+        import numpy as np
+
+        cleaned, glyphs = clean_cell(img)
+        if glyphs == 0:
+            return [], 0
+        readings = []
+        engine = self._engine
+        # Old rapidocr versions ignore use_det/use_cls and always run the angle classifier, which turns small
+        # crops upside down ('ZJO' -> 'orz'). Force "recognize only" through their attributes as well.
+        saved = {name: getattr(engine, name) for name in ("min_height", "use_angle_cls") if hasattr(engine, name)}
+        try:
+            if "min_height" in saved:
+                engine.min_height = 10 ** 6      # "image is too short for detection" -> skip detection
+            if "use_angle_cls" in saved:
+                engine.use_angle_cls = False
+            for scale in (3, 4):
+                big = cv2.resize(cleaned, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                big = cv2.copyMakeBorder(big, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=255)
+                result, _ = engine(cv2.cvtColor(big, cv2.COLOR_GRAY2BGR), use_det=False, use_cls=False,
+                                   use_rec=True, text_score=0.0)
+                readings.append(result[0][1] if result else "")
+        finally:
+            for name, value in saved.items():
+                setattr(engine, name, value)
+        return readings, glyphs
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -472,6 +587,8 @@ class Reading:
     text: str
     verified: bool = True
     seen: tuple = ()     # mnemonics read on the row (to detect a prefix-only match)
+    glyphs: int = 0      # how many separate characters the Mnemo cell holds (0 = unknown)
+    match: str | None = None  # "exact" | "weak" | None (how the Mnemo was confirmed)
     term_text: str = ""  # raw text read from the Term cell (to detect a truncated column)
 
 
@@ -492,6 +609,8 @@ class Automator:
         self.pts: dict = {}
         self.g: Geometry
         self._widened = False
+        self._first_click_done = False
+        self._clipboard_works = True
 
     # ── helpers ─────────────────────────────────────────────────────────────
     def _wait(self, seconds: float) -> None:
@@ -510,7 +629,7 @@ class Automator:
 
     def _geometry(self) -> Geometry:
         r1, r2, rn = self._pt("row1"), self._pt("row2"), self._pt("rowN")
-        ext, tl, tr = self._pt("ext"), self._pt("term_left"), self._pt("term_right")
+        ext, ric, tr = self._pt("ext"), self._pt("ric_left"), self._pt("term_right")
         h = r2[1] - r1[1]
         data = f"(row1 y={r1[1]}, row2 y={r2[1]}, rowN y={rn[1]})"
         if h < 8:
@@ -523,11 +642,10 @@ class Automator:
                 f"Invalid calibration {data}: row height={h}px, so 'rowN' falls on row {n}. "
                 "'rowN' must be the LAST visible row of the table (several rows below 'row1'). "
                 "Redo only those points:  python sophis_auto.py calibrate --only row1 row2 rowN")
-        widen = max(0, self.cfg.widen_px)
         return Geometry(
             x_click=r1[0], x_mnemo0=r1[0] - 30, x_mnemo1=max(r1[0] + 12, ext[0] - 2), x_ext=ext[0],
             y1=r1[1], h=float(h), n=n,
-            term_x0=tl[0] - widen - 6, term_x1=tr[0],
+            term_x0=ric[0] + 3, term_x1=tr[0] - 1,
         )
 
     def save_debug(self, name: str, img: Image.Image | None = None) -> Path:
@@ -538,12 +656,22 @@ class Automator:
 
     # ── preparation ─────────────────────────────────────────────────────────
     def widen_term(self) -> None:
-        """The Term column shows 'Short ter...': drag its left border to reveal the whole text."""
+        """The Term column shows 'Short ter...'. Two header drags give it room without moving Cyc:
+        1) drag Term's RIGHT border to the right (Term gets wider, Cyc is pushed out),
+        2) drag the RIC|Term border to the left (RIC shrinks, Term slides left, Cyc comes back).
+        The RIC column is normally empty, so nothing useful is lost."""
         if self._widened or self.cfg.widen_px <= 0:
             return
-        bx, by = self._pt("term_left")
-        self.log(f"Widening the Term column by {self.cfg.widen_px}px ...")
-        self.s.drag(bx, by, bx - self.cfg.widen_px, by)
+        ric, tl, tr = self._pt("ric_left"), self._pt("term_left"), self._pt("term_right")
+        d = max(0, min(self.cfg.widen_px, tl[0] - ric[0] - 10))   # RIC keeps at least ~10px
+        if d < 15:
+            self.log("  not enough room in the RIC column to widen Term; widen it by hand instead")
+            self._widened = True
+            return
+        self.log(f"Widening the Term column by {d}px ...")
+        self.s.drag(tr[0], tr[1], tr[0] + d, tr[1])
+        self._wait(0.5)
+        self.s.drag(tl[0], tl[1], tl[0] - d, tl[1])
         self._widened = True
         self._wait(0.6)
 
@@ -555,6 +683,11 @@ class Automator:
         Nothing else happens between this click and typing, so typing can never be skipped."""
         self.click_row(0)
         self._wait(0.4)
+        if not self._first_click_done:
+            # The very first click may only bring the Citrix window to the front; give it a moment so the
+            # first characters are not typed into a window that is not ready yet.
+            self._first_click_done = True
+            self._wait(1.0)
 
     # ── grid ────────────────────────────────────────────────────────────────
     def click_row(self, i: int, double: bool = False) -> None:
@@ -576,25 +709,36 @@ class Automator:
         return (x0, yc - half, x1, yc + half)
 
     def _read_clipboard(self) -> str | None:
+        """Copies the selected row (Ctrl+C, then Ctrl+Insert) and waits for Citrix to hand the text over."""
         sentinel = f"__sophis_{time.time()}__"
-        self.s.clipboard_set(sentinel)
-        self.s.hotkey("ctrl", "c")
-        self._wait(0.4)
-        text = self.s.clipboard_get()
-        if not text or text == sentinel:
-            return None
-        return text
+        for keys in (("ctrl", "c"), ("ctrl", "insert")):
+            self.s.clipboard_set(sentinel)
+            self.s.hotkey(*keys)
+            deadline = time.time() + 1.5 * self.cfg.slowdown
+            while True:
+                self._wait(0.2)
+                text = self.s.clipboard_get()
+                if text and text != sentinel:
+                    return text
+                if time.time() >= deadline:
+                    break
+        return None
 
-    def _mnemonic_by_ocr(self, i: int, code: str) -> tuple[bool, list[str]]:
+    def _column_image(self) -> Image.Image:
+        """The visible part of the Mnemo column (used to tell whether typing made the grid move)."""
+        g = self.g
+        top = int(round(g.y1 - g.h / 2))
+        return self.s.capture((g.x_mnemo0, top, g.x_mnemo1, int(round(top + g.h * g.n)))).convert("L")
+
+    @staticmethod
+    def _differs(a: Image.Image, b: Image.Image) -> bool:
+        import numpy as np
+        return float(np.mean(np.abs(np.asarray(a, dtype=np.int16) - np.asarray(b, dtype=np.int16)))) > 1.0
+
+    def _mnemonic_by_ocr(self, i: int) -> tuple[list[str], int]:
+        """(readings, glyph count) of the Mnemo cell of row i."""
         region = self._cell_region(i, self.g.x_mnemo0, self.g.x_mnemo1)
-        img = self.s.capture(region)
-        seen = []
-        for scale in (3, 4, 2):
-            text = self.ocr.text(img, scale)
-            seen.append(text)
-            if _norm_code(text) == _norm_code(code):
-                return True, seen
-        return False, seen
+        return self.ocr.read_cell(self.s.capture(region))
 
     def _term_by_ocr(self, i: int) -> tuple[str | None, str]:
         img = self.s.capture(self._cell_region(i, self.g.term_x0, self.g.term_x1))
@@ -607,36 +751,40 @@ class Automator:
                 return term, text
         return None, " | ".join(texts)
 
-    def read_row(self, i: int, code: str) -> Reading:
+    def read_row(self, i: int, code: str, allow_weak: bool = True) -> Reading:
         mode = self.cfg.reader
         fallback = None
-        if mode in ("auto", "clipboard"):
+        if mode == "clipboard" or (mode == "auto" and self._clipboard_works):
             text = self._read_clipboard()
             if text:
                 cells = [c.strip() for c in re.split(r"[\t\r\n]+", text) if c.strip()]
                 if any(_norm_code(c) == _norm_code(code) for c in cells[:3]):
-                    return Reading(True, classify_term(text), "clipboard", text, term_text=text)
+                    return Reading(True, classify_term(text), "clipboard", text, term_text=text, match="exact")
                 if cells:
                     fallback = Reading(False, classify_term(text), "clipboard", text, seen=(cells[0],),
                                        term_text=text)
+            elif mode == "auto":
+                self._clipboard_works = False
+                self.log("  clipboard gave nothing (Citrix may block it); reading with OCR from now on")
         if mode in ("auto", "ocr"):
-            ok, seen = self._mnemonic_by_ocr(i, code)
+            readings, glyphs = self._mnemonic_by_ocr(i)
             term, term_text = self._term_by_ocr(i)
-            text = f"mnemonic={seen} term='{term_text}'"
-            if ok:
-                return Reading(True, term, "ocr", text, seen=tuple(seen), term_text=term_text)
+            match = match_code(readings, glyphs, code, self.cfg.weak_verify and allow_weak)
+            text = f"mnemonic={readings} glyphs={glyphs} term='{term_text}'"
+            if match:
+                return Reading(True, term, "ocr", text, verified=(match == "exact"), seen=tuple(readings),
+                               glyphs=glyphs, term_text=term_text, match=match)
             if not self.cfg.verify_mnemonic and term:
                 self.log("  WARNING: Mnemo NOT verified (verify_mnemonic=False)")
                 return Reading(True, term, "ocr", text, verified=False, term_text=term_text)
-            return Reading(False, term, "ocr", text, seen=tuple(seen), term_text=term_text)
+            return Reading(False, term, "ocr", text, seen=tuple(readings), glyphs=glyphs, term_text=term_text)
         return fallback or Reading(False, None, mode, "")
 
     # ── search ──────────────────────────────────────────────────────────────
     @staticmethod
     def _is_extension(reading: Reading, code: str) -> bool:
-        """True if the row read starts with the code but is longer (e.g. you search 'ZM' and land on 'ZMH')."""
-        c = _norm_code(code)
-        return any(_norm_code(t).startswith(c) and len(_norm_code(t)) > len(c) for t in reading.seen)
+        """True if the row holds the code plus more characters (e.g. you search 'ZM' and land on 'ZMH')."""
+        return looks_like_extension(list(reading.seen), reading.glyphs, code)
 
     def _walk_down_to(self, code: str, max_rows: int = 15) -> tuple[int, Reading] | None:
         """Incremental search lands on the first prefix match; in a descending list the exact code (ZM)
@@ -655,24 +803,38 @@ class Automator:
         return None
 
     def search(self, code: str, attempts: int = 3) -> tuple[int, Reading]:
+        """One click on the first row, then type the code. If the row cannot be confirmed, the next attempt
+        first just re-reads (the grid may still have been scrolling); only the last attempt, or one that
+        found no selected row at all, clicks and types again."""
         last = ""
+        retype = True
+        moved = False
         for k in range(1, attempts + 1):
-            self.focus_first_row()
-            self.s.type_text(code)
-            self._wait(0.8)
+            if retype or k == attempts:
+                self.focus_first_row()
+                before = self._column_image()
+                self.s.type_text(code)
+                self._wait(0.8)
+                moved = self._differs(before, self._column_image())
+            else:
+                self._wait(0.8)
             i = self.selected_row()
             if i is None:
-                last = "no selected row detected"
+                last, retype = "no selected row detected", True
                 self.log(f"  attempt {k}: {last}")
                 continue
-            reading = self.read_row(i, code)
+            retype = False
+            # A match by shape alone is only allowed if typing really moved the grid (otherwise the code was
+            # probably not found and the highlighted row is just where it already was).
+            reading = self.read_row(i, code, allow_weak=moved or i != 0)
             if not reading.mnemo_ok and self._is_extension(reading, code):
-                self.log(f"  landed on {reading.seen[0]!r}; walking down to '{code}' ...")
+                self.log(f"  landed on {list(reading.seen)[:1]}; walking down to '{code}' ...")
                 found = self._walk_down_to(code)
                 if found:
                     i, reading = found
             if reading.mnemo_ok:
-                self.log(f"  row {i} ok ({reading.source}): term={reading.term}")
+                note = "" if reading.match != "weak" else "  (Mnemo confirmed by shape only)"
+                self.log(f"  row {i} ok ({reading.source}): term={reading.term}{note}")
                 return i, reading
             last = f"the selected row is not '{code}' ({reading.text})"
             self.log(f"  attempt {k}: {last}")
@@ -863,8 +1025,12 @@ def cmd_diagnose(args) -> None:
         g = a.g
         a.save_debug("diag_mnemo", a.s.capture(a._cell_region(i, g.x_mnemo0, g.x_mnemo1)))
         a.save_debug("diag_term", a.s.capture(a._cell_region(i, g.term_x0, g.term_x1)))
-        print("Clipboard after Ctrl+C   :", repr(a._read_clipboard()))
-        print("OCR Mnemo (ok, readings) :", a._mnemonic_by_ocr(i, code))
+        cleaned, _ = clean_cell(a.s.capture(a._cell_region(i, g.x_mnemo0, g.x_mnemo1)))
+        a.save_debug("diag_mnemo_cleaned", Image.fromarray(cleaned))
+        readings, glyphs = a._mnemonic_by_ocr(i)
+        print("Clipboard (Ctrl+C/Insert):", repr(a._read_clipboard()))
+        print("OCR Mnemo readings       :", readings, "| glyphs:", glyphs)
+        print("Mnemo match              :", match_code(readings, glyphs, code))
         print("OCR Term                 :", a._term_by_ocr(i))
     print("Dropdown (OCR)           :", a.read_dropdown())
     print(f"\nScreenshots saved in {DEBUG_DIR}/ (screen, mnemo, term).")
