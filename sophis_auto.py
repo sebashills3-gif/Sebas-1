@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Sophis Risque automation (runs over Citrix) -- STAGE 1:
-  search a code (Mnemo) -> read its Term -> set the dropdown to match -> open the update window
+  you select the code's row -> read its Term -> set the dropdown to match -> open the update window
   (Maturity / Minimum / Maximum / Ric).
 
 It does NOT read the Excel file or fill in the dates yet (that is stage 2).
@@ -18,8 +18,11 @@ Usage (in this order the first time):
     1) Open the Sophis "Listed market ..." window. It may open anywhere: the script finds it again every
        time by looking for the table header. It must be visible (not minimized) and on the primary monitor.
     2) python sophis_auto.py calibrate          # once: point the mouse at 12 spots
-    3) python sophis_auto.py diagnose ZYS       # checks how your screen is read (send me what it prints)
-    4) python sophis_auto.py open ZYS ZTS YY    # searches, matches the dropdown, opens each code's window
+    3) python sophis_auto.py diagnose           # checks how your screen is read (send me what it prints)
+    4) python sophis_auto.py open               # YOU click the right row; it reads its Term, sets the dropdown,
+                                                # double-clicks the row and waits for the update window
+       python sophis_auto.py open --term "Long term share"   # same, but you tell it the Term (skips reading it)
+       python sophis_auto.py open-code ZYS ZTS     # (older flow) types the code to find its row; not reliable yet
 
 Old Spanish command names (calibrar / diagnostico / abrir) still work as aliases.
 
@@ -1017,6 +1020,78 @@ class Automator:
         self.log(f"[{code}] done: term='{reading.term}', update window is open")
         return Result(code, reading.term, j, window)
 
+    # ── the flow you drive: YOU select the row, the script continues from there ──
+    def row_under_mouse(self) -> int | None:
+        """The visible row the mouse pointer is over (your pointer stays on the row you just clicked)."""
+        x, y = self.s.position()
+        g = self.g
+        if not (g.x_mnemo0 - 40 <= x <= g.term_x1 + 40):
+            return None
+        i = int(round((y - g.y1) / g.h))
+        return i if 0 <= i < g.n and abs(y - g.row_y(i)) <= g.h / 2 else None
+
+    def find_selected_row_or_mouse(self) -> tuple[int, str]:
+        """Which row did you select? The highlighted row if it can be seen, otherwise the row under the mouse."""
+        mouse = self.row_under_mouse()          # read first: nothing has moved the pointer yet
+        color = self.selected_row()
+        if color is not None:
+            if mouse is not None and mouse != color:
+                self.log(f"  note: the highlight is on row {color} but the mouse is on row {mouse}; using the highlight")
+            return color, "highlight"
+        if mouse is not None:
+            return mouse, "mouse position"
+        path = self.save_debug("row_not_found")
+        raise SophisError("Could not tell which row you selected (no highlighted row found and the mouse is not "
+                          "over the table). Click the row once and leave the mouse on it. Screenshot: " + str(path))
+
+    def _read_term_of_row(self, i: int) -> str | None:
+        """The Term of row i: from the clipboard if it works, else by OCR (widening the column if it is cut)."""
+        mode = self.cfg.reader
+        if mode == "clipboard" or (mode == "auto" and self._clipboard_works):
+            text = self._read_clipboard()
+            if text:
+                term = classify_term(text)
+                if term:
+                    return term
+            elif mode == "auto":
+                self._clipboard_works = False
+        if mode in ("auto", "ocr"):
+            term, _ = self._term_by_ocr(i)
+            if not term and self.cfg.widen_px > 0 and not self._widened:
+                self.widen_term()
+                term, _ = self._term_by_ocr(i)
+            return term
+        return None
+
+    def open_selected(self, term: str | None = None) -> Result:
+        """Assumes YOU already selected the right row. Reads its Term (or uses `term`), matches the dropdown,
+        double-clicks the row and waits for the update window. Nothing is typed and no row is searched."""
+        self.locate()
+        i, how = self.find_selected_row_or_mouse()
+        readings, glyphs = self._mnemonic_by_ocr(i)
+        shown = next((r for r in readings if str(r).strip()), "?")
+        before = clean_cell(self.s.capture(self._cell_region(i, self.g.x_mnemo0, self.g.x_mnemo1)))[0]
+        if term is None:
+            term = self._read_term_of_row(i)
+            if not term:
+                path = self.save_debug("term_unreadable")
+                raise SophisError(f"Could not read the Term of row {i}. Tell it yourself with  --term \"Short term "
+                                  f"index\"  (or widen the Term column by hand). Screenshot: {path}")
+        self.log(f"  row {i} ({how}); Mnemo reads {shown!r}; Term = {term!r}")
+        self.set_dropdown(term)
+
+        # The dropdown click moved the keyboard focus; the list should be unchanged. Warn (never block) if the
+        # row's text is not the same any more, since the double click would then open another contract.
+        import numpy as np
+        after = clean_cell(self.s.capture(self._cell_region(i, self.g.x_mnemo0, self.g.x_mnemo1)))[0]
+        if float(np.mean(np.abs(before.astype(np.int16) - after.astype(np.int16)))) > 12:
+            self.log("  WARNING: the text of the row changed after setting the dropdown; check the window that opens")
+        self.log(f"  opening the window (double click on row {i}) ...")
+        self.click_row(i, double=True)
+        window = self.wait_for_window()
+        self.log(f"done: Mnemo '{shown}', Term '{term}', update window is open")
+        return Result(str(shown), term, i, window)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # COMMANDS
@@ -1097,26 +1172,58 @@ def _create(args) -> Automator:
     return Automator(Screen(cfg.key_interval), OCR(), cfg)
 
 
-def ask_for_click(a: Automator, args, first: bool = True) -> None:
-    """Manual mode: you give the Mnemo table keyboard focus with ONE click, then the script only types."""
-    if a.cfg.auto_focus:
+def ask_for_click(a: Automator, args, first: bool = True, typing: bool = False) -> None:
+    """You give the grid the selection with ONE click; the script continues from there."""
+    if typing and a.cfg.auto_focus:
         print("You have 3 seconds to bring Sophis (Citrix) to the front ...")
         time.sleep(3)
         return
     wait = max(1, int(getattr(args, "click_wait", 6)))
-    print(f"\nNow, in Sophis: click ONE row of the Mnemo table (a single click, on a row that is not already "
-          f"highlighted) and then DO NOT touch anything.\nTyping starts in {wait} seconds ...")
+    what = "Typing starts" if typing else "The script continues"
+    print(f"\nNow, in Sophis: SELECT THE ROW of the code you want (one click on it) and then DO NOT touch "
+          f"anything, not even the mouse.\n{what} in {wait} seconds ...")
     for sec in range(wait, 0, -1):
         print(f"   {sec}...", end="\r", flush=True)
         time.sleep(1)
-    print("   typing now      ")
+    print("   going         ")
+
+
+def cmd_diagnose_selected(args) -> None:
+    """Shows what the script sees for the row YOU selected (does not type or open anything)."""
+    a = _create(args)
+    ask_for_click(a, args)
+    DEBUG_DIR.mkdir(exist_ok=True)
+    a.save_debug("diag_screen")
+    a.prepare()
+    mouse = a.row_under_mouse()
+    color = a.selected_row()
+    print(f"\nRow under the mouse: {mouse} | highlighted row: {color}  (None = not detected)")
+    row = color if color is not None else mouse
+    if row is None:
+        print("Could not tell the row. Click it once and leave the mouse on it.")
+        return
+    g = a.g
+    raw = a.s.capture(a._cell_region(row, g.x_mnemo0, g.x_mnemo1))
+    a.save_debug("diag_mnemo", raw)
+    a.save_debug("diag_mnemo_x6", raw.resize((raw.width * 6, raw.height * 6), Image.NEAREST))
+    a.save_debug("diag_term", a.s.capture(a._cell_region(row, g.term_x0, g.term_x1)))
+    a.save_debug("diag_mnemo_cleaned", Image.fromarray(clean_cell(raw)[0]))
+    readings, glyphs = a._mnemonic_by_ocr(row)
+    print("Mnemo crop size          :", raw.size, "| background:", median_color(raw))
+    print("OCR Mnemo readings       :", readings, "| glyphs:", glyphs)
+    print("OCR Term                 :", a._term_by_ocr(row))
+    print("Clipboard (Ctrl+C/Insert):", repr(a._read_clipboard()))
+    print("Dropdown (OCR)           :", a.read_dropdown())
+    print(f"\nScreenshots saved in {DEBUG_DIR}/ (screen, mnemo, mnemo_x6, mnemo_cleaned, term).")
 
 
 def cmd_diagnose(args) -> None:
     """Shows what the script sees; useful to tune the calibration (does not open any window)."""
+    if not args.code:
+        return cmd_diagnose_selected(args)
     a = _create(args)
     code = args.code.upper()
-    ask_for_click(a, args)
+    ask_for_click(a, args, typing=True)
     DEBUG_DIR.mkdir(exist_ok=True)
     a.save_debug("diag_screen")
     a.prepare()
@@ -1151,9 +1258,37 @@ def cmd_diagnose(args) -> None:
 
 
 def cmd_open(args) -> None:
+    """You select the row; the script reads its Term, sets the dropdown, opens the window. Repeats on request."""
+    if args.codes:
+        print("`open` no longer takes codes: you select each row yourself. To search by typing use "
+              "`open-code " + " ".join(args.codes) + "`.")
+        sys.exit(2)
+    term = None
+    if args.term:
+        matches = [t for t in TERMS if _norm(t) == _norm(args.term)]
+        if not matches:
+            print(f"ERROR: --term must be one of: {', '.join(TERMS)}")
+            sys.exit(2)
+        term = matches[0]
+    a = _create(args)
+    while True:
+        ask_for_click(a, args)
+        try:
+            a.open_selected(term)
+        except SophisError as e:
+            print(f"\nERROR: {e}")
+            sys.exit(1)
+        answer = input("\nWhen you are done with the update window (close it / OK), press ENTER to do another "
+                       "code (q = quit): ")
+        if answer.strip().lower() == "q":
+            break
+
+
+def cmd_open_code(args) -> None:
+    """Older flow: types each code to find its row (not reliable on this grid yet)."""
     a = _create(args)
     for k, code in enumerate(args.codes):
-        ask_for_click(a, args, first=(k == 0))
+        ask_for_click(a, args, first=(k == 0), typing=True)
         try:
             a.open_contract(code)
         except SophisError as e:
@@ -1176,11 +1311,17 @@ def main() -> None:
     s.set_defaults(fn=cmd_calibrate)
 
     for name, aliases, fn, help_text in (
-            ("diagnose", ["diagnostico"], cmd_diagnose, "check how the screen is read"),
-            ("open", ["abrir"], cmd_open, "search the code, match the dropdown and open the window")):
+            ("diagnose", ["diagnostico"], cmd_diagnose,
+             "check how the screen is read for the row you select (give a CODE to test typing instead)"),
+            ("open", ["abrir"], cmd_open,
+             "you select the row; it reads the Term, matches the dropdown and opens the update window"),
+            ("open-code", [], cmd_open_code, "older flow: type the code(s) to find the row (not reliable yet)")):
         s = sub.add_parser(name, aliases=aliases, help=help_text)
         if name == "diagnose":
-            s.add_argument("code")
+            s.add_argument("code", nargs="?", default=None)
+        elif name == "open":
+            s.add_argument("codes", nargs="*")
+            s.add_argument("--term", help=f"the row's Term, so it is not read from the screen ({', '.join(TERMS)})")
         else:
             s.add_argument("codes", nargs="+")
         s.add_argument("--reader", "--lector", dest="reader", choices=["auto", "clipboard", "ocr", "portapapeles"],
@@ -1190,9 +1331,9 @@ def main() -> None:
         s.add_argument("--slowdown", "--pausa", dest="slowdown", type=float,
                        help="multiplier for waits (2 = twice as slow)")
         s.add_argument("--click-wait", dest="click_wait", type=int, default=6,
-                       help="seconds you get to click a row in Sophis before typing starts (default 6)")
+                       help="seconds you get to select the row in Sophis before the script continues (default 6)")
         s.add_argument("--auto-focus", dest="auto_focus", action="store_true",
-                       help="let the script click an unselected row itself (default: you click, it only types)")
+                       help="(open-code only) let the script click an unselected row itself")
         s.set_defaults(fn=fn)
 
     args = ap.parse_args()

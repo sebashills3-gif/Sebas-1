@@ -7,6 +7,7 @@ window (grid, dropdown, update window) with PIL and the real OCR reads it.
 """
 
 import json
+import sys
 
 import pytest
 from PIL import Image, ImageDraw, ImageFont
@@ -131,6 +132,7 @@ class FakeSophis:
         self.key_interval = 0
         self.events = []       # ("click" | "double" | "type", ...) in the order they happened
         self._last_type_t = -1e9
+        self.mouse = (0, 0)    # where the pointer is (it stays on the row you clicked)
 
     # drawing
     def _image(self):
@@ -178,6 +180,12 @@ class FakeSophis:
         return canvas
 
     # Screen API (receives ABSOLUTE screen coordinates)
+    def position(self):
+        return self.mouse
+
+    def mouse_on_row(self, i):
+        self.mouse = (45 + self.dx, Y1 + i * H + self.dy)
+
     def capture(self, region=None):
         im = self._image()
         return im if region is None else im.crop(tuple(int(v) for v in region))
@@ -737,3 +745,101 @@ def test_open_contract_without_row_highlight_never_types_after_the_dropdown(ocr,
     a, fake = make(ocr, anchors, reader="ocr", no_highlight=True)
     a.open_contract("ZTO")
     assert [e[0] for e in fake.events].count("type") == 1 and fake.dialog and fake.dd == "Long term share"
+
+
+# ── the flow YOU drive: you select the row, the script continues from there ──
+
+def _logged(ocr, anchors, **kw):
+    a, fake = make(ocr, anchors, **kw)
+    lines = []
+    a.log = lines.append
+    return a, fake, lines
+
+
+@pytest.mark.parametrize("row,term", [(0, "Short term share"), (3, "Long term index"), (4, "Future"),
+                                      (6, "Long term share"), (7, "Short term index")])
+def test_open_selected_uses_the_row_you_selected(ocr, anchors, row, term):
+    a, fake, _ = _logged(ocr, anchors, reader="ocr")
+    fake.sel = row
+    r = a.open_selected()
+    assert r.row == row and r.term == term and fake.dd == term and fake.dialog
+    assert not [e for e in fake.events if e[0] == "click" and e[1] < 700]       # nothing clicked on the table
+    assert [e[0] for e in fake.events].count("type") == 0 and fake.edited == ""
+    assert [e for e in fake.events if e[0] == "double"] == [("double", 45, Y1 + row * H)]
+
+
+def test_open_selected_uses_the_mouse_when_the_highlight_cannot_be_seen(ocr, anchors):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr", no_highlight=True)
+    fake.sel = 5
+    fake.mouse_on_row(5)
+    r = a.open_selected()
+    assert r.row == 5 and r.term == "Short term share" and fake.dialog
+    assert any("mouse position" in l for l in lines)
+
+
+def test_open_selected_prefers_the_highlight_if_the_mouse_disagrees(ocr, anchors):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.sel = 2
+    fake.mouse_on_row(6)
+    assert a.open_selected().row == 2
+    assert any("using the highlight" in l for l in lines)
+
+
+def test_open_selected_says_so_when_it_cannot_tell_the_row(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, _ = _logged(ocr, anchors, reader="ocr", no_highlight=True)
+    fake.mouse = (5, 5)                                    # pointer nowhere near the table
+    with pytest.raises(SophisError, match="Could not tell which row"):
+        a.open_selected()
+    assert not fake.dialog and not [e for e in fake.events if e[0] == "double"]
+
+
+def test_open_selected_widens_the_term_column_when_it_is_cut(ocr, anchors):
+    a, fake, _ = _logged(ocr, anchors, reader="ocr")
+    fake.sel = 3
+    assert fake.term_extra == 0                            # truncated: "Long term..."
+    r = a.open_selected()
+    assert r.term == "Long term index" and fake.term_extra > 0
+
+
+def test_open_selected_with_term_given_never_reads_it(ocr, anchors):
+    a, fake, _ = _logged(ocr, anchors, reader="ocr")
+    a.cfg.widen_px = 0                                     # and no widening: the Term stays unreadable
+    fake.sel = 3
+    with pytest.raises(SophisError, match="--term"):
+        a.open_selected()
+    r = a.open_selected(term="Long term share")            # ...but you can tell it yourself
+    assert r.term == "Long term share" and fake.dd == "Long term share" and fake.dialog and r.row == 3
+
+
+def test_open_selected_works_with_the_window_somewhere_else(ocr, anchors):
+    a, fake, _ = _logged(ocr, anchors, reader="ocr", shift=(60, 35))
+    fake.sel = 4
+    r = a.open_selected()
+    assert r.row == 4 and r.term == "Future" and fake.dialog
+
+
+def test_open_selected_does_not_depend_on_the_clipboard_or_reading_the_mnemo(ocr, anchors):
+    """Even if the Mnemo OCR returns nothing, the flow continues: it never needs the code."""
+    a, fake, _ = _logged(ocr, anchors, reader="ocr")
+    fake.sel = 1
+    a._mnemonic_by_ocr = lambda i: ([], 0)
+    r = a.open_selected()
+    assert r.row == 1 and r.term == "Short term index" and fake.dialog and r.code == "?"
+
+
+def test_row_under_mouse(ocr, anchors):
+    a, fake = make(ocr, anchors)
+    fake.mouse_on_row(3)
+    assert a.row_under_mouse() == 3
+    fake.mouse = (45, Y1 - 60)
+    assert a.row_under_mouse() is None
+    fake.mouse = (900, Y1 + H)
+    assert a.row_under_mouse() is None
+
+
+def test_cli_open_refuses_codes_and_points_to_open_code(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "open", "ZYS"])
+    with pytest.raises(SystemExit) as e:
+        sa.main()
+    assert e.value.code == 2 and "open-code ZYS" in capsys.readouterr().out
