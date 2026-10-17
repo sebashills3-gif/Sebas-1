@@ -155,6 +155,8 @@ class FakeSophis:
         self.edit_mode = "double"   # how a cell opens: "double" | "select_first" | "f2" | "never"
         self.stray = ""        # what was typed while NO cell was open (it only moves the selection)
         self.keys = []         # hotkeys / key presses seen by the update window
+        self.enter_moves = True      # Enter commits the edit AND moves the selection to the next row (like real grids)
+        self.enter_scrolls = False   # ...and, on the last visible row, scrolls the list by one row
 
     # drawing
     def _image(self):
@@ -357,6 +359,14 @@ class FakeSophis:
     def press(self, key):
         if self.dialog:
             self.keys.append(key)
+            if key == "enter":
+                row = self.cell_edit[0] if self.cell_edit else None
+                self._commit_cell()
+                if self.enter_moves:
+                    self.dsel = min(len(DATES) - 1, self.dsel + 1)
+                if self.enter_scrolls and row is not None and row == self.dscroll + VISIBLE - 1:
+                    self.dscroll = min(len(DATES) - VISIBLE, self.dscroll + 1)
+                return
             if key == "f2" and self.dcell and self.edit_mode == "f2" and self.cell_edit is None:
                 self.cell_edit, self.cell_buf, self.sel_all = self.dcell, self.values.get(self.dcell, ""), False
             return
@@ -1204,27 +1214,36 @@ def test_fill_writes_minimum_and_maximum_of_the_chosen_row(ocr, anchors):
     assert res[0]["minimum"] == "ok" and res[0]["maximum"] == "ok"        # read back: grid shows 100.00 == 100
 
 
-def test_each_cell_is_double_clicked_typed_and_left_with_a_click_outside(ocr, anchors):
+def test_each_cell_is_selected_double_clicked_typed_and_confirmed_with_enter(ocr, anchors):
     a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")])
     ev = [e for e in fake.events if e[0] in ("double", "type", "click")]
-    seq = [e[0] for e in ev]
-    # per cell: ONE click to select it, a double click to open it, type, one click outside to commit
-    assert seq == ["click", "double", "type", "click", "click", "double", "type", "click"]
+    # per cell: ONE click to select it, a double click to open it, then type; Enter confirms (no click after typing)
+    assert [e[0] for e in ev] == ["click", "double", "type", "click", "double", "type"]
+    assert fake.keys.count("enter") == 2
     y = HEADER_Y + PITCH * 9
-    for sel, dbl in ((ev[0], ev[1]), (ev[4], ev[5])):
+    for sel, dbl in ((ev[0], ev[1]), (ev[3], ev[4])):
         assert sel[1:] == dbl[1:]                                                # same cell for both
     assert abs(ev[1][1] - HX["Minimum"]) <= 4 and abs(ev[1][2] - y) <= 3        # Minimum first
-    assert abs(ev[5][1] - HX["Maximum"]) <= 4 and abs(ev[5][2] - y) <= 3        # then Maximum
-    assert ev[2][1] == "100" and ev[6][1] == "120"
+    assert abs(ev[4][1] - HX["Maximum"]) <= 4 and abs(ev[4][2] - y) <= 3        # then Maximum
+    assert ev[2][1] == "100" and ev[5][1] == "120"
+    assert fake.values == {(8, "minimum"): "100", (8, "maximum"): "120"}
+
+
+def test_clicking_outside_the_cell_is_still_available(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")], commit="title")
+    ev = [e for e in fake.events if e[0] in ("double", "type", "click")]
+    assert [e[0] for e in ev] == ["click", "double", "type", "click", "click", "double", "type", "click"]
+    assert "enter" not in fake.keys
     for click in (ev[3], ev[7]):                                                 # the click outside: the window title
         assert abs(click[2] - 158) <= 8
+    assert fake.values == {(8, "minimum"): "100", (8, "maximum"): "120"}
 
 
 def test_the_ric_cell_can_be_used_to_leave_a_cell_instead(ocr, anchors):
     a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")], commit="ric")
     kinds = [e[0] for e in fake.events]
     outside = [fake.events[i] for i in range(1, len(kinds)) if kinds[i] == "click" and kinds[i - 1] == "type"]
-    assert len(outside) == 2 and all(abs(e[1] - HX["Ric"]) <= 6 for e in outside)
+    assert len(outside) == 2 and all(abs(e[1] - HX["Ric"]) <= 6 for e in outside) and "enter" not in fake.keys
     assert fake.values[(8, "maximum")] == "120"
 
 
@@ -1319,7 +1338,7 @@ def test_cli_fill_has_no_ok_option_and_parses_entries(monkeypatch):
                                       "--entry", "27 Nov 2026", "95", "130", "--dry-run"])
     sa.main()
     assert seen == {"entry": [["20 Nov 2026#1", "100", "120"], ["27 Nov 2026", "95", "130"]], "dry": True,
-                    "commit": "title"}
+                    "commit": "enter"}
     monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "fill", "--entry", "20 Nov 2026", "1", "2", "--ok"])
     with pytest.raises(SystemExit):
         sa.main()                                              # --ok no longer exists
@@ -1572,3 +1591,36 @@ def test_the_dotted_focus_rectangle_is_not_mistaken_for_decimal_points(ocr):
     readings, glyphs = ocr.read_cell(cell)
     assert any(sa.parse_number(r) == 100.0 for r in readings), readings
     assert glyphs == 3
+
+
+# ── Enter moves the selection / may scroll the list: the next cell must still land on the right row ──
+
+def test_enter_moves_the_selection_but_both_cells_of_the_row_get_their_value(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("27 Nov 2026", "95", "130"), ("30 Nov 2026", "1", "2")])
+    assert fake.values == {(7, "minimum"): "95", (7, "maximum"): "130", (8, "minimum"): "1", (8, "maximum"): "2"}
+    assert fake.stray == ""
+
+
+def test_the_list_scrolling_on_enter_does_not_send_the_maximum_to_another_row(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "double")
+    fake.enter_scrolls = True                                    # Enter on the last visible row shifts the list
+    a.fill_values([sa.parse_entry("18 Dec 2026", "5", "6")])     # row 9 is the last visible row
+    assert fake.dscroll == 1
+    assert fake.values == {(9, "minimum"): "5", (9, "maximum"): "6"}      # the date's own row, not the row below it
+
+
+def test_when_nothing_moved_the_second_cell_does_not_search_the_date_again(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "double")
+    calls = []
+    real = a.locate_date
+    a.locate_date = lambda *args, **kw: (calls.append(1), real(*args, **kw))[1]
+    a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
+    assert len(calls) == 2                                       # the plan, and the first cell; Maximum reuses the row
+    assert fake.values == {(7, "minimum"): "95", (7, "maximum"): "130"}
+
+
+def test_a_repeated_date_is_safe_with_the_fast_second_cell(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "double")
+    fake.enter_scrolls = False
+    a.fill_values([sa.parse_entry("20 Nov 2026#1", "5", "6")])   # the second of two identical dates
+    assert fake.values == {(6, "minimum"): "5", (6, "maximum"): "6"}

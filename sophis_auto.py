@@ -26,7 +26,7 @@ Usage (in this order the first time):
        python sophis_auto.py open-code ZYS ZTS     # (older flow) types the code to find its row; not reliable yet
     6) python sophis_auto.py fill --entry "20 Nov 2026#1" 100 120 --entry "27 Nov 2026" 95 130 [--dry-run]
                                                 # (update window open) writes Minimum/Maximum per date: double
-                                                # click the cell, type, click outside, read it back; never presses OK
+                                                # select the cell, double click, type, Enter, read it back; never presses OK
     5) python sophis_auto.py window --date "20 Nov 2026" --show
                                                 # (update window open) reads its dates and shows where that date's
                                                 # Minimum and Maximum cells are; nothing is clicked or typed
@@ -1586,10 +1586,10 @@ class Automator:
             self.log(f"    the cell did not open after: {how}")
         return False
 
-    def write_cell(self, win: UpdateWindow, row: WindowRow, column: str, value: str, commit: str = "title",
+    def write_cell(self, win: UpdateWindow, row: WindowRow, column: str, value: str, commit: str = "enter",
                    verify: bool = True, check_edit: bool = True) -> str:
-        """Open the cell for editing (checked), replace its content with `value`, click outside to commit, and read
-        the cell back. Returns "ok", "unverified" (could not read the cell) or raises if it shows another value, or
+        """Open the cell for editing (checked), replace its content with `value`, confirm it (Enter by default, or a
+        click outside the cell), and read the cell back. Returns "ok", "unverified" (could not read the cell) or raises if it shows another value, or
         if the cell would not open (then NOTHING is typed, unless check_edit is False)."""
         x = win.x_minimum if column == "minimum" else win.x_maximum
         other = win.x_maximum if column == "minimum" else (win.x_ric or win.x_maximum + (win.x_maximum - win.x_minimum))
@@ -1611,7 +1611,10 @@ class Automator:
         self.s.type_text(str(value))
         self._wait(0.25)
         self._trace(f"{column}_3_typed")
-        self.s.click(*self._commit_point(win, row, commit))
+        if commit == "enter":
+            self.s.press("enter")                   # leaves the edit box, keeps the typed value
+        else:
+            self.s.click(*self._commit_point(win, row, commit))
         self._wait(0.7)
         self._trace(f"{column}_4_committed")
         if not verify:
@@ -1628,7 +1631,7 @@ class Automator:
         self.log(f"    {column} reads back as {seen:g}")
         return "ok"
 
-    def fill_values(self, entries: list, verify: bool = True, dry_run: bool = False, commit: str = "title",
+    def fill_values(self, entries: list, verify: bool = True, dry_run: bool = False, commit: str = "enter",
                     check_edit: bool = True) -> list:
         """Writes Minimum and Maximum for each entry in the open update window. The row is found again before
         every cell (the list may have scrolled). A date that appears more than once needs its `occurrence`;
@@ -1651,15 +1654,30 @@ class Automator:
             return [{"date": e.date, "row": t.row.index, "minimum": t.minimum, "maximum": t.maximum,
                      "written": False} for e, t in plan]
         # 2) Write. The row is found again before every cell (the list may have scrolled), with a fresh read.
+        def view(win):
+            return (tuple((r.index, r.date, r.suffix) for r in win.rows), round(win.header_y), round(win.x_maturity))
+
         for e, _ in plan:
             result = {"date": e.date, "minimum": None, "maximum": None, "written": True}
+            previous = None                                              # the target of the cell written just before
             for column, value in (("minimum", e.minimum), ("maximum", e.maximum)):
                 if value is None:
                     continue
-                t = self.locate_date(e.date, e.occurrence)
-                if t.ambiguous:
-                    raise SophisError(f"{e.date:%d %b %Y} became ambiguous while writing; stopped.")
+                t = None
+                if previous is not None:
+                    # Same row, next cell: one quick read is enough IF the list looks exactly as before (Enter may
+                    # have moved the selection or scrolled the list by a row; then the rows would be shifted and
+                    # the full search below finds the date again).
+                    win = self.read_update_window()
+                    if view(win) == view(previous.win):
+                        t = CellTarget(previous.row, (win.x_minimum, previous.row.cy), (win.x_maximum, previous.row.cy),
+                                       previous.matches, ambiguous=False, win=win)
+                if t is None:
+                    t = self.locate_date(e.date, e.occurrence)
+                    if t.ambiguous:
+                        raise SophisError(f"{e.date:%d %b %Y} became ambiguous while writing; stopped.")
                 result[column] = self.write_cell(t.win, t.row, column, value, commit, verify, check_edit)
+                previous = t
             done.append(result)
         self.log("done. The window was left open: check the values and press OK yourself.")
         return done
@@ -1997,8 +2015,9 @@ def main() -> None:
                    help="type even if the cell did not visibly open for editing (default: stop and type nothing)")
     s.add_argument("--no-trace", dest="no_trace", action="store_true",
                    help="do not save a screenshot at every step (they go to sophis_debug/ by default)")
-    s.add_argument("--commit-click", dest="commit_click", choices=["title", "ric"], default="title",
-                   help="where to click to leave a cell: the window's title (default) or the Ric cell of the row")
+    s.add_argument("--commit-click", dest="commit_click", choices=["enter", "title", "ric"], default="enter",
+                   help="how to confirm a typed value: press Enter (default), or click outside the cell: on the "
+                        "window's title or on the Ric cell of the row")
     s.add_argument("--reader", default=None, help=argparse.SUPPRESS)
     s.add_argument("--no-widen", dest="no_widen", action="store_true", help=argparse.SUPPRESS)
     s.add_argument("--slowdown", dest="slowdown", type=float, help="multiplier for waits (2 = twice as slow)")
