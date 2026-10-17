@@ -1624,7 +1624,7 @@ def test_enter_moves_the_selection_but_both_cells_of_the_row_get_their_value(ocr
 def test_the_list_scrolling_on_enter_does_not_send_the_maximum_to_another_row(ocr, anchors):
     a, fake, lines = _grid(ocr, anchors, "double")
     fake.enter_scrolls = True                                    # Enter on the last visible row shifts the list
-    a.fill_values([sa.parse_entry("18 Dec 2026", "5", "6")])     # row 9 is the last visible row
+    a.fill_values([sa.parse_entry("18 Dec 2026", "5", "6")], recheck_row=True)   # row 9 is the last visible row
     assert fake.dscroll == 1
     assert fake.values == {(9, "minimum"): "5", (9, "maximum"): "6"}      # the date's own row, not the row below it
 
@@ -1691,3 +1691,29 @@ def test_an_unreadable_neighbour_row_is_taken_as_the_next_occurrence(ocr, anchor
     assert t.row.index == 6
     with pytest.raises(SophisError, match="no occurrence 3"):
         a.locate_date(target, occurrence=3)
+
+
+def test_the_maximum_is_the_cell_to_the_right_without_reading_the_window_again(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "double")
+    reads = []
+    real = a.read_update_window
+    a.read_update_window = lambda: (reads.append(1), real())[1]
+    a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
+    n_default = len(reads)
+    assert fake.values == {(7, "minimum"): "95", (7, "maximum"): "130"}
+    a2, fake2, _ = _grid(ocr, anchors, "double")
+    reads2 = []
+    real2 = a2.read_update_window
+    a2.read_update_window = lambda: (reads2.append(1), real2())[1]
+    a2.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")], recheck_row=True)
+    assert n_default < len(reads2)
+
+
+def test_one_unreadable_row_between_its_neighbours_is_the_missing_date(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    real = a.read_update_window()
+    row = next(r for r in real.rows if r.date == D("27 Nov 2026"))
+    row.date, row.text = None, "?"                         # the highlighted row, unreadable
+    a.read_update_window = lambda: real
+    t = a.locate_date(D("27 Nov 2026"))
+    assert t.row.index == row.index and not t.ambiguous

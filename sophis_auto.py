@@ -1494,6 +1494,12 @@ class Automator:
             if not dated:
                 raise SophisError("No dates could be read in the update window.")
             if dated[0].date <= target <= dated[-1].date:
+                slot = self._unreadable_slot(win, target)
+                if slot is not None:
+                    self.log(f"  WARNING: {target:%d %b %Y} was not read, but row {slot.index} (unreadable) sits exactly "
+                             f"where it belongs between its neighbours; using that row")
+                    return CellTarget(slot, (win.x_minimum, slot.cy), (win.x_maximum, slot.cy), [slot],
+                                      ambiguous=False, win=win)
                 raise SophisError(f"{target:%d %b %Y} is not in the list (it falls between "
                                   f"{dated[0].date:%d %b %Y} and {dated[-1].date:%d %b %Y} but is not there).")
             signature = tuple(r.date for r in dated)
@@ -1508,6 +1514,20 @@ class Automator:
             self.s.scroll(-3 if down else 3, win.x_maturity, mid)
             self._wait(0.7)
         raise SophisError(f"{target:%d %b %Y} was not found after {max_scrolls} scrolls.")
+
+    @staticmethod
+    def _unreadable_slot(win: UpdateWindow, target: dt.date) -> WindowRow | None:
+        """The dates are sorted. If the rows right before and after the target's place were read and exactly one
+        row between them could not be read (often the highlighted one), that row must be the target's."""
+        before = [r for r in win.rows if r.date and r.date < target]
+        after = [r for r in win.rows if r.date and r.date > target]
+        if not before or not after:
+            return None
+        lo, hi = before[-1].index, after[0].index
+        gap = [r for r in win.rows if lo < r.index < hi]
+        if len(gap) == 1 and gap[0].date is None:
+            return gap[0]
+        return None
 
     def _more_occurrences(self, win: UpdateWindow, target: dt.date, occurrence: int, matches: list):
         """The wanted occurrence was not read. The rows of a repeated date are neighbours, so a re-read may find
@@ -1681,6 +1701,13 @@ class Automator:
                  f"probably a misread, going on - check it by eye. Screenshot: {path}")
         return "unverified"
 
+    def _next_cell_same_row(self, previous: CellTarget) -> CellTarget:
+        """After Enter the pointer is still in the middle of the cell just written, so the next cell of the same
+        row is simply to its right: no new read of the window, which can only fail on the highlighted row."""
+        win = previous.win
+        return CellTarget(previous.row, (win.x_minimum, previous.row.cy), (win.x_maximum, previous.row.cy),
+                          previous.matches, ambiguous=False, win=win)
+
     def _reuse_row(self, previous: CellTarget, view) -> CellTarget | None:
         """Same row, next cell: one quick read is enough IF the list looks exactly as before. Enter may have moved
         the selection or scrolled the list by a row (then the rows are shifted); in that case, or if the quick read
@@ -1696,7 +1723,7 @@ class Automator:
                           previous.matches, ambiguous=False, win=win)
 
     def fill_values(self, entries: list, verify: bool = True, dry_run: bool = False, commit: str = "enter",
-                    check_edit: bool = True) -> list:
+                    check_edit: bool = True, recheck_row: bool = False) -> list:
         """Writes Minimum and Maximum for each entry in the open update window. The row is found again before
         every cell (the list may have scrolled). A date that appears more than once needs its `occurrence`;
         nothing is guessed. dry_run only locates the cells. It NEVER presses OK: the window is left open so you
@@ -1727,7 +1754,10 @@ class Automator:
             for column, value in (("minimum", e.minimum), ("maximum", e.maximum)):
                 if value is None:
                     continue
-                t = self._reuse_row(previous, view) if previous is not None else None
+                t = None
+                if previous is not None:
+                    t = (self._reuse_row(previous, view) if recheck_row
+                         else self._next_cell_same_row(previous))
                 if t is None:
                     t = self.locate_date(e.date, e.occurrence)
                     if t.ambiguous:
@@ -2048,7 +2078,7 @@ def cmd_fill(args) -> None:
     _countdown_to_front(args)
     try:
         results = a.fill_values(entries, verify=not args.no_verify, dry_run=args.dry_run, commit=args.commit_click,
-                                check_edit=not args.no_edit_check)
+                                check_edit=not args.no_edit_check, recheck_row=args.recheck_row)
     except SophisError as e:
         print(f"\nERROR: {e}")
         sys.exit(1)
@@ -2068,6 +2098,9 @@ def main() -> None:
                    help="row to use for ALL entries whose date appears more than once (or write DATE#n)")
     s.add_argument("--dry-run", dest="dry_run", action="store_true", help="only locate the cells; click/type nothing")
     s.add_argument("--no-verify", dest="no_verify", action="store_true", help="do not read each cell back")
+    s.add_argument("--recheck-row", dest="recheck_row", action="store_true",
+                   help="read the window again before the Maximum cell and search the date again if the list "
+                        "moved (default: the Maximum is simply the cell to the right of the Minimum just written)")
     s.add_argument("--strict-verify", dest="strict_verify", action="store_true",
                    help="stop if a cell reads back as a different number (default: warn and go on, because the "
                         "OCR often misreads the committed cell)")
