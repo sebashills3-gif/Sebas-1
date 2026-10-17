@@ -128,6 +128,7 @@ class FakeSophis:
         self._clip = None
         self.key_interval = 0
         self.events = []       # ("click" | "double" | "type", ...) in the order they happened
+        self._last_type_t = -1e9
 
     # drawing
     def _image(self):
@@ -204,9 +205,9 @@ class FakeSophis:
 
     def double_click(self, x, y):
         self.events.append(("double", x, y))
-        self.editing = None
-        self._click(x, y)
-        if self._row_at(x - self.dx, y - self.dy) is not None:
+        i = self._row_at(x - self.dx, y - self.dy)
+        if i is not None:                              # a double click opens the window; it does not edit
+            self.sel, self.editing, self.typed = i, None, ""
             self.dialog = True
 
     def type_text(self, text):
@@ -214,6 +215,9 @@ class FakeSophis:
         if self.editing is not None:                   # typing into the open edit box overwrites the cell
             self.edited += text
             return
+        if sa.time.time() - self._last_type_t > 0.02:  # the grid's type-ahead buffer expires after a pause
+            self.typed = ""
+        self._last_type_t = sa.time.time()
         for ch in text:
             self.typed += ch.upper()
             for i, (m, _) in enumerate(ROWS):
@@ -273,7 +277,7 @@ def make(ocr, anchors, **kw):
     cfg = Config(anchors=anchors, points={
         "row1": [45, Y1], "row2": [45, Y1 + H], "rowN": [45, Y1 + 7 * H], "ext": [140, Y1],
         "ric_left": [RIC_LEFT, 70], "term_left": [BORDER, 70], "term_right": [RIGHT, 70], "dd_left": [706, 62], "dd_arrow": list(ARROW),
-    }, slowdown=0.01, **{k: v for k, v in kw.items() if k in ("reader", "verify_mnemonic")})
+    }, slowdown=0.01, **{k: v for k, v in kw.items() if k in ("reader", "verify_mnemonic", "auto_focus")})
     screen = FakeSophis(**{k: v for k, v in kw.items() if k in ("clipboard", "popup_visible", "shift", "hidden", "always_edit")})
     a = Automator(screen, ocr, cfg, log=lambda *_: None)
     a.prepare()
@@ -320,16 +324,16 @@ def test_unknown_code_aborts_without_opening(ocr, anchors, tmp_path, monkeypatch
 # ── exactly one click before typing ─────────────────────────────────────────
 
 @pytest.mark.parametrize("reader,clipboard", [("ocr", False), ("auto", True)])
-def test_a_single_click_before_typing(ocr, anchors, reader, clipboard):
-    a, fake = make(ocr, anchors, reader=reader, clipboard=clipboard)
+def test_auto_focus_makes_a_single_click_before_typing(ocr, anchors, reader, clipboard):
+    a, fake = make(ocr, anchors, reader=reader, clipboard=clipboard, auto_focus=True)
     assert fake.events == []                      # preparing must not click anything or type
     a.search("ZS")
     kinds = [e[0] for e in fake.events]
     assert kinds[:2] == ["click", "type"], kinds  # one click, then straight to typing
 
 
-def test_each_code_gets_one_click_then_typing_until_the_window_opens(ocr, anchors):
-    a, fake = make(ocr, anchors, reader="ocr")
+def test_each_code_gets_one_click_then_typing_until_the_window_opens_in_auto_focus(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr", auto_focus=True)
     a.open_contract("ZYS")
     first_type = [e[0] for e in fake.events].index("type")
     assert [e[0] for e in fake.events[:first_type]] == ["click"]
@@ -552,7 +556,7 @@ def test_widen_term_makes_it_readable_and_cyc_stays_put(ocr, anchors):
 def test_an_unconfirmed_row_is_reread_not_clicked_again(ocr, anchors, tmp_path, monkeypatch):
     """The repeated-click problem: when the Mnemo cannot be confirmed, attempt 2 only re-reads the screen."""
     monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
-    a, fake = make(ocr, anchors, reader="ocr")
+    a, fake = make(ocr, anchors, reader="ocr", auto_focus=True)
     with pytest.raises(SophisError):
         a.search("QQQ")                                   # not in the list: never confirmed
     clicks = [e for e in fake.events if e[0] == "click"]
@@ -627,23 +631,24 @@ def test_match_code_survives_non_string_readings():
 # ── a click on an already selected cell opens it for editing: never do that ──
 
 def test_the_click_never_lands_on_the_row_that_is_already_selected(ocr, anchors):
-    a, fake = make(ocr, anchors, reader="ocr")            # the fake starts with row 0 selected
+    a, fake = make(ocr, anchors, reader="ocr", auto_focus=True)   # the fake starts with row 0 selected
     clicked = a.focus_grid()
     assert clicked == 1 and fake.editing is None
     assert fake.events[0] == ("click", 45, Y1 + H)        # row 1, not the selected row 0
 
 
 def test_when_row_one_is_the_selected_one_it_clicks_another(ocr, anchors):
-    a, fake = make(ocr, anchors, reader="ocr")
+    a, fake = make(ocr, anchors, reader="ocr", auto_focus=True)
     fake.sel = 1
     assert a.focus_grid() == 2 and fake.editing is None
 
 
+@pytest.mark.parametrize("auto_focus", [False, True])
 @pytest.mark.parametrize("code", ["ZS", "ZQK", "ZYS", "ZM"])
-def test_repeated_searches_never_overwrite_a_cell(ocr, anchors, code):
+def test_repeated_searches_never_overwrite_a_cell(ocr, anchors, code, auto_focus):
     """The reported bug: after a search the found row sits selected at the top; clicking it again opened it for
     editing and the next search was typed INTO the cell."""
-    a, fake = make(ocr, anchors, reader="ocr")
+    a, fake = make(ocr, anchors, reader="ocr", auto_focus=auto_focus)
     for c in ("ZJO", code, "ZTS", code):
         a.search(c)
     assert fake.edited == "" and fake.editing is None
@@ -651,7 +656,7 @@ def test_repeated_searches_never_overwrite_a_cell(ocr, anchors, code):
 
 def test_edit_mode_is_detected_and_nothing_is_typed(ocr, anchors, tmp_path, monkeypatch):
     monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
-    a, fake = make(ocr, anchors, reader="ocr", always_edit=True)   # every click opens the cell for editing
+    a, fake = make(ocr, anchors, reader="ocr", always_edit=True, auto_focus=True)   # every click opens the cell
     with pytest.raises(SophisError, match="NOTHING was typed"):
         a.search("ZS")
     assert not [e for e in fake.events if e[0] == "type"] and fake.edited == ""
@@ -663,3 +668,58 @@ def test_row_in_edit_mode_detection(ocr, anchors):
     assert not a._row_in_edit_mode(3)                     # an ordinary row
     fake.editing = 0                                      # the Mnemo cell became a white edit box
     assert a._row_in_edit_mode(0)
+
+
+# ── manual mode (default): YOU click a row once, the script only types ───────
+
+def test_manual_mode_never_clicks_before_typing(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")            # the fake starts with a row selected, as after your click
+    a.search("ZS")
+    assert fake.events[0][0] == "type"
+    assert not [e for e in fake.events if e[0] in ("click", "double")]
+    assert fake.edited == ""
+
+
+@pytest.mark.parametrize("start_row", [0, 1, 4])
+def test_manual_mode_works_whichever_row_you_clicked(ocr, anchors, start_row):
+    a, fake = make(ocr, anchors, reader="ocr")
+    fake.sel = start_row
+    r = a.search("ZQK")
+    assert ROWS[fake.sel][0] == "ZQK" and r[1].match in ("exact", "weak")
+    assert fake.edited == ""
+
+
+def test_manual_mode_open_contract_clicks_only_the_dropdown_and_the_final_double_click(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    a.open_contract("ZTO")
+    kinds = [e[0] for e in fake.events]
+    assert kinds[0] == "type" and kinds.count("double") == 1 and fake.dialog and fake.edited == ""
+
+
+def test_manual_mode_refuses_to_type_when_no_row_is_selected(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake = make(ocr, anchors, reader="ocr")
+    fake.sel = None                                       # you forgot to click a row
+    with pytest.raises(SophisError, match="Click ONE row"):
+        a.search("ZS")
+    assert not [e for e in fake.events if e[0] == "type"]
+
+
+def test_manual_mode_refuses_to_type_into_an_open_cell(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake = make(ocr, anchors, reader="ocr")
+    fake.editing = fake.sel = 2                           # the cell is open for editing
+    with pytest.raises(SophisError, match="open for editing"):
+        a.search("ZS")
+    assert fake.edited == "" and not [e for e in fake.events if e[0] == "type"]
+
+
+def test_manual_mode_waits_for_the_typeahead_buffer_between_codes(ocr, anchors, monkeypatch):
+    a, fake = make(ocr, anchors, reader="ocr")
+    a.cfg.type_gap, a.cfg.slowdown = 2.5, 1.0
+    slept = []
+    real_sleep = sa.time.sleep
+    monkeypatch.setattr(sa.time, "sleep", lambda x: (slept.append(x), real_sleep(0.01)))
+    a._last_typed_at = sa.time.time()                     # a code was typed just now
+    a._type_code("ZS")
+    assert any(x > 1.5 for x in slept), slept             # it let the grid's search buffer expire first

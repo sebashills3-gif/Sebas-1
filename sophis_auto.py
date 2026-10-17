@@ -115,6 +115,8 @@ class Config:
     reader: str = "auto"          # auto | clipboard | ocr
     verify_mnemonic: bool = True  # False = accept the row even if its Mnemo cannot be read (NOT recommended)
     weak_verify: bool = True      # accept a Mnemo OCR could not read exactly if its shape fits (same glyph count)
+    auto_focus: bool = False      # False = YOU click a row once and the script only types; True = it clicks too
+    type_gap: float = 2.5         # seconds between two typed codes (the grid's type-ahead buffer must expire)
 
     @staticmethod
     def _migrate(d: dict) -> dict:
@@ -633,6 +635,7 @@ class Automator:
         self.g: Geometry
         self._widened = False
         self._first_click_done = False
+        self._last_typed_at = -1e9
         self._clipboard_works = True
 
     # ── helpers ─────────────────────────────────────────────────────────────
@@ -700,6 +703,33 @@ class Automator:
 
     def prepare(self) -> None:
         self.locate()
+
+    def ensure_ready_to_type(self) -> int:
+        """Manual mode: the grid must already have focus because YOU clicked a row. This only checks that it is
+        safe to type: a row is selected and no cell is open for editing (typing would overwrite it).
+        Returns the selected row. It never clicks."""
+        row = self.selected_row()
+        if row is None:
+            path = self.save_debug("no_row_selected")
+            raise SophisError("No selected row found in the Mnemo table. Click ONE row of the table yourself "
+                              f"(a single click) and try again. NOTHING was typed. Screenshot: {path}")
+        if self._row_in_edit_mode(row):
+            path = self.save_debug("edit_mode")
+            raise SophisError("A Mnemo cell is open for editing (a click on an already selected cell does that). "
+                              "Click a DIFFERENT row once so the edit closes (do not press Enter) and try "
+                              f"again. NOTHING was typed. Screenshot: {path}")
+        return row
+
+    def _type_code(self, code: str) -> int:
+        """Types `code` once the type-ahead buffer of the previous code has expired. Returns the row that was
+        selected before typing (used to tell whether typing moved the grid)."""
+        pause = self._last_typed_at + self.cfg.type_gap * self.cfg.slowdown - time.time()
+        if pause > 0:
+            time.sleep(pause)
+        start = self.ensure_ready_to_type() if not self.cfg.auto_focus else self.focus_grid()
+        self.s.type_text(code)
+        self._last_typed_at = time.time()
+        return start
 
     def focus_grid(self) -> int:
         """Gives the grid keyboard focus with ONE click and returns the row that was clicked.
@@ -857,7 +887,8 @@ class Automator:
         return None
 
     def search(self, code: str, attempts: int = 3) -> tuple[int, Reading]:
-        """One click on an unselected row, then type the code. If the row cannot be confirmed, the next attempt
+        """Type the code (the grid already has focus because you clicked a row, or --auto-focus clicked an
+        unselected one). If the row cannot be confirmed, the next attempt
         first just re-reads (the grid may still have been scrolling); only the last attempt, or one that
         found no selected row at all, clicks and types again."""
         last = ""
@@ -866,9 +897,8 @@ class Automator:
         clicked = -1
         for k in range(1, attempts + 1):
             if retype or k == attempts:
-                clicked = self.focus_grid()
                 before = self._column_image()
-                self.s.type_text(code)
+                clicked = self._type_code(code)
                 self._wait(0.8)
                 moved = self._differs(before, self._column_image())
             else:
@@ -1058,22 +1088,38 @@ def _create(args) -> Automator:
         cfg.widen_px = 0
     if getattr(args, "slowdown", None):
         cfg.slowdown = args.slowdown
+    if getattr(args, "auto_focus", False):
+        cfg.auto_focus = True
     print("Loading OCR ...")
     return Automator(Screen(cfg.key_interval), OCR(), cfg)
+
+
+def ask_for_click(a: Automator, args, first: bool = True) -> None:
+    """Manual mode: you give the Mnemo table keyboard focus with ONE click, then the script only types."""
+    if a.cfg.auto_focus:
+        print("You have 3 seconds to bring Sophis (Citrix) to the front ...")
+        time.sleep(3)
+        return
+    wait = max(1, int(getattr(args, "click_wait", 6)))
+    print(f"\nNow, in Sophis: click ONE row of the Mnemo table (a single click, on a row that is not already "
+          f"highlighted) and then DO NOT touch anything.\nTyping starts in {wait} seconds ...")
+    for sec in range(wait, 0, -1):
+        print(f"   {sec}...", end="\r", flush=True)
+        time.sleep(1)
+    print("   typing now      ")
 
 
 def cmd_diagnose(args) -> None:
     """Shows what the script sees; useful to tune the calibration (does not open any window)."""
     a = _create(args)
     code = args.code.upper()
-    print("You have 3 seconds to bring Sophis (Citrix) to the front ...")
-    time.sleep(3)
+    ask_for_click(a, args)
     DEBUG_DIR.mkdir(exist_ok=True)
     a.save_debug("diag_screen")
     a.prepare()
-    clicked = a.focus_grid()
-    print(f"Clicked row {clicked} (never an already selected one) and the grid is not in edit mode.")
-    a.s.type_text(code)
+    start = a._type_code(code)
+    print(f"Row selected before typing: {start} (the script did not click anything"
+          f"{' except an unselected row' if a.cfg.auto_focus else ''}); the grid was not in edit mode.")
     a._wait(0.8)
     i = a.selected_row()
     print(f"\nSelected row after typing '{code}': {i}")
@@ -1104,10 +1150,8 @@ def cmd_diagnose(args) -> None:
 
 def cmd_open(args) -> None:
     a = _create(args)
-    print("You have 3 seconds to bring Sophis (Citrix) to the front ...")
-    time.sleep(3)
-    a.prepare()
     for k, code in enumerate(args.codes):
+        ask_for_click(a, args, first=(k == 0))
         try:
             a.open_contract(code)
         except SophisError as e:
@@ -1143,6 +1187,10 @@ def main() -> None:
                        help="do not touch the Term column width")
         s.add_argument("--slowdown", "--pausa", dest="slowdown", type=float,
                        help="multiplier for waits (2 = twice as slow)")
+        s.add_argument("--click-wait", dest="click_wait", type=int, default=6,
+                       help="seconds you get to click a row in Sophis before typing starts (default 6)")
+        s.add_argument("--auto-focus", dest="auto_focus", action="store_true",
+                       help="let the script click an unselected row itself (default: you click, it only types)")
         s.set_defaults(fn=fn)
 
     args = ap.parse_args()
