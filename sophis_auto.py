@@ -320,6 +320,8 @@ class Pantalla:
         self.pg = pyautogui
         self.intervalo_tecla = intervalo_tecla
         self._tk = None
+        self._ultimo_click = -1e9
+        self._intervalo_doble = self._tiempo_doble_click()
 
     def posicion(self) -> tuple[int, int]:
         p = self.pg.position()
@@ -332,13 +334,35 @@ class Pantalla:
         x0, y0, x1, y1 = (int(v) for v in region)
         return self.pg.screenshot(region=(x0, y0, max(1, x1 - x0), max(1, y1 - y0))).convert("RGB")
 
+    @staticmethod
+    def _tiempo_doble_click() -> float:
+        """Tiempo (s) en que Windows junta dos clics en uno doble (normalmente 0.5 s)."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                return ctypes.windll.user32.GetDoubleClickTime() / 1000.0
+            except Exception:
+                pass
+        return 0.5
+
+    def _esperar_fin_doble_click(self) -> None:
+        """Dos clics sencillos muy seguidos se leen como UN doble clic: se espera a que pase esa ventana."""
+        falta = self._ultimo_click + self._intervalo_doble + 0.15 - time.monotonic()
+        if falta > 0:
+            time.sleep(falta)
+
     def click(self, x: int, y: int) -> None:
+        """Un clic sencillo (nunca se junta con el clic anterior)."""
+        self._esperar_fin_doble_click()
         self.pg.moveTo(x, y, duration=0.15)
         self.pg.click()
+        self._ultimo_click = time.monotonic()
 
     def doble_click(self, x: int, y: int) -> None:
+        self._esperar_fin_doble_click()
         self.pg.moveTo(x, y, duration=0.15)
         self.pg.doubleClick(interval=0.12)
+        self._ultimo_click = time.monotonic()
 
     def escribir(self, texto: str) -> None:
         for ch in texto:
@@ -806,7 +830,7 @@ def cmd_diagnostico(args) -> None:
     CARPETA_DEBUG.mkdir(exist_ok=True)
     a.guardar_debug("diag_pantalla")
     a.preparar()
-    a.click_fila(0)
+    a.click_fila(0)       # el clic previo de preparar() queda separado por la espera anti doble clic
     a._esp(0.4)
     a.p.escribir(codigo)
     a._esp(0.8)

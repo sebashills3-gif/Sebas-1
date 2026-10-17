@@ -300,3 +300,54 @@ def test_calibrar_invalido_no_pisa_la_calibracion_anterior(ocr, monkeypatch, tmp
     with pytest.raises(ErrorSophis, match="filaN"):
         _calibrar_con(monkeypatch, tmp_path, FakeSophis(), [(45, Y1 + H)], solo=["filaN"])
     assert (tmp_path / "sophis_config.json").read_text() == antes
+
+
+# ── dos clics sencillos seguidos no deben convertirse en doble clic ─────────
+
+class _PgFalso:
+    FAILSAFE = False
+    PAUSE = 0
+
+    def __init__(self):
+        self.eventos = []
+
+    def moveTo(self, *a, **k):
+        pass
+
+    def click(self):
+        self.eventos.append(("click", sa.time.monotonic()))
+
+    def doubleClick(self, **k):
+        self.eventos.append(("doble", sa.time.monotonic()))
+
+
+def test_dos_clics_sencillos_quedan_separados(monkeypatch):
+    import sys
+    pg = _PgFalso()
+    monkeypatch.setitem(sys.modules, "pyautogui", pg)
+    reloj = {"t": 1000.0}
+    esperas = []
+    monkeypatch.setattr(sa.time, "monotonic", lambda: reloj["t"])
+    monkeypatch.setattr(sa.time, "sleep", lambda s: (esperas.append(s), reloj.__setitem__("t", reloj["t"] + s)))
+    p = sa.Pantalla()
+    p.click(10, 10)
+    reloj["t"] += 0.4                   # el script solo espera 0.4 s entre clics (menos que el doble clic de Windows)
+    p.click(10, 10)
+    t1, t2 = (e[1] for e in pg.eventos)
+    assert t2 - t1 >= p._intervalo_doble + 0.1
+    assert esperas, "debió esperar antes del segundo clic"
+
+
+def test_clics_ya_separados_no_esperan(monkeypatch):
+    import sys
+    pg = _PgFalso()
+    monkeypatch.setitem(sys.modules, "pyautogui", pg)
+    reloj = {"t": 1000.0}
+    esperas = []
+    monkeypatch.setattr(sa.time, "monotonic", lambda: reloj["t"])
+    monkeypatch.setattr(sa.time, "sleep", lambda s: esperas.append(s))
+    p = sa.Pantalla()
+    p.click(10, 10)
+    reloj["t"] += 5
+    p.click(10, 10)
+    assert not esperas
