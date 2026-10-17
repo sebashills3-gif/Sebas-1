@@ -449,11 +449,17 @@ class Automatizador:
         f1, f2, fn = self._pt("fila1"), self._pt("fila2"), self._pt("filaN")
         ext, tb, td = self._pt("ext"), self._pt("term_borde"), self._pt("term_der")
         h = f2[1] - f1[1]
+        datos = f"(fila1 y={f1[1]}, fila2 y={f2[1]}, filaN y={fn[1]})"
         if h < 8:
-            raise ErrorSophis("Calibración inválida: 'fila2' debe estar debajo de 'fila1'. Repite 'calibrar'.")
+            raise ErrorSophis(
+                f"Calibración inválida {datos}: 'fila2' debe estar unos 15-25px DEBAJO de 'fila1'. "
+                "Repite solo esos puntos:  python sophis_auto.py calibrar --solo fila1 fila2 filaN")
         n = int(round((fn[1] - f1[1]) / h)) + 1
         if n < 3:
-            raise ErrorSophis("Calibración inválida: 'filaN' debe ser la última fila visible. Repite 'calibrar'.")
+            raise ErrorSophis(
+                f"Calibración inválida {datos}: alto de fila={h}px, así que 'filaN' cae en la fila {n}. "
+                "'filaN' debe ser la ÚLTIMA fila visible de la tabla (varias filas debajo de 'fila1'). "
+                "Repite solo esos puntos:  python sophis_auto.py calibrar --solo fila1 fila2 filaN")
         ensanche = max(0, self.cfg.ensanchar_px)
         return Geometria(
             x_click=f1[0], x_mnemo0=f1[0] - 30, x_mnemo1=max(f1[0] + 12, ext[0] - 2), x_ext=ext[0],
@@ -719,12 +725,35 @@ class Automatizador:
 
 def cmd_calibrar(args) -> None:
     p = Pantalla()
+    nombres = [n for n, _ in PUNTOS_CALIBRACION]
+    solo = args.solo or []
+    if solo:
+        malos = [n for n in solo if n not in nombres]
+        if malos:
+            raise ErrorSophis(f"Puntos desconocidos: {malos}. Válidos: {nombres}")
+        for nom in ("grid", "der"):
+            if f"ancla_{nom}_b" in solo and f"ancla_{nom}_a" not in solo:
+                raise ErrorSophis(f"Para rehacer ancla_{nom}_b también incluye ancla_{nom}_a (ambas esquinas).")
+        # Se parte de la calibración guardada, llevada a donde está la ventana AHORA (puede haberse movido).
+        base = Config.cargar()
+        actuales, info = calcular_puntos(p.captura(), base)
+        puntos = {**base.puntos, **actuales}
+        anclas = {n: {"archivo": a["archivo"],
+                      "origen": [a["origen"][0] + info[n][0], a["origen"][1] + info[n][1]]}
+                  for n, a in base.anclas.items()}
+        lista = [(n, t) for n, t in PUNTOS_CALIBRACION if n in solo]
+        previa = base
+    else:
+        puntos, anclas, lista = {}, {}, PUNTOS_CALIBRACION
+        try:
+            previa = Config.cargar()
+        except ErrorSophis:
+            previa = None
     print("CALIBRACIÓN: para cada punto pon el mouse donde se indica y NO lo muevas.")
     print(f"Se captura automáticamente al terminar la cuenta regresiva de {args.espera}s.")
     print("La ventana puede estar en cualquier posición, pero debe estar completa y visible.\n")
-    puntos, anclas = {}, {}
-    for k, (nombre, texto) in enumerate(PUNTOS_CALIBRACION, 1):
-        print(f"[{k}/{len(PUNTOS_CALIBRACION)}] {texto}")
+    for k, (nombre, texto) in enumerate(lista, 1):
+        print(f"[{k}/{len(lista)}] {nombre}: {texto}")
         for s in range(args.espera, 0, -1):
             print(f"   {s}...", end="\r", flush=True)
             time.sleep(1)
@@ -742,17 +771,13 @@ def cmd_calibrar(args) -> None:
             ruta = ARCHIVO_ANCLAS / f"{nom}.png"
             p.captura((x0, y0, x1, y1)).save(ruta)
             anclas[nom] = {"archivo": str(ruta), "origen": [x0, y0]}
-    previa = None
-    try:
-        previa = Config.cargar()
-    except ErrorSophis:
-        pass
     cfg = Config(puntos=puntos, anclas=anclas)
     if previa:
         cfg.ensanchar_px, cfg.intervalo_tecla = previa.ensanchar_px, previa.intervalo_tecla
         cfg.pausa, cfg.lector, cfg.verificar_mnemo = previa.pausa, previa.lector, previa.verificar_mnemo
+    # Se valida antes de guardar: si algo está mal no se pisa la calibración anterior.
+    Automatizador(p, None, cfg, log=lambda *_: None).localizar()
     cfg.guardar()
-    # Comprobación inmediata: las anclas deben encontrarse a sí mismas con parecido ~1.0
     _, info = calcular_puntos(p.captura(), cfg)
     for nom, (dx, dy, sc) in info.items():
         print(f"Ancla '{nom}': parecido {sc:.2f}, desplazamiento ({dx:+d},{dy:+d})  <- debe ser ~1.00 y (0,0)")
@@ -821,6 +846,8 @@ def main() -> None:
 
     s = sub.add_parser("calibrar", help="registra las posiciones en pantalla (una vez)")
     s.add_argument("--espera", type=int, default=5, help="segundos por punto (default 5)")
+    s.add_argument("--solo", nargs="+", metavar="PUNTO",
+                   help="rehacer solo estos puntos (ej: --solo fila1 fila2 filaN), conservando el resto")
     s.set_defaults(fn=cmd_calibrar)
 
     for nombre, fn, ayuda in (("diagnostico", cmd_diagnostico, "prueba cómo se lee la pantalla"),

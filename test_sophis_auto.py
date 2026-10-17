@@ -260,3 +260,43 @@ def test_ventana_minimizada_da_error_claro(ocr, anclas, tmp_path, monkeypatch):
     monkeypatch.setattr(sa, "CARPETA_DEBUG", tmp_path)
     with pytest.raises(ErrorSophis, match="No encuentro la ventana"):
         crear(ocr, anclas, oculta=True)
+
+
+# ── calibrar (completo y parcial) con pantalla falsa ────────────────────────
+
+class _Args:
+    def __init__(self, solo=None):
+        self.espera, self.solo = 0, solo
+
+
+def _calibrar_con(monkeypatch, tmp_path, fake, posiciones, solo=None):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sa.time, "sleep", lambda *_: None)
+    it = iter(posiciones)
+    fake.posicion = lambda: next(it)
+    monkeypatch.setattr(sa, "Pantalla", lambda *a, **k: fake)
+    sa.cmd_calibrar(_Args(solo))
+    return Config.cargar()
+
+
+PUNTOS_OK = [(22, 62), (330, 84), (45, Y1), (45, Y1 + H), (45, Y1 + 7 * H), (140, Y1), (BORDE, 70), (DER, 70),
+             (700, 188), (850, 208), (706, 62), FLECHA]
+
+
+def test_calibrar_completo_y_luego_parcial_con_ventana_movida(ocr, monkeypatch, tmp_path):
+    cfg = _calibrar_con(monkeypatch, tmp_path, FakeSophis(), PUNTOS_OK)
+    assert set(cfg.anclas) == {"grid", "der"} and cfg.puntos["filaN"] == [45, Y1 + 7 * H]
+    # la ventana ahora está corrida (40, 25); se rehace solo filaN apuntando a su nueva posición
+    mov = FakeSophis(desplaz=(40, 25))
+    cfg = _calibrar_con(monkeypatch, tmp_path, mov, [(45 + 40, Y1 + 5 * H + 25)], solo=["filaN"])
+    a = Automatizador(mov, ocr, cfg, log=lambda *_: None)
+    a.preparar()
+    assert a.g.n == 6 and a.g.y1 == Y1 + 25            # filaN nueva; el resto se trasladó a la posición actual
+
+
+def test_calibrar_invalido_no_pisa_la_calibracion_anterior(ocr, monkeypatch, tmp_path):
+    _calibrar_con(monkeypatch, tmp_path, FakeSophis(), PUNTOS_OK)
+    antes = (tmp_path / "sophis_config.json").read_text()
+    with pytest.raises(ErrorSophis, match="filaN"):
+        _calibrar_con(monkeypatch, tmp_path, FakeSophis(), [(45, Y1 + H)], solo=["filaN"])
+    assert (tmp_path / "sophis_config.json").read_text() == antes
