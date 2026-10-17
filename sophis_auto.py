@@ -207,7 +207,7 @@ _LOOKALIKE = str.maketrans({"0": "O", "1": "I", "L": "I", "5": "S", "2": "Z", "8
 
 def _canon(s: str) -> str:
     """Upper-case letters/digits only, with look-alikes merged (0/O, 1/I/L, 5/S, 2/Z, 8/B)."""
-    return re.sub(r"[^A-Z0-9]", "", s.upper()).translate(_LOOKALIKE)
+    return re.sub(r"[^A-Z0-9]", "", str(s).upper()).translate(_LOOKALIKE)
 
 
 def match_code(readings: list[str], glyphs: int, code: str, allow_weak: bool = True) -> str | None:
@@ -266,20 +266,32 @@ def clean_cell(img: Image.Image):
             continue
         keep[labels == i] = 1
         glyphs += 1
-    keep = cv2.dilate(keep, np.ones((3, 3), np.uint8))
     if glyphs == 0:
         return np.full_like(g, 255), 0
-    # Stretch the contrast so the text is dark on a pure white background whatever the cell color was
-    # (a gray halo around the text confuses the recognizer).
-    ink = g[keep > 0].astype(np.float32)
-    lo = float(np.percentile(ink, 5))
-    if background - lo >= 30:
-        stretched = np.clip((g.astype(np.float32) - lo) * 255.0 / (background - lo), 0, 255)
-    else:                                     # light text on a dark cell: invert instead
-        hi = float(np.percentile(ink, 95))
-        stretched = np.clip((background - g.astype(np.float32)) * 255.0 / max(1.0, background - hi + 255.0), 0, 255)
-        stretched = 255 - stretched
+    core = g[keep > 0].astype(np.float32)               # the pixels of the letters themselves
+    keep = cv2.dilate(keep, np.ones((3, 3), np.uint8))  # plus a 1px halo to keep the anti-aliased edges
+    gf = g.astype(np.float32)
+    # Output: dark text on a pure white background, whatever the cell colors were. A selected row is often
+    # WHITE text on a DARK background, so the polarity must be detected (a halo of the cell color, or text
+    # painted white on white, makes the recognizer read nothing).
+    if float(np.median(core)) <= background:            # dark text on a lighter cell
+        lo = float(np.percentile(core, 5))
+        stretched = np.clip((gf - lo) * 255.0 / max(1.0, background - lo), 0, 255)
+    else:                                               # light text on a darker cell: invert
+        hi = float(np.percentile(core, 95))
+        stretched = 255.0 - np.clip((gf - background) * 255.0 / max(1.0, hi - background), 0, 255)
     return np.where(keep > 0, stretched, 255).astype(np.uint8), glyphs
+
+
+def text_from_ocr_result(result) -> str:
+    """The recognized text from a RapidOCR result, whatever the version's layout is:
+    [[box, 'text', 'score']] (older) or [['text', score]] / [('text', score)] (newer). Never raises."""
+    for item in result or []:
+        parts = item if isinstance(item, (list, tuple)) else [item]
+        for part in parts:
+            if isinstance(part, str):
+                return part
+    return ""
 
 
 def color_distance(a, b) -> int:
@@ -443,7 +455,7 @@ class OCR:
                 big = cv2.copyMakeBorder(big, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=255)
                 result, _ = engine(cv2.cvtColor(big, cv2.COLOR_GRAY2BGR), use_det=False, use_cls=False,
                                    use_rec=True, text_score=0.0)
-                readings.append(result[0][1] if result else "")
+                readings.append(text_from_ocr_result(result))
         finally:
             for name, value in saved.items():
                 setattr(engine, name, value)
@@ -1032,6 +1044,11 @@ def cmd_diagnose(args) -> None:
         cleaned, _ = clean_cell(a.s.capture(a._cell_region(i, g.x_mnemo0, g.x_mnemo1)))
         a.save_debug("diag_mnemo_cleaned", Image.fromarray(cleaned))
         readings, glyphs = a._mnemonic_by_ocr(i)
+        try:
+            from importlib.metadata import version
+            print("rapidocr version         :", version("rapidocr-onnxruntime"))
+        except Exception:
+            pass
         print("Clipboard (Ctrl+C/Insert):", repr(a._read_clipboard()))
         print("OCR Mnemo readings       :", readings, "| glyphs:", glyphs)
         print("Mnemo match              :", match_code(readings, glyphs, code))

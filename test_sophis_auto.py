@@ -475,14 +475,18 @@ def test_typing_is_never_skipped_after_the_click(ocr, anchors):
 
 # ── reading a Mnemo cell with grid lines and a focus rectangle around the text ──
 
-def _cell(text, selected=True, width=96, height=18):
-    bg = (170, 195, 235) if selected else (255, 255, 255)
+def _cell(text, selected=True, width=96, height=18, dark=False):
+    """A Mnemo cell. dark=True is Windows' classic selection: WHITE text on a DARK blue background."""
+    if dark:
+        bg, ink, frame = (10, 36, 106), (255, 255, 255), (255, 255, 255)
+    else:
+        bg, ink, frame = ((170, 195, 235) if selected else (255, 255, 255)), (0, 0, 160), (0, 0, 0)
     im = Image.new("RGB", (width, height), bg)
     d = ImageDraw.Draw(im)
-    d.text((14, 2), text, fill=(0, 0, 160), font=ImageFont.load_default(size=12))
+    d.text((14, 2), text, fill=ink, font=ImageFont.load_default(size=12))
     d.line((0, 0, 0, height), fill=(90, 90, 90))                # column border at the crop edge
     d.line((width - 8, 2, width - 8, height - 2), fill=(60, 60, 60))   # column border inside the crop
-    d.rectangle((3, 1, width - 12, height - 2), outline=(0, 0, 0))     # focus rectangle
+    d.rectangle((3, 1, width - 12, height - 2), outline=frame)         # focus rectangle
     return im
 
 
@@ -570,3 +574,38 @@ def test_a_calibration_missing_one_point_can_be_repaired_with_only(ocr, anchors,
     a = Automator(fake, ocr, cfg, log=lambda *_: None)
     a.prepare()
     assert a.open_contract("ZJO").term == "Short term index" and fake.dialog
+
+
+# ── light text on a dark selection (the cleaned image used to come out blank) ──
+
+@pytest.mark.parametrize("text", ["ZYS", "ZJO", "ZMH", "ZS", "ZION"])
+def test_white_text_on_dark_selection_is_read(ocr, text):
+    readings, glyphs = ocr.read_cell(_cell(text, dark=True))
+    assert glyphs >= len(text) - 1
+    assert sa.match_code(readings, glyphs, text) in ("exact", "weak"), readings
+
+
+def test_cleaned_cell_is_never_blank_for_either_polarity():
+    import numpy as np
+    for dark in (False, True):
+        cleaned, glyphs = sa.clean_cell(_cell("ZJO", dark=dark))
+        assert glyphs == 3
+        assert (cleaned < 128).sum() > 20, f"dark={dark}: the letters vanished"     # real black ink exists
+        assert cleaned.max() == 255
+
+
+@pytest.mark.parametrize("result,expected", [
+    ([[[[0, 0], [1, 0], [1, 1], [0, 1]], "ZJO", "0.62"]], "ZJO"),     # older layout: [box, text, score-as-str]
+    ([["ZJO", 0.71]], "ZJO"),                                          # newer layout: [text, score]
+    ([("ZJO", 0.71, 0.0)], "ZJO"),
+    ([["", 0.0]], ""),
+    (None, ""),
+    ([], ""),
+    ([[0.0, 0.0]], ""),                                                # numbers only: no text, and no crash
+])
+def test_text_from_ocr_result(result, expected):
+    assert sa.text_from_ocr_result(result) == expected
+
+
+def test_match_code_survives_non_string_readings():
+    assert sa.match_code([0.0, None, "ZJO"], 3, "ZJO") == "exact"
