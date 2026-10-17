@@ -2059,10 +2059,35 @@ def _countdown_to_front(args) -> None:
     print("   going         ")
 
 
+def _excel_triples(args) -> list:
+    """(date, Minimum, Maximum) for the code chosen with --code (or the only one in the Excel)."""
+    import sophis_excel as xl
+    try:
+        plan, warnings = xl.read_plan(args.excel, args.sheet)
+    except xl.ExcelError as e:
+        raise SophisError(str(e))
+    code = args.code
+    if code is None:
+        if len(plan) > 1:
+            raise SophisError(f"The Excel has {len(plan)} codes ({', '.join(plan)}); choose one with --code.")
+        code = next(iter(plan))
+    match = [c for c in plan if c.upper() == code.upper()]
+    if not match:
+        raise SophisError(f"Code {code!r} is not in the Excel (it has: {', '.join(plan)}).")
+    items = plan[match[0]]
+    print(f"From the Excel, {match[0]}:\n{xl.describe({match[0]: items})}")
+    for w in warnings:
+        print("WARNING:", w)
+    return xl.entries_for(items)
+
+
 def cmd_fill(args) -> None:
     """Writes Minimum / Maximum for the given dates in the open update window."""
     try:
-        entries = [parse_entry(d, mn, mx) for d, mn, mx in (args.entry or [])]
+        triples = list(args.entry or [])
+        if args.excel:
+            triples += _excel_triples(args)
+        entries = [parse_entry(d, mn, mx) for d, mn, mx in triples]
         if args.occurrence is not None:
             for e in entries:
                 e.occurrence = e.occurrence if e.occurrence is not None else args.occurrence
@@ -2070,7 +2095,8 @@ def cmd_fill(args) -> None:
         print(f"ERROR: {e}")
         sys.exit(2)
     if not entries:
-        print("ERROR: give at least one  --entry DATE MIN MAX   (e.g. --entry \"20 Nov 2026#1\" 100 120)")
+        print("ERROR: give at least one  --entry DATE MIN MAX   (e.g. --entry \"20 Nov 2026#1\" 100 120) "
+              "or  --excel FILE")
         sys.exit(2)
     a = _create(args)
     a.trace = not args.no_trace
@@ -2094,6 +2120,9 @@ def main() -> None:
     s = sub.add_parser("fill", help="write Minimum / Maximum values in the open update window")
     s.add_argument("--entry", nargs=3, action="append", metavar=("DATE", "MIN", "MAX"),
                    help="a date and its two values; repeat for more dates. A repeated date: '20 Nov 2026#1'")
+    s.add_argument("--excel", default=None, help="read the dates and values from this Excel/CSV (sophis_excel.py)")
+    s.add_argument("--sheet", default=None, help="sheet of the Excel (default: the active one)")
+    s.add_argument("--code", default=None, help="which code of the Excel to use (needed if it has several)")
     s.add_argument("--occurrence", type=int, default=None,
                    help="row to use for ALL entries whose date appears more than once (or write DATE#n)")
     s.add_argument("--dry-run", dest="dry_run", action="store_true", help="only locate the cells; click/type nothing")

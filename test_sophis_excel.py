@@ -1,0 +1,120 @@
+import datetime as dt
+
+import pytest
+
+import sophis_excel as xl
+
+
+def row(date, value, code="SNDK"):
+    return ("SNDK US Equity", f"SNDK US {date} C45", f"SNDK US {date} P45", date, value, code, "A", 100.0, "M", "N", 0, 0)
+
+
+HEADER = ("Equity", "Call", "Put", "Date", "Value", "Code", "L1", "V", "L2", "L3", "V1", "V2")
+
+
+def test_first_value_is_minimum_last_is_maximum_per_date():
+    rows = [HEADER, row("01/15/27", 45.0), row("01/15/27", 50.0), row("01/15/27", 100.0), row("02/19/27", 30.0),
+            row("02/19/27", 70.0)]
+    plan, warnings = xl.extract(rows)
+    assert list(plan) == ["SNDK"]
+    got = [(d.date, d.minimum, d.maximum, d.rows) for d in plan["SNDK"]]
+    assert got == [(dt.date(2027, 1, 15), 45.0, 100.0, 3), (dt.date(2027, 2, 19), 30.0, 70.0, 2)]
+    assert warnings == []
+
+
+def test_it_is_the_order_of_the_file_not_the_size():
+    plan, warnings = xl.extract([row("01/15/27", 90.0), row("01/15/27", 40.0)])
+    d = plan["SNDK"][0]
+    assert (d.minimum, d.maximum) == (90.0, 40.0)
+    assert any("bigger than" in w for w in warnings)
+
+
+def test_several_codes_each_get_their_own_dates():
+    rows = [row("01/15/27", 45.0, "SNDK"), row("01/15/27", 60.0, "SNDK"), row("01/15/27", 5.0, "AAPL"),
+            row("03/19/27", 9.0, "AAPL"), row("03/19/27", 12.0, "AAPL")]
+    plan, _ = xl.extract(rows)
+    assert set(plan) == {"SNDK", "AAPL"}
+    assert [(d.minimum, d.maximum) for d in plan["AAPL"]] == [(5.0, 5.0), (9.0, 12.0)]
+
+
+def test_dates_are_sorted_and_a_single_value_is_both_ends_with_a_warning():
+    plan, warnings = xl.extract([row("03/19/27", 9.0), row("01/15/27", 45.0)])
+    assert [d.date for d in plan["SNDK"]] == [dt.date(2027, 1, 15), dt.date(2027, 3, 19)]
+    assert sum("only one value" in w for w in warnings) == 2
+
+
+def test_real_date_cells_and_text_numbers():
+    plan, _ = xl.extract([("", "", "", dt.datetime(2027, 1, 15), "45.00", "SNDK"),
+                          ("", "", "", dt.datetime(2027, 1, 15), "1,100.50", "SNDK")])
+    d = plan["SNDK"][0]
+    assert (d.minimum, d.maximum) == (45.0, 1100.5)
+
+
+def test_unusable_rows_are_reported_and_headers_skipped():
+    plan, warnings = xl.extract([HEADER, row("01/15/27", None), row("01/15/27", 45.0), (None,) * 12])
+    assert len(plan["SNDK"]) == 1 and any("row 2" in w for w in warnings)
+
+
+def test_number_format_and_entries():
+    assert [xl.format_number(v) for v in (45.0, 45.5, 0.0, 100.25)] == ["45", "45.5", "0", "100.25"]
+    plan, _ = xl.extract([row("01/15/27", 45.0), row("01/15/27", 100.0)])
+    assert xl.entries_for(plan["SNDK"]) == [("15 Jan 2027", "45", "100")]
+
+
+def test_reads_a_real_xlsx_and_a_csv(tmp_path):
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.append(HEADER)
+    for r in (row("01/15/27", 45.0), row("01/15/27", 100.0)):
+        ws.append(r)
+    ws.append(("", "", "", dt.datetime(2027, 2, 19), 30, "SNDK"))
+    path = tmp_path / "strikes.xlsx"
+    wb.save(path)
+    plan, _ = xl.read_plan(path)
+    assert [(d.date, d.minimum, d.maximum) for d in plan["SNDK"]] == [
+        (dt.date(2027, 1, 15), 45.0, 100.0), (dt.date(2027, 2, 19), 30.0, 30.0)]
+    csv_path = tmp_path / "strikes.csv"
+    csv_path.write_text("a,b,c,d,e,f\n,,,01/15/27,45.00,SNDK\n,,,01/15/27,100.00,SNDK\n")
+    assert xl.read_plan(csv_path)[0]["SNDK"][0].maximum == 100.0
+
+
+def test_clear_errors(tmp_path):
+    with pytest.raises(xl.ExcelError, match="does not exist"):
+        xl.read_plan(tmp_path / "nope.xlsx")
+    bad = tmp_path / "x.csv"
+    bad.write_text("nothing,useful\n")
+    with pytest.raises(xl.ExcelError, match="No data rows"):
+        xl.read_plan(bad)
+    old = tmp_path / "old.xls"
+    old.write_text("x")
+    with pytest.raises(xl.ExcelError, match="Unsupported"):
+        xl.read_plan(old)
+
+
+def _args(path, **kw):
+    import argparse
+    return argparse.Namespace(excel=str(path), sheet=None, code=None, **kw)
+
+
+def test_fill_takes_the_entries_from_the_excel(tmp_path, capsys):
+    import sophis_auto as sa
+    f = tmp_path / "s.csv"
+    f.write_text(",,,01/15/27,45.00,SNDK\n,,,01/15/27,100.00,SNDK\n,,,02/19/27,30.00,SNDK\n")
+    triples = sa._excel_triples(_args(f))
+    assert triples == [("15 Jan 2027", "45", "100"), ("19 Feb 2027", "30", "30")]
+    assert sa.parse_entry(*triples[0]).date == dt.date(2027, 1, 15)
+
+
+def test_fill_with_several_codes_needs_a_choice(tmp_path):
+    import sophis_auto as sa
+    f = tmp_path / "s.csv"
+    f.write_text(",,,01/15/27,45.00,SNDK\n,,,01/15/27,5.00,AAPL\n")
+    with pytest.raises(sa.SophisError, match="choose one with --code"):
+        sa._excel_triples(_args(f))
+    a = _args(f)
+    a.code = "aapl"
+    assert sa._excel_triples(a) == [("15 Jan 2027", "5", "5")]
+    a.code = "XXX"
+    with pytest.raises(sa.SophisError, match="not in the Excel"):
+        sa._excel_triples(a)
