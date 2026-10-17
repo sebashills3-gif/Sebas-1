@@ -128,12 +128,14 @@ class Config:
         return d
 
     @staticmethod
-    def load(path: Path = CONFIG_FILE) -> "Config":
+    def load(path: Path = CONFIG_FILE, strict: bool = True) -> "Config":
+        """strict=False allows missing points; `calibrate` uses it to fill in the points that are missing
+        (otherwise a calibration that lacks one point could never be repaired)."""
         if not path.exists():
             raise SophisError(f"{path} does not exist. Run first:  python sophis_auto.py calibrate")
         d = Config._migrate(json.loads(path.read_text(encoding="utf-8")))
         missing = [n for n, _ in CALIBRATION_POINTS if n not in d.get("points", {})]
-        if missing:
+        if missing and strict:
             raise SophisError(f"Incomplete calibration (missing {missing}). "
                               f"Run:  python sophis_auto.py calibrate --only {' '.join(missing)}")
         if set(d.get("anchors", {})) != {"grid", "right"}:
@@ -347,6 +349,8 @@ def compute_points(screenshot: Image.Image, cfg: "Config") -> tuple[dict, dict]:
                 "Is it visible (not minimized or covered) and on the primary monitor? If the Citrix zoom/resolution "
                 "changed, calibrate again.")
     for point, name in POINT_ANCHOR.items():
+        if point not in cfg.points:        # partial calibration: the missing point is about to be recorded
+            continue
         dx, dy, _ = info[name]
         px, py = cfg.points[point]
         points[point] = [px + dx, py + dy]
@@ -946,7 +950,7 @@ def cmd_calibrate(args) -> None:
             if f"anchor_{anchor}_b" in only and f"anchor_{anchor}_a" not in only:
                 raise SophisError(f"To redo anchor_{anchor}_b also include anchor_{anchor}_a (both corners).")
         # Start from the saved calibration, moved to where the window is NOW (it may have moved).
-        base = Config.load()
+        base = Config.load(strict=False)
         current, info = compute_points(screen.capture(), base)
         points = {**base.points, **current}
         anchors = {n: {"file": a["file"], "origin": [a["origin"][0] + info[n][0], a["origin"][1] + info[n][1]]}
@@ -956,7 +960,7 @@ def cmd_calibrate(args) -> None:
     else:
         points, anchors, todo = {}, {}, CALIBRATION_POINTS
         try:
-            previous = Config.load()
+            previous = Config.load(strict=False)
         except SophisError:
             previous = None
     print("CALIBRATION: for each point, put the mouse where indicated and DO NOT move it.")

@@ -541,3 +541,32 @@ def test_an_unconfirmed_row_is_reread_not_clicked_again(ocr, anchors, tmp_path, 
     clicks = [e for e in fake.events if e[0] == "click"]
     types = [e for e in fake.events if e[0] == "type"]
     assert len(clicks) == len(types) == 2                 # attempt 1 and the last attempt, nothing in between
+
+
+def test_a_calibration_missing_one_point_can_be_repaired_with_only(ocr, anchors, monkeypatch, tmp_path):
+    """Regression: `calibrate --only ric_left` used to fail with 'missing ric_left' because it could not load
+    the very calibration it was meant to complete."""
+    legacy = {
+        "puntos": {"ancla_grid_a": [0, 0], "ancla_grid_b": [0, 0], "fila1": [45, Y1], "fila2": [45, Y1 + H],
+                   "filaN": [45, Y1 + 7 * H], "ext": [140, Y1], "term_borde": [BORDER, 70],
+                   "term_der": [RIGHT, 70], "ancla_der_a": [0, 0], "ancla_der_b": [0, 0],
+                   "dd_izq": [706, 62], "dd_flecha": list(ARROW)},
+        "anclas": {"grid": {"archivo": anchors["grid"]["file"], "origen": anchors["grid"]["origin"]},
+                   "der": {"archivo": anchors["right"]["file"], "origen": anchors["right"]["origin"]}},
+        "ensanchar_px": 140, "intervalo_tecla": 0.12, "pausa": 0.01, "lector": "ocr", "verificar_mnemo": True,
+    }
+    (tmp_path / "sophis_config.json").write_text(json.dumps(legacy), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SophisError, match="calibrate --only ric_left"):
+        Config.load()                                         # normal use is still blocked until repaired
+    fake = FakeSophis(shift=(25, 15))                         # and the window is not where it was
+    monkeypatch.setattr(sa.time, "sleep", lambda *_: None)
+    fake.position = lambda: (RIC_LEFT + 25, 70 + 15)
+    monkeypatch.setattr(sa, "Screen", lambda *a, **k: fake)
+    sa.cmd_calibrate(_Args(["ric_left"]))
+    cfg = Config.load()                                       # now complete and in the new format
+    assert cfg.points["ric_left"] == [RIC_LEFT + 25, 70 + 15]
+    assert cfg.reader == "ocr" and cfg.widen_px == 140        # old settings kept
+    a = Automator(fake, ocr, cfg, log=lambda *_: None)
+    a.prepare()
+    assert a.open_contract("ZJO").term == "Short term index" and fake.dialog
