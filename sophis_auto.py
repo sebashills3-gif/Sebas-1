@@ -24,6 +24,9 @@ Usage (in this order the first time):
                                                 # for the update window (--open-with double = double click)
        python sophis_auto.py open --term "Long term share"   # same, but you tell it the Term (skips reading it)
        python sophis_auto.py open-code ZYS ZTS     # (older flow) types the code to find its row; not reliable yet
+    5) python sophis_auto.py window --date "20 Nov 2026" --show
+                                                # (update window open) reads its dates and shows where that date's
+                                                # Minimum and Maximum cells are; nothing is clicked or typed
 
 Old Spanish command names (calibrar / diagnostico / abrir) still work as aliases.
 
@@ -34,9 +37,11 @@ If anything does not match, the script stops and saves screenshots in ./sophis_d
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import difflib
 import json
 import re
+import statistics
 import sys
 import time
 from dataclasses import dataclass, field
@@ -305,6 +310,99 @@ def text_from_ocr_result(result) -> str:
     return ""
 
 
+# ── the update window (Maturity | Minimum | Maximum | Ric) ───────────────────
+
+_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+_DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1", "|": "1", "S": "5", "B": "8"})
+
+
+def _to_int(text: str) -> int:
+    return int(text.translate(_DIGIT_FIX))
+
+
+def parse_date(text) -> tuple[dt.date | None, str]:
+    """Reads a date written as '19 Oct 2026', '19-Oct-2026', '2026-10-19' or '19/10/2026' (day first).
+    Tolerates OCR slips (O for 0, l for 1). A trailing '-1' ('19 Feb 2027-1') is returned separately as the
+    suffix. Returns (date or None, suffix)."""
+    t = str(text).strip()
+    try:
+        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", t)                       # ISO
+        if m:
+            return dt.date(int(m[1]), int(m[2]), int(m[3])), ""
+        m = re.search(r"([0-9OolI|S]{1,2})\s*[-/. ]?\s*([A-Za-z0]{3,9})\.?\s*[-/. ]?\s*([0-9OolI|SB]{4})"
+                      r"(?:\s*(-\s*\d+))?", t)
+        if m:                                                                      # 19 Oct 2026 (-1)
+            word = m[2].lower().replace("0", "o")[:3]
+            best = max(_MONTHS, key=lambda mo: difflib.SequenceMatcher(None, word, mo).ratio())
+            if difflib.SequenceMatcher(None, word, best).ratio() >= 0.66:
+                day, year = _to_int(m[1]), _to_int(m[3])
+                if 1990 <= year <= 2100:
+                    return dt.date(year, _MONTHS.index(best) + 1, day), re.sub(r"\s+", "", m[4] or "")
+        m = re.match(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$", t)               # 19/10/2026 (day first)
+        if m:
+            a, b, y = int(m[1]), int(m[2]), int(m[3])
+            try:
+                return dt.date(y, b, a), ""
+            except ValueError:
+                return dt.date(y, a, b), ""
+    except ValueError:
+        pass
+    return None, ""
+
+
+def find_header(lines: list) -> dict | None:
+    """Finds the header row 'Maturity | Minimum | Maximum | Ric' among OCR lines (each a Line). Returns the
+    center x of every column and the header's y (the texts are centered in their cells), or None."""
+    def candidates(word):
+        return [l for l in lines if contains_word(l.text, word) and len(_norm(l.text)) <= len(word) + 3]
+
+    for mat in candidates("Maturity"):
+        for mn in (l for l in candidates("Minimum") if abs(l.cy - mat.cy) <= 10 and l.cx > mat.cx):
+            for mx in (l for l in candidates("Maximum") if abs(l.cy - mat.cy) <= 10 and l.cx > mn.cx):
+                ric = next((l for l in lines if abs(l.cy - mat.cy) <= 10 and l.cx > mx.cx
+                            and len(_norm(l.text)) <= 4 and _best_window(_norm(l.text), "ric") >= 0.8), None)
+                return {"y": mat.cy, "maturity": mat.cx, "minimum": mn.cx, "maximum": mx.cx,
+                        "ric": ric.cx if ric else None}
+    return None
+
+
+@dataclass
+class WindowRow:
+    index: int                # 0 = first visible row
+    cy: int                   # y of the row's center on screen
+    text: str                 # what was read in the Maturity cell
+    date: dt.date | None
+    suffix: str = ""          # e.g. "-1" in '19 Feb 2027-1'
+
+
+@dataclass
+class UpdateWindow:
+    header_y: int
+    x_maturity: int
+    x_minimum: int
+    x_maximum: int
+    x_ric: int | None
+    pitch: float
+    rows: list
+    image: Image.Image | None = None
+
+    def find(self, date: dt.date) -> list:
+        return [r for r in self.rows if r.date == date]
+
+    def dated(self) -> list:
+        return [r for r in self.rows if r.date]
+
+
+@dataclass
+class CellTarget:
+    """Where to put the values for one date: the centers of its Minimum and Maximum cells."""
+    row: WindowRow
+    minimum: tuple
+    maximum: tuple
+    matches: list             # every row that has this date
+    ambiguous: bool           # more than one row has this date and no `occurrence` was chosen
+
+
 def median_color(img: Image.Image) -> tuple:
     """Per-channel median color of an image (robust to a few text pixels)."""
     import numpy as np
@@ -564,6 +662,11 @@ class Screen:
 
     def hotkey(self, *keys: str) -> None:
         self.pg.hotkey(*keys)
+
+    def scroll(self, clicks: int, x: int, y: int) -> None:
+        """Mouse wheel over (x, y): positive scrolls up, negative scrolls down."""
+        self.pg.moveTo(x, y, duration=0.15)
+        self.pg.scroll(clicks)
 
     def drag(self, x0: int, y0: int, x1: int, y1: int) -> None:
         self.pg.moveTo(x0, y0, duration=0.2)
@@ -1105,7 +1208,145 @@ class Automator:
         self.open_update_window(i)
         window = self.wait_for_window()
         self.log(f"done: Mnemo '{shown}', Term '{term}', update window is open")
+        self.report_update_window()
         return Result(str(shown), term, i, window)
+
+    # ── stage 2: find where the values go in the update window (nothing is clicked or typed) ──
+    def read_update_window(self) -> UpdateWindow:
+        """Reads the open update window: the Maturity / Minimum / Maximum / Ric columns and the date of every
+        visible row, with the on-screen position of each. Read-only."""
+        shot = self.s.capture()
+        lines = self.ocr.read(shot, scale=2, margin=8)
+        header = find_header(lines)
+        if header is None:
+            path = self.save_debug("update_window_header_not_found", shot)
+            raise SophisError("Could not find the Maturity | Minimum | Maximum | Ric header on screen. Is the "
+                              f"update window open and fully visible? Screenshot: {path}")
+        hy, xm = header["y"], header["maturity"]
+        half = 0.6 * (header["minimum"] - xm)                     # a bit less than half the Maturity column
+
+        found = []                                                # (cy, text, date, suffix) from the detector
+        for l in lines:
+            if l.cy > hy + 6 and abs(l.cx - xm) <= half:
+                date, suffix = parse_date(l.text)
+                if date:
+                    found.append((l.cy, l.text, date, suffix))
+        found.sort()
+        gaps = [b[0] - a[0] for a, b in zip(found, found[1:]) if 8 <= b[0] - a[0] <= 80]
+        if not gaps:
+            path = self.save_debug("update_window_no_dates", shot)
+            raise SophisError(f"Found the header but could not read at least two dates below it. Screenshot: {path}")
+        small = min(gaps)
+        pitch = float(statistics.median([g for g in gaps if g <= 1.4 * small]))
+
+        by_index = {}
+        for cy, text, date, suffix in found:
+            idx = int(round((cy - hy) / pitch)) - 1
+            by_index.setdefault(idx, WindowRow(idx, cy, text, date, suffix))
+        # The detector often misses the highlighted row (white text on dark blue) and any row it merged:
+        # read those row slots one by one, which handles light-on-dark text.
+        for idx in range(0, max(by_index) + 2):
+            if idx in by_index:
+                continue
+            cy = int(round(hy + (idx + 1) * pitch))
+            crop = shot.crop((int(xm - half), int(cy - pitch / 2 + 1), int(xm + half), int(cy + pitch / 2 - 1)))
+            readings, _ = self.ocr.read_cell(crop)
+            for text in readings:
+                date, suffix = parse_date(text)
+                if date:
+                    by_index[idx] = WindowRow(idx, cy, text, date, suffix)
+                    break
+        rows = [by_index[i] for i in sorted(by_index)]
+        return UpdateWindow(hy, xm, header["minimum"], header["maximum"], header["ric"], pitch, rows, shot)
+
+    def locate_date(self, target: dt.date, occurrence: int | None = None, max_scrolls: int = 15) -> CellTarget:
+        """Finds the row whose Maturity is `target` (scrolling the list if needed) and returns where its Minimum
+        and Maximum cells are. If several rows have that date, `occurrence` (0, 1, ...) picks one; without it the
+        first is returned and `ambiguous` is True. Nothing is clicked or typed."""
+        previous = None
+        for _ in range(max_scrolls + 1):
+            win = self.read_update_window()
+            matches = win.find(target)
+            if matches:
+                win, matches = self._reveal_duplicates(win, target)
+                if occurrence is not None and occurrence >= len(matches):
+                    raise SophisError(f"{target:%d %b %Y} appears {len(matches)} time(s); there is no occurrence "
+                                      f"{occurrence} (0 is the first).")
+                row = matches[occurrence or 0]
+                return CellTarget(row, (win.x_minimum, row.cy), (win.x_maximum, row.cy), matches,
+                                  ambiguous=len(matches) > 1 and occurrence is None)
+            dated = win.dated()
+            if not dated:
+                raise SophisError("No dates could be read in the update window.")
+            if dated[0].date <= target <= dated[-1].date:
+                raise SophisError(f"{target:%d %b %Y} is not in the list (it falls between "
+                                  f"{dated[0].date:%d %b %Y} and {dated[-1].date:%d %b %Y} but is not there).")
+            signature = tuple(r.date for r in dated)
+            if signature == previous:
+                raise SophisError(f"{target:%d %b %Y} was not found: the list stopped scrolling at "
+                                  f"{dated[0].date:%d %b %Y} ... {dated[-1].date:%d %b %Y}.")
+            previous = signature
+            down = target > dated[-1].date
+            self.log(f"  {target:%d %b %Y} not visible ({dated[0].date:%d %b %Y} ... {dated[-1].date:%d %b %Y}); "
+                     f"scrolling {'down' if down else 'up'}")
+            mid = win.rows[len(win.rows) // 2].cy
+            self.s.scroll(-3 if down else 3, win.x_maturity, mid)
+            self._wait(0.7)
+        raise SophisError(f"{target:%d %b %Y} was not found after {max_scrolls} scrolls.")
+
+    def _reveal_duplicates(self, win: UpdateWindow, target: dt.date) -> tuple[UpdateWindow, list]:
+        """The same date can appear on several adjacent rows. If the date sits on the first or last visible row,
+        more rows with it may be hidden just beyond, so nudge the list one wheel click at a time until the edge
+        row has a different date (or the list stops moving). Returns the final view and the rows with the date."""
+        for direction in (-1, +1):                                      # -1 = down, +1 = up
+            for _ in range(4):
+                dated = win.dated()
+                if not dated:
+                    break
+                edge = dated[-1] if direction == -1 else dated[0]
+                if edge.date != target:
+                    break
+                before = tuple(r.date for r in dated)
+                self.s.scroll(direction, win.x_maturity, win.rows[len(win.rows) // 2].cy)
+                self._wait(0.6)
+                win = self.read_update_window()
+                if tuple(r.date for r in win.dated()) == before:         # the list did not move: end of the list
+                    break
+        return win, win.find(target)
+
+    def annotate_window(self, win: UpdateWindow, target: CellTarget | None = None) -> Path:
+        """Saves a screenshot with what was understood drawn on it, so you can check it by eye."""
+        from PIL import ImageDraw
+        img = (win.image or self.s.capture()).copy()
+        d = ImageDraw.Draw(img)
+        half = int(0.55 * (win.x_minimum - win.x_maturity))
+        for x, name in ((win.x_maturity, "Maturity"), (win.x_minimum, "Minimum"), (win.x_maximum, "Maximum"),
+                        (win.x_ric, "Ric")):
+            if x:
+                d.line((x, win.header_y - 12, x, win.header_y + 12), fill=(255, 0, 0), width=2)
+                d.text((x - 20, win.header_y - 28), name, fill=(255, 0, 0))
+        for r in win.rows:
+            d.rectangle((win.x_maturity - half, int(r.cy - win.pitch / 2), (win.x_ric or win.x_maximum + 40),
+                         int(r.cy + win.pitch / 2)), outline=(0, 160, 0))
+            d.text(((win.x_ric or win.x_maximum + 40) + 6, r.cy - 6), f"{r.index}: {r.date:%d %b %Y}{r.suffix}" if r.date
+                   else f"{r.index}: ?", fill=(0, 120, 0))
+        if target:
+            for (x, y), name in ((target.minimum, "MIN"), (target.maximum, "MAX")):
+                d.ellipse((x - 7, y - 7, x + 7, y + 7), outline=(255, 0, 0), width=3)
+                d.text((x + 10, y - 6), name, fill=(255, 0, 0))
+        return self.save_debug("update_window_map", img)
+
+    def report_update_window(self) -> None:
+        """After opening the window: log what was understood. Never raises (it is only informative)."""
+        try:
+            win = self.read_update_window()
+            dated = win.dated()
+            if dated:
+                self.log(f"  update window read: {len(dated)} visible dates, {dated[0].date:%d %b %Y} ... "
+                         f"{dated[-1].date:%d %b %Y}; Minimum x={win.x_minimum}, Maximum x={win.x_maximum}")
+            self.log(f"  map saved in {self.annotate_window(win)}")
+        except SophisError as e:
+            self.log(f"  (could not read the update window yet: {e})")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1317,9 +1558,56 @@ def cmd_open_code(args) -> None:
                 break
 
 
+def cmd_window(args) -> None:
+    """Reads the open update window and shows where each date's Minimum / Maximum cells are."""
+    a = _create(args)
+    print("You have 3 seconds to bring the Sophis update window (Maturity / Minimum / Maximum) to the front ...")
+    time.sleep(3)
+    try:
+        win = a.read_update_window()
+        print(f"\nColumns (x): Maturity {win.x_maturity} | Minimum {win.x_minimum} | Maximum {win.x_maximum} | "
+              f"Ric {win.x_ric}; header y {win.header_y}; row pitch {win.pitch:.1f}px")
+        for r in win.rows:
+            print(f"  row {r.index:2d}  y={r.cy}  {r.text!r:22} -> "
+                  f"{r.date.strftime('%d %b %Y') if r.date else '?'}{r.suffix}")
+        target = None
+        if args.date:
+            date, _ = parse_date(args.date)
+            if not date:
+                print(f"ERROR: could not understand --date {args.date!r} (try 19 Oct 2026, 2026-10-19 or 19/10/2026)")
+                sys.exit(2)
+            target = a.locate_date(date, args.occurrence)
+            if len(target.matches) > 1:
+                print(f"\n{date:%d %b %Y} appears {len(target.matches)} times: rows "
+                      f"{[(m.index, m.text) for m in target.matches]}"
+                      f"{'  -> pick one with --occurrence 0/1/...' if target.ambiguous else ''}")
+            print(f"\n{date:%d %b %Y}: row {target.row.index}; Minimum cell at {target.minimum}, "
+                  f"Maximum cell at {target.maximum}")
+            win = a.read_update_window()                 # (the list may have scrolled) for the picture
+        print("Map saved in", a.annotate_window(win, target if args.date else None))
+        if target and args.show:
+            for name, xy in (("Minimum", target.minimum), ("Maximum", target.maximum)):
+                print(f"Moving the pointer to the {name} cell (no click) ...")
+                a.s.pg.moveTo(*xy, duration=0.4)
+                time.sleep(2)
+    except SophisError as e:
+        print(f"\nERROR: {e}")
+        sys.exit(1)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sophis automation (stage 1: search a code and open its window)")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("window", help="read the open update window: dates and where Minimum / Maximum go")
+    s.add_argument("--date", help="a date to locate, e.g. '19 Oct 2026', 2026-10-19 or 19/10/2026")
+    s.add_argument("--occurrence", type=int, default=None,
+                   help="which row to use if the date appears more than once (0 = first)")
+    s.add_argument("--show", action="store_true", help="move the pointer over the Minimum and Maximum cells (no click)")
+    s.add_argument("--reader", default=None, help=argparse.SUPPRESS)
+    s.add_argument("--no-widen", dest="no_widen", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--slowdown", dest="slowdown", type=float, help="multiplier for waits (2 = twice as slow)")
+    s.set_defaults(fn=cmd_window)
 
     s = sub.add_parser("calibrate", aliases=["calibrar"], help="record the on-screen positions (once)")
     s.add_argument("--wait", "--espera", dest="wait", type=int, default=5, help="seconds per point (default 5)")

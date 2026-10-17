@@ -111,6 +111,13 @@ Y1, H, BORDER, RIGHT, RIC_LEFT = 100, 24, 470, 540, 400
 ARROW = (836, 62)
 AVAIL_BTN = (40, 45)         # first small button next to "Available contracts"
 
+# The update window ("Strikes ...") with its Maturity | Minimum | Maximum | Ric grid
+DATES = ["19 Oct 2026", "23 Oct 2026", "30 Oct 2026", "06 Nov 2026", "13 Nov 2026", "20 Nov 2026", "20 Nov 2026",
+         "27 Nov 2026", "30 Nov 2026", "18 Dec 2026", "15 Jan 2027", "21 Jan 2027", "19 Feb 2027-1",
+         "19 Feb 2027", "19 Mar 2027", "16 Apr 2027"]
+HX = {"Maturity": 290, "Minimum": 380, "Maximum": 460, "Ric": 600}       # header text centers (x)
+HEADER_Y, PITCH, VISIBLE = 175, 22, 10                                    # header y, row pitch, rows in view
+
 ANCHOR_GRID = (22, 62, 330, 84)      # header "Mnemo | Extended Mnemo | Description"
 ANCHOR_RIGHT = (700, 188, 850, 208)  # header "Date | Cycle | Name"
 
@@ -136,6 +143,7 @@ class FakeSophis:
         self._last_type_t = -1e9
         self.mouse = (0, 0)    # where the pointer is (it stays on the row you clicked)
         self.avail_clicks = 0
+        self.dscroll = 0       # first visible row of the update window's grid
 
     # drawing
     def _image(self):
@@ -177,7 +185,25 @@ class FakeSophis:
                 d.text((706, 80 + 22 * i), t, fill=(0, 0, 0), font=FONT)
         if self.dialog:
             d.rectangle((200, 150, 800, 450), fill=(240, 240, 240), outline=(0, 0, 0))
-            d.text((220, 170), "Maturity        Minimum        Maximum        Ric", fill=(0, 0, 0), font=FONT)
+            d.text((220, 158), "Strikes ZIMMER BIOMET HOLDINGS INC", fill=(0, 0, 0), font=FONT, anchor="lm")
+            d.rectangle((232, HEADER_Y - 11, 660, HEADER_Y + 11 + PITCH * VISIBLE), fill=(255, 255, 255),
+                        outline=(0, 0, 0))
+            for name, x in HX.items():
+                d.text((x, HEADER_Y), name, fill=(0, 0, 0), font=FONT, anchor="mm")
+            for x in (335, 420, 500):                                       # column borders
+                d.line((x, HEADER_Y - 11, x, HEADER_Y + 11 + PITCH * VISIBLE), fill=(120, 120, 120))
+            for k in range(VISIBLE):
+                n = self.dscroll + k
+                if n >= len(DATES):
+                    break
+                y = HEADER_Y + PITCH * (k + 1)
+                selected = (n == 0)                                         # the first date starts highlighted
+                if selected:
+                    d.rectangle((233, y - PITCH // 2 + 1, 659, y + PITCH // 2 - 1), fill=(10, 36, 106))
+                d.text((HX["Maturity"], y), DATES[n], fill=(255, 255, 255) if selected else (0, 0, 0), font=FONT,
+                       anchor="mm")
+            d.text((560, 425), "OK", fill=(0, 0, 0), font=FONT, anchor="mm")
+            d.text((640, 425), "Cancel", fill=(0, 0, 0), font=FONT, anchor="mm")
         canvas = Image.new("RGB", (1200, 800), (30, 60, 90))
         if self.hidden:                        # minimized window: only the desktop is visible
             return canvas
@@ -187,6 +213,12 @@ class FakeSophis:
     # Screen API (receives ABSOLUTE screen coordinates)
     def position(self):
         return self.mouse
+
+    def scroll(self, clicks, x, y):
+        x, y = x - self.dx, y - self.dy
+        if self.dialog and 232 <= x <= 660 and HEADER_Y <= y <= HEADER_Y + PITCH * VISIBLE:
+            self.dscroll = max(0, min(len(DATES) - VISIBLE, self.dscroll - clicks))     # one row per wheel click
+            self.events.append(("scroll", clicks))
 
     def mouse_on_row(self, i):
         self.mouse = (45 + self.dx, Y1 + i * H + self.dy)
@@ -915,3 +947,151 @@ def test_cli_open_with_option_is_parsed(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "open", "--open-with", "double", "--term", "Future"])
     sa.main()
     assert seen == {"open_with": "double", "term": "Future"}
+
+
+# ── stage 2: where do the values go in the update window? ────────────────────
+
+import datetime as dt
+
+
+def D(text):
+    return sa.parse_date(text)[0]
+
+
+@pytest.mark.parametrize("text,date,suffix", [
+    ("19 Oct 2026", dt.date(2026, 10, 19), ""),
+    ("19-Oct-2026", dt.date(2026, 10, 19), ""),
+    ("2026-10-19", dt.date(2026, 10, 19), ""),
+    ("19/10/2026", dt.date(2026, 10, 19), ""),
+    ("19 Feb 2027-1", dt.date(2027, 2, 19), "-1"),
+    ("l9 0ct 2O26", dt.date(2026, 10, 19), ""),        # OCR slips: l for 1, 0 for O, O for 0
+    ("19 Ocl 2026", dt.date(2026, 10, 19), ""),
+    ("12/31/2026", dt.date(2026, 12, 31), ""),         # month/day order is guessed when the day cannot be second
+])
+def test_parse_date(text, date, suffix):
+    assert sa.parse_date(text) == (date, suffix)
+
+
+@pytest.mark.parametrize("text", ["", "Maturity", "Short term index", "19 Xyz 2026", "99/99/2026", "19 Oct 1850"])
+def test_parse_date_rejects_what_is_not_a_date(text):
+    assert sa.parse_date(text)[0] is None
+
+
+def _open_window(ocr, anchors, **kw):
+    a, fake = make(ocr, anchors, reader="ocr", **kw)
+    fake.dialog = True
+    return a, fake
+
+
+def test_read_update_window_finds_columns_and_every_visible_date(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    win = a.read_update_window()
+    for name, x in (("x_maturity", HX["Maturity"]), ("x_minimum", HX["Minimum"]), ("x_maximum", HX["Maximum"]),
+                    ("x_ric", HX["Ric"])):
+        assert abs(getattr(win, name) - x) <= 4, name
+    assert abs(win.header_y - HEADER_Y) <= 4 and abs(win.pitch - PITCH) <= 2
+    assert [r.date for r in win.rows] == [D(t) for t in DATES[:VISIBLE]]      # all ten, in order
+    for r in win.rows:
+        assert abs(r.cy - (HEADER_Y + PITCH * (r.index + 1))) <= 3
+
+
+def test_the_highlighted_first_row_is_read_too(ocr, anchors):
+    """White text on dark blue (the selected row) is what the plain detector tends to miss."""
+    a, fake = _open_window(ocr, anchors)
+    win = a.read_update_window()
+    assert win.rows[0].index == 0 and win.rows[0].date == D("19 Oct 2026")
+
+
+def test_locate_date_gives_the_minimum_and_maximum_cells(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    t = a.locate_date(D("30 Nov 2026"))
+    y = HEADER_Y + PITCH * (8 + 1)
+    assert t.row.index == 8 and not t.ambiguous
+    assert abs(t.minimum[0] - HX["Minimum"]) <= 4 and abs(t.maximum[0] - HX["Maximum"]) <= 4
+    assert abs(t.minimum[1] - y) <= 3 and t.minimum[1] == t.maximum[1]
+
+
+def test_locate_date_on_the_highlighted_row(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    t = a.locate_date(D("19 Oct 2026"))
+    assert t.row.index == 0 and abs(t.minimum[1] - (HEADER_Y + PITCH)) <= 3
+
+
+def test_a_repeated_date_is_reported_as_ambiguous_until_you_choose(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    t = a.locate_date(D("20 Nov 2026"))
+    assert t.ambiguous and [m.index for m in t.matches] == [5, 6] and t.row.index == 5
+    second = a.locate_date(D("20 Nov 2026"), occurrence=1)
+    assert not second.ambiguous and second.row.index == 6 and second.minimum[1] > t.minimum[1]
+    with pytest.raises(SophisError, match="no occurrence 2"):
+        a.locate_date(D("20 Nov 2026"), occurrence=2)
+
+
+def test_the_list_is_scrolled_to_reach_a_date_that_is_not_visible(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    t = a.locate_date(D("16 Apr 2027"))
+    assert fake.dscroll > 0 and t.row.date == D("16 Apr 2027")
+    assert t.minimum[1] <= HEADER_Y + PITCH * VISIBLE + 3                          # the cell is on screen now
+
+
+def test_scrolling_back_up_to_an_earlier_date(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    fake.dscroll = len(DATES) - VISIBLE
+    t = a.locate_date(D("23 Oct 2026"))
+    assert fake.dscroll == 0 and t.row.date == D("23 Oct 2026")
+
+
+def test_a_suffixed_duplicate_is_found_and_flagged(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    t = a.locate_date(D("19 Feb 2027"))
+    assert t.ambiguous and sorted(m.suffix for m in t.matches) == ["", "-1"]
+    plain = a.locate_date(D("19 Feb 2027"), occurrence=[m.suffix for m in t.matches].index(""))
+    assert plain.row.suffix == ""
+
+
+def test_a_date_that_is_not_in_the_list_says_so(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    with pytest.raises(SophisError, match="is not in the list"):
+        a.locate_date(D("24 Oct 2026"))                                            # between two existing dates
+    with pytest.raises(SophisError, match="was not found"):
+        a.locate_date(D("01 Jan 2030"))                                            # beyond the end: stops scrolling
+    assert not [e for e in fake.events if e[0] in ("click", "double", "type")]     # read-only: nothing clicked
+
+
+def test_update_window_cells_follow_the_window_when_it_moves(ocr, anchors):
+    a, fake = _open_window(ocr, anchors, shift=(55, 30))
+    t = a.locate_date(D("30 Nov 2026"))
+    assert abs(t.minimum[0] - (HX["Minimum"] + 55)) <= 4
+    assert abs(t.minimum[1] - (HEADER_Y + PITCH * 9 + 30)) <= 3
+
+
+def test_the_annotated_map_is_saved(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake = _open_window(ocr, anchors)
+    win = a.read_update_window()
+    path = a.annotate_window(win, a.locate_date(D("27 Nov 2026")))
+    assert path.exists() and Image.open(path).size == win.image.size
+
+
+def test_a_missing_window_is_a_clear_error(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake = make(ocr, anchors, reader="ocr")                                     # the update window is NOT open
+    with pytest.raises(SophisError, match="Could not find the Maturity"):
+        a.read_update_window()
+
+
+def test_opening_the_window_reports_what_it_sees(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.sel = 3
+    a.open_selected()
+    assert any("update window read: 10 visible dates" in l for l in lines)
+    assert any("map saved" in l for l in lines) and list(tmp_path.glob("*update_window_map.png"))
+
+
+def test_cli_window_options_are_parsed(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(sa, "cmd_window", lambda args: seen.update(date=args.date, occ=args.occurrence, show=args.show))
+    monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "window", "--date", "20 Nov 2026", "--occurrence", "1", "--show"])
+    sa.main()
+    assert seen == {"date": "20 Nov 2026", "occ": 1, "show": True}
