@@ -704,41 +704,36 @@ class Automator:
     def prepare(self) -> None:
         self.locate()
 
-    def ensure_ready_to_type(self) -> int:
-        """Manual mode: the grid must already have focus because YOU clicked a row. This only checks that it is
-        safe to type: a row is selected and no cell is open for editing (typing would overwrite it).
-        Returns the selected row. It never clicks."""
-        row = self.selected_row()
-        if row is None:
-            path = self.save_debug("no_row_selected")
-            raise SophisError("No selected row found in the Mnemo table. Click ONE row of the table yourself "
-                              f"(a single click) and try again. NOTHING was typed. Screenshot: {path}")
-        if self._row_in_edit_mode(row):
-            path = self.save_debug("edit_mode")
-            raise SophisError("A Mnemo cell is open for editing (a click on an already selected cell does that). "
-                              "Click a DIFFERENT row once so the edit closes (do not press Enter) and try "
-                              f"again. NOTHING was typed. Screenshot: {path}")
-        return row
+    def _type_code(self, code: str) -> int | None:
+        """Types `code` once the type-ahead buffer of the previous code has expired.
 
-    def _type_code(self, code: str) -> int:
-        """Types `code` once the type-ahead buffer of the previous code has expired. Returns the row that was
-        selected before typing (used to tell whether typing moved the grid)."""
+        Manual mode (default) TRUSTS that you already selected a row: there is no check that can stop the
+        typing (the checks used to give false alarms and block it). The row that was selected before typing is
+        only looked up for information (None if it cannot be told); the result is verified AFTER typing."""
         pause = self._last_typed_at + self.cfg.type_gap * self.cfg.slowdown - time.time()
         if pause > 0:
             time.sleep(pause)
-        start = self.ensure_ready_to_type() if not self.cfg.auto_focus else self.focus_grid()
+        start = self.focus_grid() if self.cfg.auto_focus else self.selected_row()
         self.s.type_text(code)
         self._last_typed_at = time.time()
         return start
 
-    def focus_grid(self) -> int:
-        """Gives the grid keyboard focus with ONE click and returns the row that was clicked.
+    def _locate_row_by_reading(self, code: str) -> int | None:
+        """Fallback when the highlighted row cannot be told by color: read the Mnemo of every visible row and
+        return the one that exactly equals `code` (None if none or several do)."""
+        hits = []
+        for i in range(self.g.n):
+            readings, glyphs = self._mnemonic_by_ocr(i)
+            if match_code(readings, glyphs, code, allow_weak=False) == "exact":
+                hits.append(i)
+        return hits[0] if len(hits) == 1 else None
 
-        IMPORTANT: in this grid a click on a row that is ALREADY SELECTED opens its cell for editing, and
-        whatever is typed next overwrites the cell. So the click always goes to a row that is not selected
-        (a click on an unselected row only selects it, after which typing jumps through the list). Before
-        returning, it checks that the grid is not in edit mode; if it cannot get a safe selection it raises
-        and nothing is typed."""
+    def focus_grid(self) -> int:
+        """--auto-focus only: gives the grid keyboard focus with ONE click and returns the clicked row.
+
+        In this grid a click on a row that is ALREADY SELECTED opens its cell for editing, so the click always
+        goes to a row that is not selected (a click on an unselected row only selects it). It never blocks the
+        typing: if the selection cannot be confirmed it only logs a warning."""
         selected = self.selected_row()
         candidates = [i for i in (1, 2, 3) if i != selected and i < self.g.n]
         target = candidates[0]
@@ -749,24 +744,20 @@ class Automator:
             # first characters are not typed into a window that is not ready yet.
             self._first_click_done = True
             self._wait(1.0)
-        if self.selected_row() == target and not self._row_in_edit_mode(target):
+        if self.selected_row() == target:
             return target
-        # Either the click did not select the row (window not active yet) or the cell went into edit mode.
-        # Click a different, unselected row (this ends any edit without typing anything) and check again.
         alt = next(i for i in (1, 2, 3, 4) if i not in (target, selected) and i < self.g.n)
-        self.log(f"  row {target} did not end up cleanly selected; clicking row {alt} instead")
+        self.log(f"  row {target} does not look selected yet; clicking row {alt} instead")
         self.click_row(alt)
         self._wait(0.5)
-        if self.selected_row() == alt and not self._row_in_edit_mode(alt):
-            return alt
-        path = self.save_debug("cannot_select_safely")
-        raise SophisError(
-            "Could not select a row safely (a click on an already selected cell opens it for editing, and "
-            f"typing would overwrite it). NOTHING was typed. Check the Sophis window. Screenshot: {path}")
+        if self.selected_row() != alt:
+            self.log("  WARNING: could not confirm the selected row; typing anyway")
+        return alt
 
     def _row_in_edit_mode(self, i: int) -> bool:
-        """True if the Mnemo cell of row i is an edit box. In a selected row every cell has the highlight
-        color; an edit box shows up as a different (usually white) cell next to the highlighted ones."""
+        """Informational only (shown by `diagnose`, never used to block anything): True if the Mnemo cell of
+        row i looks different from its neighbour, which is what an open edit box looks like. It can give false
+        alarms when the columns simply have different background colors."""
         g = self.g
         yc = g.row_y(i)
         cell = self.s.capture(self._cell_region(i, g.x_mnemo0, g.x_mnemo1))
@@ -894,7 +885,7 @@ class Automator:
         last = ""
         retype = True
         moved = False
-        clicked = -1
+        clicked = None
         for k in range(1, attempts + 1):
             if retype or k == attempts:
                 before = self._column_image()
@@ -905,13 +896,17 @@ class Automator:
                 self._wait(0.8)
             i = self.selected_row()
             if i is None:
+                i = self._locate_row_by_reading(code)
+                if i is not None:
+                    self.log("  highlighted row not detected by color; found it by reading the Mnemo column")
+            if i is None:
                 last, retype = "no selected row detected", True
                 self.log(f"  attempt {k}: {last}")
                 continue
             retype = False
             # A match by shape alone is only allowed if typing really moved the grid (otherwise the code was
             # probably not found and the highlighted row is just where it already was).
-            reading = self.read_row(i, code, allow_weak=moved or i != clicked)
+            reading = self.read_row(i, code, allow_weak=moved or (clicked is not None and i != clicked))
             if not reading.mnemo_ok and self._is_extension(reading, code):
                 self.log(f"  landed on {list(reading.seen)[:1]}; walking down to '{code}' ...")
                 found = self._walk_down_to(code)
@@ -1006,6 +1001,14 @@ class Automator:
         # Changing the dropdown may reload/move the list: re-check the row before opening.
         j = self.selected_row()
         if j is None or not self.read_row(j, code).mnemo_ok:
+            j = self._locate_row_by_reading(code)
+        if j is None:
+            if not self.cfg.auto_focus:
+                # The dropdown click took the keyboard focus away from the grid, so typing the code again
+                # would go nowhere. Nothing is typed or clicked blindly.
+                path = self.save_debug(f"row_lost_{code}")
+                raise SophisError(f"[{code}] the row could not be found again after setting the dropdown. "
+                                  f"Click a row, then run this code again. Screenshot: {path}")
             self.log("  the list changed after the dropdown; searching again")
             j, _ = self.search(code)
         self.log(f"  opening window (double click on row {j}) ...")
@@ -1118,8 +1121,7 @@ def cmd_diagnose(args) -> None:
     a.save_debug("diag_screen")
     a.prepare()
     start = a._type_code(code)
-    print(f"Row selected before typing: {start} (the script did not click anything"
-          f"{' except an unselected row' if a.cfg.auto_focus else ''}); the grid was not in edit mode.")
+    print(f"Row selected before typing: {start} (None = not detected). The script typed without any check.")
     a._wait(0.8)
     i = a.selected_row()
     print(f"\nSelected row after typing '{code}': {i}")

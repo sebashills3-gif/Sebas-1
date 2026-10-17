@@ -114,7 +114,9 @@ ANCHOR_RIGHT = (700, 188, 850, 208)  # header "Date | Cycle | Name"
 
 
 class FakeSophis:
-    def __init__(self, clipboard=False, popup_visible=True, shift=(0, 0), hidden=False, always_edit=False):
+    def __init__(self, clipboard=False, popup_visible=True, shift=(0, 0), hidden=False, always_edit=False,
+                 tinted_mnemo=False, no_highlight=False):
+        self.tinted_mnemo, self.no_highlight = tinted_mnemo, no_highlight
         self.dx, self.dy = shift
         self.editing = None          # row whose Mnemo cell is open for editing (a click on a SELECTED row does it)
         self.edited = ""             # what was typed into that edit box (i.e. what would overwrite the data)
@@ -139,7 +141,11 @@ class FakeSophis:
         for i, (m, t) in enumerate(ROWS):
             y = Y1 - H // 2 + i * H
             color = (170, 195, 235) if i == self.sel else ((255, 255, 255) if i % 2 == 0 else (235, 235, 235))
+            if self.no_highlight:                                              # selection not visible by color
+                color = (255, 255, 255) if i % 2 == 0 else (235, 235, 235)
             d.rectangle((20, y, 640, y + H - 1), fill=color)
+            if self.tinted_mnemo:                                              # Mnemo column has its own background
+                d.rectangle((21, y, 133, y + H - 1), fill=(255, 230, 150))
             d.text((40, y + 4), m, fill=(0, 0, 160), font=FONT)
             d.line((135, y, 135, y + H - 1), fill=(90, 90, 90))               # border between Mnemo and Extended
             if i == self.sel:                                                  # focus rectangle of the selection
@@ -278,7 +284,7 @@ def make(ocr, anchors, **kw):
         "row1": [45, Y1], "row2": [45, Y1 + H], "rowN": [45, Y1 + 7 * H], "ext": [140, Y1],
         "ric_left": [RIC_LEFT, 70], "term_left": [BORDER, 70], "term_right": [RIGHT, 70], "dd_left": [706, 62], "dd_arrow": list(ARROW),
     }, slowdown=0.01, **{k: v for k, v in kw.items() if k in ("reader", "verify_mnemonic", "auto_focus")})
-    screen = FakeSophis(**{k: v for k, v in kw.items() if k in ("clipboard", "popup_visible", "shift", "hidden", "always_edit")})
+    screen = FakeSophis(**{k: v for k, v in kw.items() if k in ("clipboard", "popup_visible", "shift", "hidden", "always_edit", "tinted_mnemo", "no_highlight")})
     a = Automator(screen, ocr, cfg, log=lambda *_: None)
     a.prepare()
     return a, screen
@@ -654,14 +660,6 @@ def test_repeated_searches_never_overwrite_a_cell(ocr, anchors, code, auto_focus
     assert fake.edited == "" and fake.editing is None
 
 
-def test_edit_mode_is_detected_and_nothing_is_typed(ocr, anchors, tmp_path, monkeypatch):
-    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
-    a, fake = make(ocr, anchors, reader="ocr", always_edit=True, auto_focus=True)   # every click opens the cell
-    with pytest.raises(SophisError, match="NOTHING was typed"):
-        a.search("ZS")
-    assert not [e for e in fake.events if e[0] == "type"] and fake.edited == ""
-
-
 def test_row_in_edit_mode_detection(ocr, anchors):
     a, fake = make(ocr, anchors)
     assert not a._row_in_edit_mode(0)                     # selected normally: every cell has the highlight color
@@ -696,24 +694,6 @@ def test_manual_mode_open_contract_clicks_only_the_dropdown_and_the_final_double
     assert kinds[0] == "type" and kinds.count("double") == 1 and fake.dialog and fake.edited == ""
 
 
-def test_manual_mode_refuses_to_type_when_no_row_is_selected(ocr, anchors, tmp_path, monkeypatch):
-    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
-    a, fake = make(ocr, anchors, reader="ocr")
-    fake.sel = None                                       # you forgot to click a row
-    with pytest.raises(SophisError, match="Click ONE row"):
-        a.search("ZS")
-    assert not [e for e in fake.events if e[0] == "type"]
-
-
-def test_manual_mode_refuses_to_type_into_an_open_cell(ocr, anchors, tmp_path, monkeypatch):
-    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
-    a, fake = make(ocr, anchors, reader="ocr")
-    fake.editing = fake.sel = 2                           # the cell is open for editing
-    with pytest.raises(SophisError, match="open for editing"):
-        a.search("ZS")
-    assert fake.edited == "" and not [e for e in fake.events if e[0] == "type"]
-
-
 def test_manual_mode_waits_for_the_typeahead_buffer_between_codes(ocr, anchors, monkeypatch):
     a, fake = make(ocr, anchors, reader="ocr")
     a.cfg.type_gap, a.cfg.slowdown = 2.5, 1.0
@@ -723,3 +703,37 @@ def test_manual_mode_waits_for_the_typeahead_buffer_between_codes(ocr, anchors, 
     a._last_typed_at = sa.time.time()                     # a code was typed just now
     a._type_code("ZS")
     assert any(x > 1.5 for x in slept), slept             # it let the grid's search buffer expire first
+
+
+# ── manual mode trusts your click: nothing can stop the typing ───────────────
+
+def test_typing_is_never_blocked_by_a_false_edit_mode_alarm(ocr, anchors):
+    """The Mnemo column has its own background color, so the edit-mode heuristic would raise a false alarm.
+    The script must type anyway and still find the row."""
+    a, fake = make(ocr, anchors, reader="ocr", tinted_mnemo=True)
+    assert a._row_in_edit_mode(0)                          # the (informational) heuristic is fooled...
+    r = a.search("ZQK")
+    assert fake.events[0][0] == "type" and ROWS[fake.sel][0] == "ZQK"     # ...and the script typed regardless
+    assert r[1].match in ("exact", "weak")
+
+
+@pytest.mark.parametrize("sel", [None, 5])
+def test_typing_does_not_depend_on_a_row_being_detected_as_selected(ocr, anchors, sel):
+    a, fake = make(ocr, anchors, reader="ocr")
+    fake.sel = sel
+    a.search("ZS")
+    assert fake.events[0][0] == "type" and ROWS[fake.sel][0] == "ZS"
+
+
+def test_row_found_by_reading_when_the_highlight_cannot_be_seen(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr", no_highlight=True)
+    assert a.selected_row() is None
+    i, reading = a.search("ZQK")
+    assert ROWS[i][0] == "ZQK" and reading.match == "exact"
+    assert [e[0] for e in fake.events].count("type") == 1          # typed once, not retried blindly
+
+
+def test_open_contract_without_row_highlight_never_types_after_the_dropdown(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr", no_highlight=True)
+    a.open_contract("ZTO")
+    assert [e[0] for e in fake.events].count("type") == 1 and fake.dialog and fake.dd == "Long term share"
