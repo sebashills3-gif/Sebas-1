@@ -3,3 +3,4 @@ sophis_config.json
 __pycache__/
 .pytest_cache/
 sophis_anclas/
+sophis_anchors/

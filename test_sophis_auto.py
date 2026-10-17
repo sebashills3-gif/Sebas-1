@@ -1,119 +1,120 @@
 """
-Pruebas de sophis_auto.py SIN Sophis ni pantalla real: una "pantalla falsa" dibuja con PIL una
-imitación de la ventana (grid, dropdown, ventana de actualización) y el OCR real la lee.
+Tests for sophis_auto.py WITHOUT Sophis or a real screen: a "fake screen" draws an imitation of the
+window (grid, dropdown, update window) with PIL and the real OCR reads it.
 
-    pip install pytest rapidocr-onnxruntime pillow
+    pip install pytest rapidocr-onnxruntime pillow opencv-python
     pytest -q test_sophis_auto.py
 """
+
+import json
 
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
 import sophis_auto as sa
-from sophis_auto import Automatizador, Config, ErrorSophis, OCR, TERMS
+from sophis_auto import Automator, Config, OCR, SophisError, TERMS
 
-# ── pruebas de funciones puras ──────────────────────────────────────────────
+# ── pure-function tests ─────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("texto,esperado", [
+@pytest.mark.parametrize("text,expected", [
     ("Short term index", "Short term index"),
-    ("ShortTermIndex", "Short term index"),            # OCR junta palabras
+    ("ShortTermIndex", "Short term index"),            # OCR joins words
     ("short term lndex", "Short term index"),          # I -> l
     ("Long Term Shares", "Long term share"),           # plural
     ("  LONG TERM INDEX ", "Long term index"),
     ("Future", "Future"),
     ("Short term share", "Short term share"),
-    ("ZYS.N Short term share", "Short term share"),    # texto extra en el mismo recorte
+    ("ZYS.N Short term share", "Short term share"),    # extra text in the same crop
 ])
-def test_clasificar_term_ok(texto, esperado):
-    assert sa.clasificar_term(texto) == esperado
+def test_classify_term_ok(text, expected):
+    assert sa.classify_term(text) == expected
 
 
-@pytest.mark.parametrize("texto", ["", "Short ter...", "Short ter", "Cycle", "US92189H6071"])
-def test_clasificar_term_ambiguo(texto):
-    assert sa.clasificar_term(texto) is None
+@pytest.mark.parametrize("text", ["", "Short ter...", "Short ter", "Cycle", "US92189H6071"])
+def test_classify_term_ambiguous(text):
+    assert sa.classify_term(text) is None
 
 
-def test_term_truncado():
-    assert sa.term_truncado("Short ter...")
-    assert not sa.term_truncado("Short term index")
+def test_term_truncated():
+    assert sa.term_truncated("Short ter...")
+    assert not sa.term_truncated("Short term index")
 
 
-def test_los_cinco_terms_se_distinguen_entre_si():
+def test_the_five_terms_are_told_apart():
     for t in TERMS:
-        assert sa.clasificar_term(t) == t
+        assert sa.classify_term(t) == t
 
 
-def test_filas_con_color():
+def test_rows_with_color():
     img = Image.new("RGB", (7, 72), (255, 255, 255))
     ImageDraw.Draw(img).rectangle((0, 24, 6, 47), fill=(170, 195, 235))
-    cols = sa.colores_filas(img, 24, 3)
-    assert sa.filas_con_color(cols, (170, 195, 235), 20) == [1]
+    colors = sa.row_colors(img, 24, 3)
+    assert sa.rows_with_color(colors, (170, 195, 235), 20) == [1]
 
 
-# ── pantalla falsa ──────────────────────────────────────────────────────────
+# ── fake screen ─────────────────────────────────────────────────────────────
 
-FUENTE = ImageFont.load_default(size=13)
-FILAS = [("ZYS", "Short term share"), ("ZTS", "Short term index"), ("ZTO", "Long term share"),
-         ("ZS", "Long term index"), ("ZQK", "Future"), ("ZMH", "Short term share"),
-         ("ZM", "Long term share"), ("ZJO", "Short term index")]
-Y1, H, BORDE, DER = 100, 24, 470, 620
-FLECHA = (836, 62)
+FONT = ImageFont.load_default(size=13)
+ROWS = [("ZYS", "Short term share"), ("ZTS", "Short term index"), ("ZTO", "Long term share"),
+        ("ZS", "Long term index"), ("ZQK", "Future"), ("ZMH", "Short term share"),
+        ("ZM", "Long term share"), ("ZJO", "Short term index")]
+Y1, H, BORDER, RIGHT = 100, 24, 470, 620
+ARROW = (836, 62)
 
-
-ANCLA_GRID = (22, 62, 330, 84)     # encabezado "Mnemo | Extended Mnemo | Description"
-ANCLA_DER = (700, 188, 850, 208)   # encabezado "Date | Cycle | Name"
+ANCHOR_GRID = (22, 62, 330, 84)      # header "Mnemo | Extended Mnemo | Description"
+ANCHOR_RIGHT = (700, 188, 850, 208)  # header "Date | Cycle | Name"
 
 
 class FakeSophis:
-    def __init__(self, portapapeles=False, popup_visible=True, desplaz=(0, 0), oculta=False):
-        self.dx, self.dy = desplaz
-        self.oculta = oculta
+    def __init__(self, clipboard=False, popup_visible=True, shift=(0, 0), hidden=False):
+        self.dx, self.dy = shift
+        self.hidden = hidden
         self.sel, self.typed, self.dd = 0, "", "Short term index"
-        self.popup, self.ancho, self.dialogo = False, False, False
+        self.popup, self.widened, self.dialog = False, False, False
         self.popup_idx = 0
-        self.portapapeles, self.popup_visible = portapapeles, popup_visible
+        self.clipboard, self.popup_visible = clipboard, popup_visible
         self._clip = None
-        self.intervalo_tecla = 0
+        self.key_interval = 0
 
-    # dibujo
-    def _imagen(self):
+    # drawing
+    def _image(self):
         im = Image.new("RGB", (1000, 600), (200, 200, 200))
         d = ImageDraw.Draw(im)
-        borde = BORDE - (140 if self.ancho else 0)
-        for i, (m, t) in enumerate(FILAS):
+        border = BORDER - (140 if self.widened else 0)
+        for i, (m, t) in enumerate(ROWS):
             y = Y1 - H // 2 + i * H
             color = (170, 195, 235) if i == self.sel else ((255, 255, 255) if i % 2 == 0 else (235, 235, 235))
             d.rectangle((20, y, 640, y + H - 1), fill=color)
-            d.text((40, y + 4), m, fill=(0, 0, 160), font=FUENTE)
-            d.text((borde + 6, y + 4), t if self.ancho else t[:9] + "...", fill=(0, 0, 160), font=FUENTE)
-        d.rectangle(ANCLA_GRID, fill=(215, 215, 215))
-        d.text((30, 66), "Mnemo        Extended Mnemo        Description", fill=(0, 0, 0), font=FUENTE)
-        d.rectangle(ANCLA_DER, fill=(215, 215, 215))
-        d.text((706, 192), "Date     Cycle     Name", fill=(0, 0, 0), font=FUENTE)
-        d.text((BORDE + 6, 62), "Term", fill=(0, 0, 0), font=FUENTE)
+            d.text((40, y + 4), m, fill=(0, 0, 160), font=FONT)
+            d.text((border + 6, y + 4), t if self.widened else t[:9] + "...", fill=(0, 0, 160), font=FONT)
+        d.rectangle(ANCHOR_GRID, fill=(215, 215, 215))
+        d.text((30, 66), "Mnemo        Extended Mnemo        Description", fill=(0, 0, 0), font=FONT)
+        d.rectangle(ANCHOR_RIGHT, fill=(215, 215, 215))
+        d.text((706, 192), "Date     Cycle     Name", fill=(0, 0, 0), font=FONT)
+        d.text((BORDER + 6, 62), "Term", fill=(0, 0, 0), font=FONT)
         d.rectangle((700, 50, 850, 74), fill=(255, 255, 255), outline=(0, 0, 0))
-        d.text((706, 55), self.dd, fill=(0, 0, 0), font=FUENTE)
+        d.text((706, 55), self.dd, fill=(0, 0, 0), font=FONT)
         d.polygon([(830, 58), (842, 58), (836, 67)], fill=(0, 0, 0))
         if self.popup and self.popup_visible:
             d.rectangle((700, 76, 850, 76 + 22 * 5), fill=(255, 255, 255), outline=(0, 0, 0))
             for i, t in enumerate(TERMS):
-                d.text((706, 80 + 22 * i), t, fill=(0, 0, 0), font=FUENTE)
-        if self.dialogo:
+                d.text((706, 80 + 22 * i), t, fill=(0, 0, 0), font=FONT)
+        if self.dialog:
             d.rectangle((200, 150, 800, 450), fill=(240, 240, 240), outline=(0, 0, 0))
-            d.text((220, 170), "Maturity        Minimum        Maximum        Ric", fill=(0, 0, 0), font=FUENTE)
-        if self.oculta:                       # ventana minimizada: solo se ve el escritorio
-            return Image.new("RGB", (1200, 800), (30, 60, 90))
-        lienzo = Image.new("RGB", (1200, 800), (30, 60, 90))
-        lienzo.paste(im, (self.dx, self.dy))  # la ventana aparece desplazada
-        return lienzo
+            d.text((220, 170), "Maturity        Minimum        Maximum        Ric", fill=(0, 0, 0), font=FONT)
+        canvas = Image.new("RGB", (1200, 800), (30, 60, 90))
+        if self.hidden:                        # minimized window: only the desktop is visible
+            return canvas
+        canvas.paste(im, (self.dx, self.dy))   # the window appears shifted
+        return canvas
 
-    # API de Pantalla (recibe coordenadas ABSOLUTAS de pantalla)
-    def captura(self, region=None):
-        im = self._imagen()
+    # Screen API (receives ABSOLUTE screen coordinates)
+    def capture(self, region=None):
+        im = self._image()
         return im if region is None else im.crop(tuple(int(v) for v in region))
 
-    def _fila_en(self, x, y):
-        for i in range(len(FILAS)):
+    def _row_at(self, x, y):
+        for i in range(len(ROWS)):
             if abs(y - (Y1 + i * H)) <= H // 2 and 20 <= x <= 640:
                 return i
         return None
@@ -125,49 +126,49 @@ class FakeSophis:
                 self.dd = TERMS[min(4, (y - 76) // 22)]
             self.popup = False
             return
-        if abs(x - FLECHA[0]) <= 14 and abs(y - FLECHA[1]) <= 14:
+        if abs(x - ARROW[0]) <= 14 and abs(y - ARROW[1]) <= 14:
             self.popup, self.popup_idx = True, 0
             return
-        i = self._fila_en(x, y)
+        i = self._row_at(x, y)
         if i is not None:
             self.sel, self.typed = i, ""
 
-    def doble_click(self, x, y):
+    def double_click(self, x, y):
         self.click(x, y)
-        if self._fila_en(x - self.dx, y - self.dy) is not None:
-            self.dialogo = True
+        if self._row_at(x - self.dx, y - self.dy) is not None:
+            self.dialog = True
 
-    def escribir(self, texto):
-        for ch in texto:
+    def type_text(self, text):
+        for ch in text:
             self.typed += ch.upper()
-            for i, (m, _) in enumerate(FILAS):
+            for i, (m, _) in enumerate(ROWS):
                 if m.startswith(self.typed):
                     self.sel = i
                     break
 
-    def tecla(self, nombre):
-        if not self.popup and nombre == "down":
-            self.sel = min(self.sel + 1, len(FILAS) - 1)
-        elif self.popup and nombre == "home":
+    def press(self, key):
+        if not self.popup and key == "down":
+            self.sel = min(self.sel + 1, len(ROWS) - 1)
+        elif self.popup and key == "home":
             self.popup_idx = 0
-        elif self.popup and nombre == "down":
+        elif self.popup and key == "down":
             self.popup_idx += 1
-        elif self.popup and nombre == "enter":
+        elif self.popup and key == "enter":
             self.dd, self.popup = TERMS[self.popup_idx], False
 
-    def hotkey(self, *teclas):
-        if self.portapapeles:
-            m, t = FILAS[self.sel]
-            self._clip = f"{m}\t\tDESCRIPCION\tUS0000\t\t{t}"
+    def hotkey(self, *keys):
+        if self.clipboard:
+            m, t = ROWS[self.sel]
+            self._clip = f"{m}\t\tDESCRIPTION\tUS0000\t\t{t}"
 
-    def arrastrar(self, x0, y0, x1, y1):
-        if abs(x0 - self.dx - BORDE) <= 4:
-            self.ancho = True
+    def drag(self, x0, y0, x1, y1):
+        if abs(x0 - self.dx - BORDER) <= 4:
+            self.widened = True
 
-    def portapapeles_set(self, txt):
-        self._clip = txt
+    def clipboard_set(self, text):
+        self._clip = text
 
-    def portapapeles_get(self):
+    def clipboard_get(self):
         return self._clip
 
 
@@ -177,177 +178,199 @@ def ocr():
 
 
 @pytest.fixture(scope="module")
-def anclas(tmp_path_factory):
-    """Calibración: recortes de las dos anclas tomados con la ventana en su posición original."""
-    carpeta = tmp_path_factory.mktemp("anclas")
-    base = FakeSophis().captura()
-    res = {}
-    for nombre, caja in (("grid", ANCLA_GRID), ("der", ANCLA_DER)):
-        ruta = carpeta / f"{nombre}.png"
-        base.crop(caja).save(ruta)
-        res[nombre] = {"archivo": str(ruta), "origen": [caja[0], caja[1]]}
-    return res
+def anchors(tmp_path_factory):
+    """Calibration: crops of the two anchors taken with the window at its original position."""
+    folder = tmp_path_factory.mktemp("anchors")
+    base = FakeSophis().capture()
+    result = {}
+    for name, box in (("grid", ANCHOR_GRID), ("right", ANCHOR_RIGHT)):
+        path = folder / f"{name}.png"
+        base.crop(box).save(path)
+        result[name] = {"file": str(path), "origin": [box[0], box[1]]}
+    return result
 
 
-def crear(ocr, anclas, **kw):
-    cfg = Config(anclas=anclas, puntos={
-        "fila1": [45, Y1], "fila2": [45, Y1 + H], "filaN": [45, Y1 + 7 * H], "ext": [140, Y1],
-        "term_borde": [BORDE, 70], "term_der": [DER, 70], "dd_izq": [706, 62], "dd_flecha": list(FLECHA),
-    }, pausa=0.01, **{k: v for k, v in kw.items() if k in ("lector", "verificar_mnemo")})
-    pantalla = FakeSophis(**{k: v for k, v in kw.items() if k in ("portapapeles", "popup_visible", "desplaz", "oculta")})
-    a = Automatizador(pantalla, ocr, cfg, log=lambda *_: None)
-    a.preparar()
-    return a, pantalla
+def make(ocr, anchors, **kw):
+    cfg = Config(anchors=anchors, points={
+        "row1": [45, Y1], "row2": [45, Y1 + H], "rowN": [45, Y1 + 7 * H], "ext": [140, Y1],
+        "term_left": [BORDER, 70], "term_right": [RIGHT, 70], "dd_left": [706, 62], "dd_arrow": list(ARROW),
+    }, slowdown=0.01, **{k: v for k, v in kw.items() if k in ("reader", "verify_mnemonic")})
+    screen = FakeSophis(**{k: v for k, v in kw.items() if k in ("clipboard", "popup_visible", "shift", "hidden")})
+    a = Automator(screen, ocr, cfg, log=lambda *_: None)
+    a.prepare()
+    return a, screen
 
 
-# ── flujo completo contra la pantalla falsa ─────────────────────────────────
+# ── full flow against the fake screen ───────────────────────────────────────
 
-def test_geometria(ocr, anclas):
-    a, _ = crear(ocr, anclas)
+def test_geometry(ocr, anchors):
+    a, _ = make(ocr, anchors)
     assert a.g.n == 8 and a.g.h == 24
 
 
-@pytest.mark.parametrize("codigo,term", [
+@pytest.mark.parametrize("code,term", [
     ("ZYS", "Short term share"), ("ZS", "Long term index"), ("ZQK", "Future"), ("ZM", "Long term share"),
 ])
-def test_abrir_por_ocr(ocr, anclas, codigo, term):
-    a, fake = crear(ocr, anclas, lector="ocr")
-    r = a.abrir_contrato(codigo)
-    assert r.term == term and fake.dd == term and fake.dialogo
-    assert FILAS[fake.sel][0] == codigo
+def test_open_by_ocr(ocr, anchors, code, term):
+    a, fake = make(ocr, anchors, reader="ocr")
+    r = a.open_contract(code)
+    assert r.term == term and fake.dd == term and fake.dialog
+    assert ROWS[fake.sel][0] == code
 
 
-def test_abrir_por_portapapeles(ocr, anclas):
-    a, fake = crear(ocr, anclas, portapapeles=True)
-    r = a.abrir_contrato("ZTO")
-    assert r.term == "Long term share" and fake.dd == "Long term share" and fake.dialogo
+def test_open_by_clipboard(ocr, anchors):
+    a, fake = make(ocr, anchors, clipboard=True)
+    r = a.open_contract("ZTO")
+    assert r.term == "Long term share" and fake.dd == "Long term share" and fake.dialog
 
 
-def test_dropdown_con_teclado_si_no_se_ve_la_lista(ocr, anclas):
-    a, fake = crear(ocr, anclas, popup_visible=False, lector="ocr")
-    a.abrir_contrato("ZTO")
+def test_dropdown_by_keyboard_when_the_list_is_not_visible(ocr, anchors):
+    a, fake = make(ocr, anchors, popup_visible=False, reader="ocr")
+    a.open_contract("ZTO")
     assert fake.dd == "Long term share"
 
 
-def test_codigo_inexistente_aborta_sin_abrir(ocr, anclas, tmp_path, monkeypatch):
-    monkeypatch.setattr(sa, "CARPETA_DEBUG", tmp_path)
-    a, fake = crear(ocr, anclas, lector="ocr")
-    with pytest.raises(ErrorSophis):
-        a.abrir_contrato("QQQ")
-    assert not fake.dialogo
+def test_unknown_code_aborts_without_opening(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake = make(ocr, anchors, reader="ocr")
+    with pytest.raises(SophisError):
+        a.open_contract("QQQ")
+    assert not fake.dialog
 
 
-# ── la ventana NO está siempre en la misma posición ─────────────────────────
+# ── the window is NOT always in the same position ───────────────────────────
 
-@pytest.mark.parametrize("desplaz", [(57, 33), (-15, 120), (200, 0)])
-@pytest.mark.parametrize("lector", ["ocr", "auto"])
-def test_ventana_en_otra_posicion(ocr, anclas, desplaz, lector):
-    a, fake = crear(ocr, anclas, desplaz=desplaz, lector=lector, portapapeles=(lector == "auto"))
-    r = a.abrir_contrato("ZS")
-    assert r.term == "Long term index" and fake.dd == "Long term index" and fake.dialogo
-    assert FILAS[fake.sel][0] == "ZS"
-
-
-def test_ventana_que_se_mueve_entre_codigos(ocr, anclas):
-    a, fake = crear(ocr, anclas, lector="ocr")
-    a.abrir_contrato("ZYS")
-    fake.dialogo, fake.dx, fake.dy = False, 80, 45        # el usuario cierra la ventana y la reabre en otro lugar
-    r = a.abrir_contrato("ZTO")
-    assert r.term == "Long term share" and fake.dd == "Long term share" and fake.dialogo
+@pytest.mark.parametrize("shift", [(57, 33), (-15, 120), (200, 0)])
+@pytest.mark.parametrize("reader", ["ocr", "auto"])
+def test_window_at_another_position(ocr, anchors, shift, reader):
+    a, fake = make(ocr, anchors, shift=shift, reader=reader, clipboard=(reader == "auto"))
+    r = a.open_contract("ZS")
+    assert r.term == "Long term index" and fake.dd == "Long term index" and fake.dialog
+    assert ROWS[fake.sel][0] == "ZS"
 
 
-def test_ventana_minimizada_da_error_claro(ocr, anclas, tmp_path, monkeypatch):
-    monkeypatch.setattr(sa, "CARPETA_DEBUG", tmp_path)
-    with pytest.raises(ErrorSophis, match="No encuentro la ventana"):
-        crear(ocr, anclas, oculta=True)
+def test_window_that_moves_between_codes(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    a.open_contract("ZYS")
+    fake.dialog, fake.dx, fake.dy = False, 80, 45        # the user closes the window and reopens it elsewhere
+    r = a.open_contract("ZTO")
+    assert r.term == "Long term share" and fake.dd == "Long term share" and fake.dialog
 
 
-# ── calibrar (completo y parcial) con pantalla falsa ────────────────────────
+def test_minimized_window_gives_a_clear_error(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    with pytest.raises(SophisError, match="Cannot find the Sophis window"):
+        make(ocr, anchors, hidden=True)
+
+
+# ── calibrate (full and partial) with the fake screen ───────────────────────
 
 class _Args:
-    def __init__(self, solo=None):
-        self.espera, self.solo = 0, solo
+    def __init__(self, only=None):
+        self.wait, self.only = 0, only
 
 
-def _calibrar_con(monkeypatch, tmp_path, fake, posiciones, solo=None):
+def _calibrate_with(monkeypatch, tmp_path, fake, positions, only=None):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sa.time, "sleep", lambda *_: None)
-    it = iter(posiciones)
-    fake.posicion = lambda: next(it)
-    monkeypatch.setattr(sa, "Pantalla", lambda *a, **k: fake)
-    sa.cmd_calibrar(_Args(solo))
-    return Config.cargar()
+    it = iter(positions)
+    fake.position = lambda: next(it)
+    monkeypatch.setattr(sa, "Screen", lambda *a, **k: fake)
+    sa.cmd_calibrate(_Args(only))
+    return Config.load()
 
 
-PUNTOS_OK = [(22, 62), (330, 84), (45, Y1), (45, Y1 + H), (45, Y1 + 7 * H), (140, Y1), (BORDE, 70), (DER, 70),
-             (700, 188), (850, 208), (706, 62), FLECHA]
+GOOD_POINTS = [(22, 62), (330, 84), (45, Y1), (45, Y1 + H), (45, Y1 + 7 * H), (140, Y1), (BORDER, 70), (RIGHT, 70),
+               (700, 188), (850, 208), (706, 62), ARROW]
 
 
-def test_calibrar_completo_y_luego_parcial_con_ventana_movida(ocr, monkeypatch, tmp_path):
-    cfg = _calibrar_con(monkeypatch, tmp_path, FakeSophis(), PUNTOS_OK)
-    assert set(cfg.anclas) == {"grid", "der"} and cfg.puntos["filaN"] == [45, Y1 + 7 * H]
-    # la ventana ahora está corrida (40, 25); se rehace solo filaN apuntando a su nueva posición
-    mov = FakeSophis(desplaz=(40, 25))
-    cfg = _calibrar_con(monkeypatch, tmp_path, mov, [(45 + 40, Y1 + 5 * H + 25)], solo=["filaN"])
-    a = Automatizador(mov, ocr, cfg, log=lambda *_: None)
-    a.preparar()
-    assert a.g.n == 6 and a.g.y1 == Y1 + 25            # filaN nueva; el resto se trasladó a la posición actual
+def test_full_then_partial_calibration_with_moved_window(ocr, monkeypatch, tmp_path):
+    cfg = _calibrate_with(monkeypatch, tmp_path, FakeSophis(), GOOD_POINTS)
+    assert set(cfg.anchors) == {"grid", "right"} and cfg.points["rowN"] == [45, Y1 + 7 * H]
+    # the window is now shifted by (40, 25); only rowN is redone, pointing at its new position
+    moved = FakeSophis(shift=(40, 25))
+    cfg = _calibrate_with(monkeypatch, tmp_path, moved, [(45 + 40, Y1 + 5 * H + 25)], only=["rowN"])
+    a = Automator(moved, ocr, cfg, log=lambda *_: None)
+    a.prepare()
+    assert a.g.n == 6 and a.g.y1 == Y1 + 25            # new rowN; the rest was translated to the current position
 
 
-def test_calibrar_invalido_no_pisa_la_calibracion_anterior(ocr, monkeypatch, tmp_path):
-    _calibrar_con(monkeypatch, tmp_path, FakeSophis(), PUNTOS_OK)
-    antes = (tmp_path / "sophis_config.json").read_text()
-    with pytest.raises(ErrorSophis, match="filaN"):
-        _calibrar_con(monkeypatch, tmp_path, FakeSophis(), [(45, Y1 + H)], solo=["filaN"])
-    assert (tmp_path / "sophis_config.json").read_text() == antes
+def test_invalid_calibration_does_not_overwrite_the_previous_one(ocr, monkeypatch, tmp_path):
+    _calibrate_with(monkeypatch, tmp_path, FakeSophis(), GOOD_POINTS)
+    before = (tmp_path / "sophis_config.json").read_text()
+    with pytest.raises(SophisError, match="rowN"):
+        _calibrate_with(monkeypatch, tmp_path, FakeSophis(), [(45, Y1 + H)], only=["rowN"])
+    assert (tmp_path / "sophis_config.json").read_text() == before
 
 
-# ── dos clics sencillos seguidos no deben convertirse en doble clic ─────────
+def test_legacy_spanish_config_still_loads_and_works(ocr, anchors, tmp_path):
+    legacy = {
+        "puntos": {"ancla_grid_a": [0, 0], "ancla_grid_b": [0, 0], "fila1": [45, Y1], "fila2": [45, Y1 + H],
+                   "filaN": [45, Y1 + 7 * H], "ext": [140, Y1], "term_borde": [BORDER, 70],
+                   "term_der": [RIGHT, 70], "ancla_der_a": [0, 0], "ancla_der_b": [0, 0],
+                   "dd_izq": [706, 62], "dd_flecha": list(ARROW)},
+        "anclas": {"grid": {"archivo": anchors["grid"]["file"], "origen": anchors["grid"]["origin"]},
+                   "der": {"archivo": anchors["right"]["file"], "origen": anchors["right"]["origin"]}},
+        "ensanchar_px": 140, "intervalo_tecla": 0.12, "pausa": 0.01, "lector": "portapapeles",
+        "verificar_mnemo": True,
+    }
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    cfg = Config.load(path)
+    assert cfg.reader == "clipboard" and cfg.widen_px == 140 and set(cfg.anchors) == {"grid", "right"}
+    assert cfg.points["row1"] == [45, Y1] and cfg.anchors["grid"]["origin"] == anchors["grid"]["origin"]
+    fake = FakeSophis(shift=(30, 10), clipboard=True)
+    a = Automator(fake, ocr, cfg, log=lambda *_: None)
+    a.prepare()
+    assert a.open_contract("ZQK").term == "Future" and fake.dialog
 
-class _PgFalso:
+
+# ── two single clicks in a row must not become a double click ───────────────
+
+class _FakePyAutoGui:
     FAILSAFE = False
     PAUSE = 0
 
     def __init__(self):
-        self.eventos = []
+        self.events = []
 
     def moveTo(self, *a, **k):
         pass
 
     def click(self):
-        self.eventos.append(("click", sa.time.monotonic()))
+        self.events.append(("click", sa.time.monotonic()))
 
     def doubleClick(self, **k):
-        self.eventos.append(("doble", sa.time.monotonic()))
+        self.events.append(("double", sa.time.monotonic()))
 
 
-def test_dos_clics_sencillos_quedan_separados(monkeypatch):
+def test_two_single_clicks_are_kept_apart(monkeypatch):
     import sys
-    pg = _PgFalso()
+    pg = _FakePyAutoGui()
     monkeypatch.setitem(sys.modules, "pyautogui", pg)
-    reloj = {"t": 1000.0}
-    esperas = []
-    monkeypatch.setattr(sa.time, "monotonic", lambda: reloj["t"])
-    monkeypatch.setattr(sa.time, "sleep", lambda s: (esperas.append(s), reloj.__setitem__("t", reloj["t"] + s)))
-    p = sa.Pantalla()
-    p.click(10, 10)
-    reloj["t"] += 0.4                   # el script solo espera 0.4 s entre clics (menos que el doble clic de Windows)
-    p.click(10, 10)
-    t1, t2 = (e[1] for e in pg.eventos)
-    assert t2 - t1 >= p._intervalo_doble + 0.1
-    assert esperas, "debió esperar antes del segundo clic"
+    clock = {"t": 1000.0}
+    waits = []
+    monkeypatch.setattr(sa.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(sa.time, "sleep", lambda s: (waits.append(s), clock.__setitem__("t", clock["t"] + s)))
+    screen = sa.Screen()
+    screen.click(10, 10)
+    clock["t"] += 0.4                   # the script only waits 0.4 s between clicks (less than Windows' double-click time)
+    screen.click(10, 10)
+    t1, t2 = (e[1] for e in pg.events)
+    assert t2 - t1 >= screen._double_interval + 0.1
+    assert waits, "it should have waited before the second click"
 
 
-def test_clics_ya_separados_no_esperan(monkeypatch):
+def test_clicks_that_are_already_apart_do_not_wait(monkeypatch):
     import sys
-    pg = _PgFalso()
+    pg = _FakePyAutoGui()
     monkeypatch.setitem(sys.modules, "pyautogui", pg)
-    reloj = {"t": 1000.0}
-    esperas = []
-    monkeypatch.setattr(sa.time, "monotonic", lambda: reloj["t"])
-    monkeypatch.setattr(sa.time, "sleep", lambda s: esperas.append(s))
-    p = sa.Pantalla()
-    p.click(10, 10)
-    reloj["t"] += 5
-    p.click(10, 10)
-    assert not esperas
+    clock = {"t": 1000.0}
+    waits = []
+    monkeypatch.setattr(sa.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(sa.time, "sleep", lambda s: waits.append(s))
+    screen = sa.Screen()
+    screen.click(10, 10)
+    clock["t"] += 5
+    screen.click(10, 10)
+    assert not waits
