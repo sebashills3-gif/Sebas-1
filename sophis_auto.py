@@ -276,15 +276,35 @@ def clean_cell(img: Image.Image):
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     keep = np.zeros_like(mask)
     glyphs = 0
+    tiny = []                                               # 1-pixel dots: decimal points, commas (or noise)
     for i in range(1, n):
         x, y, cw, ch, area = stats[i]
         touches_edge = x <= 0 or y <= 0 or x + cw >= w or y + ch >= h
         is_line = (cw <= 1 and ch >= 0.7 * h) or (ch <= 1 and cw >= 0.7 * w)
         is_frame = cw > 0.55 * w and ch > 0.6 * h
-        if touches_edge or is_line or is_frame or area < 2:
+        if touches_edge or is_line or is_frame:
+            continue
+        if area < 2:
+            tiny.append(i)
             continue
         keep[labels == i] = 1
         glyphs += 1
+    if glyphs:
+        # A '.' or ',' inside a number ("100.00") is a component of a pixel or two. Keep such dots only where they
+        # can be part of the text: inside the box of the real characters (the focus rectangle's dotted outline and
+        # other specks lie outside it). They are not counted as glyphs.
+        ys, xs = np.nonzero(keep)
+        x0, x1, y0, y1 = xs.min() - 1, xs.max() + 1, ys.min() - 1, ys.max() + 1
+        for i in tiny:
+            x, y, cw, ch, area = stats[i]
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                keep[labels == i] = 1
+        soft = (np.abs(g.astype(np.int16) - background) > 28).astype(np.uint8)       # faint, anti-aliased dots
+        sn, slabels, sstats, _ = cv2.connectedComponentsWithStats(soft, connectivity=8)
+        for i in range(1, sn):
+            x, y, cw, ch, area = sstats[i]
+            if area <= 6 and x0 <= x <= x1 and y0 <= y <= y1 and not keep[slabels == i].any():
+                keep[slabels == i] = 1
     if glyphs == 0:
         return np.full_like(g, 255), 0
     core = g[keep > 0].astype(np.float32)               # the pixels of the letters themselves
@@ -1528,20 +1548,66 @@ class Automator:
                 return value, readings
         return None, readings
 
+    def _cell_box(self, win: UpdateWindow, x: int, y: int, half: int) -> tuple[int, int, int, int]:
+        h = max(3, int(win.pitch / 2) - 2)
+        return (x - half, y - h, x + half, y + h)
+
+    def _open_cell_for_editing(self, win: UpdateWindow, row: WindowRow, column: str, x: int, half: int) -> bool:
+        """Gets the Minimum / Maximum cell into edit mode and CHECKS that it is in edit mode before anything is
+        typed. A double click on a row that is not selected yet only selects it (the editor never opens), and typing
+        then just jumps through the list instead of filling the cell, so the order is: ONE click to select the
+        cell, then a double click, then (if still not open) a slower double click, then F2. "Open" means the
+        cell visibly changed (it turns into an edit box). Returns False if it never opened."""
+        y = row.cy
+        box = self._cell_box(win, x, y, half)
+        self.s.click(x, y)
+        self._wait(0.6)
+        self._trace(f"{column}_1b_selected")
+        base = median_color(self.s.capture(box))
+
+        def editing() -> bool:
+            return color_distance(median_color(self.s.capture(box)), base) > 45
+
+        if editing():                                   # (a click on an already selected cell can open it)
+            return True
+        for how in ("double click", "double click again, slower", "F2"):
+            if how == "double click":
+                self.s.double_click(x, y)
+            elif how.startswith("double click again"):
+                self._wait(0.8)
+                self.s.double_click(x, y)
+            else:
+                self.s.press("f2")
+            self._wait(0.6)
+            self._trace(f"{column}_2_after_{how.split(',')[0].replace(' ', '_')}")
+            if editing():
+                self.log(f"    the cell opened for editing ({how})")
+                return True
+            self.log(f"    the cell did not open after: {how}")
+        return False
+
     def write_cell(self, win: UpdateWindow, row: WindowRow, column: str, value: str, commit: str = "title",
-                   verify: bool = True) -> str:
-        """Double click the cell, replace its content with `value`, click outside to commit, and read the cell
-        back. Returns "ok", "unverified" (could not read the cell) or raises if it shows another value."""
+                   verify: bool = True, check_edit: bool = True) -> str:
+        """Open the cell for editing (checked), replace its content with `value`, click outside to commit, and read
+        the cell back. Returns "ok", "unverified" (could not read the cell) or raises if it shows another value, or
+        if the cell would not open (then NOTHING is typed, unless check_edit is False)."""
         x = win.x_minimum if column == "minimum" else win.x_maximum
         other = win.x_maximum if column == "minimum" else (win.x_ric or win.x_maximum + (win.x_maximum - win.x_minimum))
         half = max(8, int(0.4 * abs(other - x)))
-        self.log(f"  {column} of {row.date:%d %b %Y}: double click at ({x}, {row.cy}), typing {value!r}")
+        self.log(f"  {column} of {row.date:%d %b %Y}: opening the cell at ({x}, {row.cy}) to type {value!r}")
         self._trace(f"{column}_1_before")
-        self.s.double_click(x, row.cy)
-        self._wait(0.5)
-        self._trace(f"{column}_2_after_double_click")
-        self.s.hotkey("ctrl", "a")                  # replace whatever the cell held
-        self._wait(0.15)
+        existing, _ = self._read_cell_number(win, x, row.cy, half) if verify else (None, [])
+        if not self._open_cell_for_editing(win, row, column, x, half):
+            if check_edit:
+                path = self.save_debug(f"cell_would_not_open_{column}", self.s.capture())
+                raise SophisError(
+                    f"The {column} cell of {row.date:%d %b %Y} did not open for editing (tried: select + double click, "
+                    "slower double click, F2). NOTHING was typed. If your editor does not look different when it is "
+                    f"open, run again with --no-edit-check. Screenshot: {path}")
+            self.log("    WARNING: could not tell whether the cell opened; typing anyway (--no-edit-check)")
+        if existing is not None:
+            self.s.hotkey("ctrl", "a")              # the cell already held a value: replace it
+            self._wait(0.15)
         self.s.type_text(str(value))
         self._wait(0.25)
         self._trace(f"{column}_3_typed")
@@ -1562,7 +1628,8 @@ class Automator:
         self.log(f"    {column} reads back as {seen:g}")
         return "ok"
 
-    def fill_values(self, entries: list, verify: bool = True, dry_run: bool = False, commit: str = "title") -> list:
+    def fill_values(self, entries: list, verify: bool = True, dry_run: bool = False, commit: str = "title",
+                    check_edit: bool = True) -> list:
         """Writes Minimum and Maximum for each entry in the open update window. The row is found again before
         every cell (the list may have scrolled). A date that appears more than once needs its `occurrence`;
         nothing is guessed. dry_run only locates the cells. It NEVER presses OK: the window is left open so you
@@ -1592,7 +1659,7 @@ class Automator:
                 t = self.locate_date(e.date, e.occurrence)
                 if t.ambiguous:
                     raise SophisError(f"{e.date:%d %b %Y} became ambiguous while writing; stopped.")
-                result[column] = self.write_cell(t.win, t.row, column, value, commit, verify)
+                result[column] = self.write_cell(t.win, t.row, column, value, commit, verify, check_edit)
             done.append(result)
         self.log("done. The window was left open: check the values and press OK yourself.")
         return done
@@ -1905,7 +1972,8 @@ def cmd_fill(args) -> None:
     a.trace = not args.no_trace
     _countdown_to_front(args)
     try:
-        results = a.fill_values(entries, verify=not args.no_verify, dry_run=args.dry_run, commit=args.commit_click)
+        results = a.fill_values(entries, verify=not args.no_verify, dry_run=args.dry_run, commit=args.commit_click,
+                                check_edit=not args.no_edit_check)
     except SophisError as e:
         print(f"\nERROR: {e}")
         sys.exit(1)
@@ -1925,6 +1993,8 @@ def main() -> None:
                    help="row to use for ALL entries whose date appears more than once (or write DATE#n)")
     s.add_argument("--dry-run", dest="dry_run", action="store_true", help="only locate the cells; click/type nothing")
     s.add_argument("--no-verify", dest="no_verify", action="store_true", help="do not read each cell back")
+    s.add_argument("--no-edit-check", dest="no_edit_check", action="store_true",
+                   help="type even if the cell did not visibly open for editing (default: stop and type nothing)")
     s.add_argument("--no-trace", dest="no_trace", action="store_true",
                    help="do not save a screenshot at every step (they go to sophis_debug/ by default)")
     s.add_argument("--commit-click", dest="commit_click", choices=["title", "ric"], default="title",

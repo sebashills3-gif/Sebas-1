@@ -150,6 +150,11 @@ class FakeSophis:
         self.sel_all = False   # Ctrl+A pressed inside the edit box
         self.corrupt = False   # simulate a grid that stores something else than what was typed
         self.ok_clicks = 0
+        self.dsel = 0          # selected row of the update window's grid (absolute index)
+        self.dcell = None      # focused cell (row number, column)
+        self.edit_mode = "double"   # how a cell opens: "double" | "select_first" | "f2" | "never"
+        self.stray = ""        # what was typed while NO cell was open (it only moves the selection)
+        self.keys = []         # hotkeys / key presses seen by the update window
 
     # drawing
     def _image(self):
@@ -203,13 +208,15 @@ class FakeSophis:
                 if n >= len(DATES):
                     break
                 y = HEADER_Y + PITCH * (k + 1)
-                selected = (n == 0)                                         # the first date starts highlighted
+                selected = (n == self.dsel)                                 # the first date starts highlighted
                 if selected:
                     d.rectangle((233, y - PITCH // 2 + 1, 659, y + PITCH // 2 - 1), fill=(10, 36, 106))
                 d.text((HX["Maturity"], y), DATES[n], fill=(255, 255, 255) if selected else (0, 0, 0), font=FONT,
                        anchor="mm")
                 for col in ("minimum", "maximum"):
                     x = HX[col.capitalize()]
+                    if self.dcell == (n, col) and self.cell_edit != (n, col):       # focused cell: light blue
+                        d.rectangle((x - 40, y - PITCH // 2 + 1, x + 40, y + PITCH // 2 - 1), fill=(170, 200, 235))
                     if self.cell_edit == (n, col):                                    # the open edit box
                         d.rectangle((x - 38, y - 9, x + 38, y + 9), fill=(255, 255, 255), outline=(0, 0, 0))
                         d.text((x, y), self.cell_buf, fill=(0, 0, 0), font=FONT, anchor="mm")
@@ -280,6 +287,9 @@ class FakeSophis:
             if 520 <= x <= 600 and 415 <= y <= 435:
                 self.ok_clicks += 1                             # (the script must never do this for now)
             self._commit_cell()                                 # any click outside an edit box commits it
+            cell = self._dialog_cell(x, y)
+            if cell:                                            # a click on a cell selects its row and focuses it
+                self.dsel, self.dcell = cell[0], cell
             return
         if self.popup:
             if 700 <= x <= 850 and 76 <= y <= 76 + 110:
@@ -307,7 +317,10 @@ class FakeSophis:
             self._commit_cell()
             cell = self._dialog_cell(x - self.dx, y - self.dy)
             if cell:
-                self.cell_edit, self.cell_buf, self.sel_all = cell, self.values.get(cell, ""), False
+                was_selected = (self.dsel == cell[0])
+                self.dsel, self.dcell = cell[0], cell
+                if self.edit_mode == "double" or (self.edit_mode == "select_first" and was_selected):
+                    self.cell_edit, self.cell_buf, self.sel_all = cell, self.values.get(cell, ""), False
             return
         i = self._row_at(x - self.dx, y - self.dy)
         if i is not None:                              # a double click opens the window; it does not edit
@@ -320,6 +333,13 @@ class FakeSophis:
             if self.sel_all:
                 self.cell_buf, self.sel_all = "", False          # Ctrl+A first: the typed text replaces the old
             self.cell_buf += text
+            return
+        if self.dialog:                                          # no cell open: typing only moves the selection
+            self.stray += text
+            for n, d_ in enumerate(DATES):
+                if d_.startswith(text[0]):
+                    self.dsel = n
+                    break
             return
         if self.editing is not None:                   # typing into the open edit box overwrites the cell
             self.edited += text
@@ -335,6 +355,11 @@ class FakeSophis:
                     break
 
     def press(self, key):
+        if self.dialog:
+            self.keys.append(key)
+            if key == "f2" and self.dcell and self.edit_mode == "f2" and self.cell_edit is None:
+                self.cell_edit, self.cell_buf, self.sel_all = self.dcell, self.values.get(self.dcell, ""), False
+            return
         if not self.popup and key == "down":
             self.sel = min(self.sel + 1, len(ROWS) - 1)
         elif self.popup and key == "home":
@@ -346,6 +371,7 @@ class FakeSophis:
 
     def hotkey(self, *keys):
         if tuple(keys) == ("ctrl", "a"):
+            self.keys.append("ctrl+a")
             self.sel_all = self.cell_edit is not None
             return
         if self.clipboard:
@@ -1180,21 +1206,25 @@ def test_fill_writes_minimum_and_maximum_of_the_chosen_row(ocr, anchors):
 
 def test_each_cell_is_double_clicked_typed_and_left_with_a_click_outside(ocr, anchors):
     a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")])
-    ev = [e for e in fake.events if e[0] in ("double", "type", "click") and e[0] != "scroll"]
+    ev = [e for e in fake.events if e[0] in ("double", "type", "click")]
     seq = [e[0] for e in ev]
-    assert seq == ["double", "type", "click", "double", "type", "click"]
+    # per cell: ONE click to select it, a double click to open it, type, one click outside to commit
+    assert seq == ["click", "double", "type", "click", "click", "double", "type", "click"]
     y = HEADER_Y + PITCH * 9
-    assert abs(ev[0][1] - HX["Minimum"]) <= 4 and abs(ev[0][2] - y) <= 3        # double click on Minimum
-    assert abs(ev[3][1] - HX["Maximum"]) <= 4 and abs(ev[3][2] - y) <= 3        # then on Maximum
-    assert ev[1][1] == "100" and ev[4][1] == "120"
-    for click in (ev[2], ev[5]):                                                 # the click outside: the window title
+    for sel, dbl in ((ev[0], ev[1]), (ev[4], ev[5])):
+        assert sel[1:] == dbl[1:]                                                # same cell for both
+    assert abs(ev[1][1] - HX["Minimum"]) <= 4 and abs(ev[1][2] - y) <= 3        # Minimum first
+    assert abs(ev[5][1] - HX["Maximum"]) <= 4 and abs(ev[5][2] - y) <= 3        # then Maximum
+    assert ev[2][1] == "100" and ev[6][1] == "120"
+    for click in (ev[3], ev[7]):                                                 # the click outside: the window title
         assert abs(click[2] - 158) <= 8
 
 
 def test_the_ric_cell_can_be_used_to_leave_a_cell_instead(ocr, anchors):
     a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")], commit="ric")
-    outside = [e for e in fake.events if e[0] == "click"]
-    assert outside and all(abs(e[1] - HX["Ric"]) <= 6 for e in outside)
+    kinds = [e[0] for e in fake.events]
+    outside = [fake.events[i] for i in range(1, len(kinds)) if kinds[i] == "click" and kinds[i - 1] == "type"]
+    assert len(outside) == 2 and all(abs(e[1] - HX["Ric"]) <= 6 for e in outside)
     assert fake.values[(8, "maximum")] == "120"
 
 
@@ -1451,3 +1481,91 @@ def test_fill_works_from_a_remembered_header_without_any_big_ocr(ocr, anchors):
     assert fake_b.values == {(7, "minimum"): "95", (7, "maximum"): "130"}
     screen = fake_b.capture().size
     assert not [c for c in counter.calls if c[0] * c[1] >= 0.2 * screen[0] * screen[1]]
+
+
+# ── the cell must really be open before anything is typed ───────────────────
+
+def _grid(ocr, anchors, mode, **kw):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.dialog, fake.edit_mode = True, mode
+    return a, fake, lines
+
+
+def test_a_double_click_on_an_unselected_row_only_selects_so_the_cell_is_selected_first(ocr, anchors):
+    """The reported bug: double click on a row that is not selected yet never opens the editor."""
+    a, fake, lines = _grid(ocr, anchors, "select_first")
+    assert fake.dsel == 0
+    a.fill_values([sa.parse_entry("30 Nov 2026", "100", "120")])               # row 8 is NOT the selected row
+    assert fake.values == {(8, "minimum"): "100", (8, "maximum"): "120"} and fake.stray == ""
+
+
+def test_the_old_way_double_click_only_would_have_failed_here(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "select_first")
+    fake.double_click(HX["Minimum"], HEADER_Y + PITCH * 9)                      # what the old code did first
+    assert fake.cell_edit is None and fake.dsel == 8                            # selected, but not open
+
+
+def test_f2_is_tried_when_double_click_does_not_open_the_cell(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "f2")
+    a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
+    assert fake.values == {(7, "minimum"): "95", (7, "maximum"): "130"} and "f2" in fake.keys and fake.stray == ""
+
+
+def test_if_the_cell_never_opens_nothing_is_typed(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, lines = _grid(ocr, anchors, "never")
+    with pytest.raises(SophisError, match="did not open for editing.*NOTHING was typed.*--no-edit-check"):
+        a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
+    assert not [e for e in fake.events if e[0] == "type"] and fake.stray == "" and fake.values == {}
+    assert fake.dsel == 7                                                       # it only selected the row
+
+
+def test_no_edit_check_types_anyway(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "never")
+    a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")], check_edit=False, verify=False)
+    assert fake.stray == "95130" and [e for e in fake.events if e[0] == "type"]   # typed (and went nowhere here)
+    assert any("typing anyway" in l for l in lines)
+
+
+def test_ctrl_a_is_only_used_when_the_cell_already_holds_a_value(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "double")
+    a.fill_values([sa.parse_entry("30 Nov 2026", "100", "120")])               # empty cells
+    assert "ctrl+a" not in fake.keys
+    fake.values[(8, "minimum")] = "55"
+    a.fill_values([sa.parse_entry("30 Nov 2026", "77", "120")])                # Minimum now holds 55
+    assert fake.keys.count("ctrl+a") == 1 and fake.values[(8, "minimum")] == "77"
+
+
+def test_an_already_selected_row_works_too(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "select_first")
+    a.fill_values([sa.parse_entry("19 Oct 2026", "1", "2")])                    # row 0 is the selected one
+    assert fake.values == {(0, "minimum"): "1", (0, "maximum"): "2"} and fake.stray == ""
+
+
+def test_cli_no_edit_check_option(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(sa, "cmd_fill", lambda args: seen.update(flag=args.no_edit_check))
+    monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "fill", "--entry", "20 Nov 2026", "1", "2", "--no-edit-check"])
+    sa.main()
+    assert seen == {"flag": True}
+
+
+# ── decimal points must survive the cell cleaning ("100.00" used to be read as "10000") ──
+
+@pytest.mark.parametrize("text,value", [("100.00", 100.0), ("95.50", 95.5), ("1234.50", 1234.5), ("0.25", 0.25),
+                                        ("120.00", 120.0), ("7.00", 7.0), ("15.75", 15.75)])
+@pytest.mark.parametrize("dark", [False, True])
+def test_numbers_with_decimals_are_read_back_whole(ocr, text, value, dark):
+    readings, glyphs = ocr.read_cell(_cell(text, dark=dark))
+    assert any(sa.parse_number(r) == value for r in readings), readings
+
+
+def test_the_dotted_focus_rectangle_is_not_mistaken_for_decimal_points(ocr):
+    cell = _cell("100", dark=False)
+    d = ImageDraw.Draw(cell)
+    for x in range(3, cell.width - 12, 3):                              # a dotted focus rectangle around the text
+        d.point((x, 1), fill=(0, 0, 0))
+        d.point((x, cell.height - 2), fill=(0, 0, 0))
+    readings, glyphs = ocr.read_cell(cell)
+    assert any(sa.parse_number(r) == 100.0 for r in readings), readings
+    assert glyphs == 3
