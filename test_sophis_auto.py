@@ -1291,9 +1291,19 @@ def test_a_repeated_date_with_its_occurrence(ocr, anchors, which, row):
     assert fake.values == {(row, "minimum"): "5", (row, "maximum"): "6"}
 
 
+def test_a_misread_cell_only_warns_and_the_maximum_is_still_written(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.dialog, fake.corrupt = True, True                   # reads back as 101 when 100 was typed
+    a.fill_values([sa.parse_entry("23 Oct 2026", "100", "120")])
+    assert (1, "maximum") in fake.values                     # did not stop after the Minimum
+    assert any("WARNING" in l and "read back as 101" in l for l in lines)
+
+
 def test_a_value_that_did_not_take_stops_everything(ocr, anchors, tmp_path, monkeypatch):
     monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
     a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    a.strict_verify = True
     fake.dialog, fake.corrupt = True, True                   # the grid stores 101 when 100 was typed
     with pytest.raises(SophisError, match="shows 101.0 but 100.0 was typed"):
         a.fill_values([sa.parse_entry("23 Oct 2026", "100", "120"), sa.parse_entry("27 Nov 2026", "1", "2")])
@@ -1668,3 +1678,16 @@ def test_the_error_when_a_cell_never_opens_says_what_the_cell_looked_like(ocr, a
     a, fake, lines = _grid(ocr, anchors, "never")
     with pytest.raises(SophisError, match="cell color after selecting it"):
         a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
+
+
+def test_an_unreadable_neighbour_row_is_taken_as_the_next_occurrence(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    real = a.read_update_window()
+    target = D("20 Nov 2026")
+    second = next(r for r in real.rows if r.index == 6)
+    second.date, second.text = None, "?"                     # the highlighted duplicate could not be read
+    a.read_update_window = lambda: real
+    t = a.locate_date(target, occurrence=1)
+    assert t.row.index == 6
+    with pytest.raises(SophisError, match="no occurrence 3"):
+        a.locate_date(target, occurrence=3)

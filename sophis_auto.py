@@ -814,6 +814,7 @@ class Automator:
         self._screen_width = 10 ** 6
         self._win_cache: dict | None = None    # what is known about the update window (see read_update_window)
         self.trace = False                      # save a screenshot at every step of fill_values
+        self.strict_verify = False              # True: stop if a cell reads back as another value (default: warn)
         self._trace_n = 0
         self._first_click_done = False
         self._last_typed_at = -1e9
@@ -1485,8 +1486,7 @@ class Automator:
             if matches:
                 win, matches = self._reveal_duplicates(win, target)
                 if occurrence is not None and occurrence >= len(matches):
-                    raise SophisError(f"{target:%d %b %Y} appears {len(matches)} time(s); there is no occurrence "
-                                      f"{occurrence} (0 is the first).")
+                    win, matches = self._more_occurrences(win, target, occurrence, matches)
                 row = matches[occurrence or 0]
                 return CellTarget(row, (win.x_minimum, row.cy), (win.x_maximum, row.cy), matches,
                                   ambiguous=len(matches) > 1 and occurrence is None, win=win)
@@ -1508,6 +1508,37 @@ class Automator:
             self.s.scroll(-3 if down else 3, win.x_maturity, mid)
             self._wait(0.7)
         raise SophisError(f"{target:%d %b %Y} was not found after {max_scrolls} scrolls.")
+
+    def _more_occurrences(self, win: UpdateWindow, target: dt.date, occurrence: int, matches: list):
+        """The wanted occurrence was not read. The rows of a repeated date are neighbours, so a re-read may find
+        the missing one, and a row next to the known ones whose date could not be read at all (typically the row
+        that is highlighted) is taken as the next occurrence. Raises only if neither gives that occurrence."""
+        for attempt in (1, 2):
+            self.log(f"  {target:%d %b %Y}: only {len(matches)} row(s) read but occurrence {occurrence} was asked; "
+                     f"reading again ({attempt}/2)")
+            self._wait(0.8)
+            win = self.read_update_window()
+            matches = win.find(target)
+            if occurrence < len(matches):
+                return win, matches
+        by_index = {r.index: r for r in win.rows}
+        chain = sorted(matches, key=lambda r: r.index)
+        while chain and len(chain) <= occurrence:
+            nxt = by_index.get(chain[-1].index + 1)
+            prv = by_index.get(chain[0].index - 1)
+            if nxt is not None and nxt.date is None:
+                chain.append(nxt)
+            elif prv is not None and prv.date is None:
+                chain.insert(0, prv)
+            else:
+                break
+        if occurrence < len(chain):
+            guessed = [r.index for r in chain if r.date is None]
+            self.log(f"  WARNING: the row(s) {guessed} next to {target:%d %b %Y} could not be read; taking "
+                     f"them as the next occurrence(s) of that date")
+            return win, chain
+        raise SophisError(f"{target:%d %b %Y} appears {len(matches)} time(s); there is no occurrence "
+                          f"{occurrence} (0 is the first).")
 
     def _reveal_duplicates(self, win: UpdateWindow, target: dt.date) -> tuple[UpdateWindow, list]:
         """The same date can appear on several adjacent rows. If the date sits on the first or last visible row,
@@ -1637,12 +1668,18 @@ class Automator:
         if seen is None:
             self.log(f"    WARNING: could not read the {column} cell back (OCR gave {readings}); check it by eye")
             return "unverified"
-        if abs(seen - wanted) > 1e-9:
-            path = self.save_debug(f"cell_mismatch_{column}")
+        if any(abs(v - wanted) <= 1e-9 for v in (parse_number(r) for r in readings) if v is not None):
+            self.log(f"    {column} reads back as {wanted:g}")
+            return "ok"
+        # The text of a committed cell is often light on a light-blue background and the last digit can be lost,
+        # so a different reading is NOT proof of a wrong value: say so and go on (strict_verify stops instead).
+        path = self.save_debug(f"cell_mismatch_{column}")
+        if self.strict_verify:
             raise SophisError(f"The {column} cell of {row.date:%d %b %Y} shows {seen} but {wanted} was typed "
                               f"(OCR readings: {readings}). Stopped before touching anything else. Screenshot: {path}")
-        self.log(f"    {column} reads back as {seen:g}")
-        return "ok"
+        self.log(f"    WARNING: the {column} cell was read back as {seen:g} (OCR {readings}) but {wanted:g} was typed; "
+                 f"probably a misread, going on - check it by eye. Screenshot: {path}")
+        return "unverified"
 
     def _reuse_row(self, previous: CellTarget, view) -> CellTarget | None:
         """Same row, next cell: one quick read is enough IF the list looks exactly as before. Enter may have moved
@@ -2007,6 +2044,7 @@ def cmd_fill(args) -> None:
         sys.exit(2)
     a = _create(args)
     a.trace = not args.no_trace
+    a.strict_verify = args.strict_verify
     _countdown_to_front(args)
     try:
         results = a.fill_values(entries, verify=not args.no_verify, dry_run=args.dry_run, commit=args.commit_click,
@@ -2030,6 +2068,9 @@ def main() -> None:
                    help="row to use for ALL entries whose date appears more than once (or write DATE#n)")
     s.add_argument("--dry-run", dest="dry_run", action="store_true", help="only locate the cells; click/type nothing")
     s.add_argument("--no-verify", dest="no_verify", action="store_true", help="do not read each cell back")
+    s.add_argument("--strict-verify", dest="strict_verify", action="store_true",
+                   help="stop if a cell reads back as a different number (default: warn and go on, because the "
+                        "OCR often misreads the committed cell)")
     s.add_argument("--no-edit-check", dest="no_edit_check", action="store_true",
                    help="type even if the cell did not visibly open for editing (default: stop and type nothing)")
     s.add_argument("--no-trace", dest="no_trace", action="store_true",
