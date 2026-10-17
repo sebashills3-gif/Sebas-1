@@ -1409,8 +1409,9 @@ def test_fill_saves_a_picture_of_every_step_when_tracing(ocr, anchors, tmp_path,
     fake.dialog, a.trace = True, True
     a.fill_values([sa.parse_entry("30 Nov 2026", "100", "120")])
     names = sorted(p.name for p in tmp_path.glob("*fill*.png"))
-    assert len(names) == 8                                       # 4 steps x 2 cells
-    assert any("minimum_2_after_double_click" in n for n in names) and any("maximum_4_committed" in n for n in names)
+    assert len(names) == 10                                      # 5 steps x 2 cells
+    assert any("minimum_1b_selected" in n for n in names) and any("minimum_2_after_double_click" in n for n in names)
+    assert any("maximum_3_typed" in n for n in names) and any("maximum_4_committed" in n for n in names)
 
 
 def test_without_tracing_no_step_pictures_are_saved(ocr, anchors, tmp_path, monkeypatch):
@@ -1531,8 +1532,10 @@ def test_ctrl_a_is_only_used_when_the_cell_already_holds_a_value(ocr, anchors):
     a, fake, lines = _grid(ocr, anchors, "double")
     a.fill_values([sa.parse_entry("30 Nov 2026", "100", "120")])               # empty cells
     assert "ctrl+a" not in fake.keys
-    fake.values[(8, "minimum")] = "55"
-    a.fill_values([sa.parse_entry("30 Nov 2026", "77", "120")])                # Minimum now holds 55
+    fake.keys.clear()
+    fake.values[(8, "minimum")] = "55"                                         # only Minimum holds a value now
+    del fake.values[(8, "maximum")]
+    a.fill_values([sa.parse_entry("30 Nov 2026", "77", "120")])
     assert fake.keys.count("ctrl+a") == 1 and fake.values[(8, "minimum")] == "77"
 
 
