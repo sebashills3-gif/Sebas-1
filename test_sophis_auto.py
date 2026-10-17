@@ -370,6 +370,12 @@ def ocr():
     return OCR()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_anchor_dir(tmp_path_factory, monkeypatch):
+    """The update window's header template is remembered on disk; every test gets its own empty folder."""
+    monkeypatch.setattr(sa, "ANCHOR_DIR", tmp_path_factory.mktemp("anchor_dir") / "sophis_anchors")
+
+
 @pytest.fixture(scope="module")
 def anchors(tmp_path_factory):
     """Calibration: crops of the two anchors taken with the window at its original position."""
@@ -1294,3 +1300,154 @@ def test_cli_fill_without_entries_explains_itself(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         sa.main()
     assert e.value.code == 2 and "--entry" in capsys.readouterr().out
+
+
+# ── robustness of reading the update window (it used to depend on one full-screen OCR every time) ──
+
+class _CountingOCR:
+    """Wraps the real OCR and counts how big each `read` was, so the tests can see what is OCR'd and how often."""
+
+    def __init__(self, real):
+        self.real, self.calls, self.fail_next = real, [], 0
+
+    def read(self, img, *args, **kwargs):
+        self.calls.append(img.size)
+        if self.fail_next > 0:
+            self.fail_next -= 1
+            return []
+        return self.real.read(img, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def _window_with_counting_ocr(ocr, anchors, **kw):
+    a, fake = _open_window(ocr, anchors, **kw)
+    counter = _CountingOCR(ocr)
+    a.ocr = counter
+    return a, fake, counter
+
+
+def test_after_the_first_look_the_header_is_followed_as_an_image_not_with_full_screen_ocr(ocr, anchors):
+    a, fake, counter = _window_with_counting_ocr(ocr, anchors)
+    a.read_update_window()
+    first = len(counter.calls)
+    counter.calls.clear()
+    win = a.read_update_window()
+    assert first >= 1 and len(win.dated()) == VISIBLE
+    screen = fake.capture().size
+    assert all(w * h < 0.25 * screen[0] * screen[1] for w, h in counter.calls), counter.calls   # strips only
+    assert len(counter.calls) <= 3                                                          # strip + a few row slots
+
+
+def test_the_followed_header_tracks_the_window_when_it_moves_between_reads(ocr, anchors):
+    a, fake, counter = _window_with_counting_ocr(ocr, anchors)
+    first = a.read_update_window()
+    fake.dx, fake.dy = 35, 22                                    # the window is dragged somewhere else
+    moved = a.read_update_window()
+    assert moved.x_minimum - first.x_minimum == 35 and moved.header_y - first.header_y == 22
+    assert [r.date for r in moved.rows] == [r.date for r in first.rows]
+
+
+def test_a_failed_read_is_retried_instead_of_aborting_everything(ocr, anchors):
+    a, fake, counter = _window_with_counting_ocr(ocr, anchors)
+    a.read_update_window()                                       # the window is known now
+    counter.fail_next = 1                                        # the next OCR pass sees nothing (screen redraw...)
+    win = a.read_update_window()
+    assert len(win.dated()) == VISIBLE
+
+
+def test_a_header_missed_by_the_whole_screen_pass_is_found_in_tiles(ocr, anchors):
+    a, fake, counter = _window_with_counting_ocr(ocr, anchors)
+    counter.fail_next = 1                                        # the whole-screen pass fails; the tiles must work
+    win = a.read_update_window()
+    assert abs(win.x_minimum - HX["Minimum"]) <= 4 and len(win.dated()) == VISIBLE
+
+
+def test_when_the_header_cannot_be_found_you_get_the_screenshot_and_what_the_ocr_read(ocr, anchors, tmp_path,
+                                                                                     monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake = make(ocr, anchors, reader="ocr")                   # update window not open
+    with pytest.raises(SophisError, match="what the OCR read"):
+        a.read_update_window()
+    assert list(tmp_path.glob("*update_window_header_not_found.png")) and list(tmp_path.glob("*ocr_lines.txt"))
+
+
+def test_fill_saves_a_picture_of_every_step_when_tracing(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.dialog, a.trace = True, True
+    a.fill_values([sa.parse_entry("30 Nov 2026", "100", "120")])
+    names = sorted(p.name for p in tmp_path.glob("*fill*.png"))
+    assert len(names) == 8                                       # 4 steps x 2 cells
+    assert any("minimum_2_after_double_click" in n for n in names) and any("maximum_4_committed" in n for n in names)
+
+
+def test_without_tracing_no_step_pictures_are_saved(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.dialog = True
+    a.fill_values([sa.parse_entry("30 Nov 2026", "100", "120")])
+    assert not list(tmp_path.glob("*fill*.png"))
+
+
+def test_fill_reads_the_window_with_strips_not_with_the_whole_screen_every_time(ocr, anchors):
+    a, fake, counter = _window_with_counting_ocr(ocr, anchors)
+    a.fill_values([sa.parse_entry("30 Nov 2026", "100", "120")])
+    screen = fake.capture().size
+    big = [c for c in counter.calls if c[0] * c[1] >= 0.25 * screen[0] * screen[1]]
+    assert len(big) <= 1 + 6 + 6, big                            # only the first look may use the full screen / tiles
+
+
+# ── the header is learned once and remembered between runs ──────────────────
+
+def test_the_header_is_remembered_on_disk_after_the_first_good_read(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    a.read_update_window()
+    png, meta = a._window_cache_files()
+    assert png.exists() and meta.exists()
+    saved = json.loads(meta.read_text())
+    assert saved["pitch"] and saved["n_rows"] and saved["header"]["maturity"]
+
+
+def test_a_later_run_reads_the_window_even_if_the_ocr_cannot_find_the_header_words(ocr, anchors):
+    """The reported failure: header words not recognized this time. After one good read, that no longer matters."""
+    a, fake = _open_window(ocr, anchors)
+    a.read_update_window()                                          # run 1: learns the header
+    b, fake_b = make(ocr, anchors, reader="ocr")                    # run 2: a brand new Automator, same folder
+    fake_b.dialog = True
+    counter = _CountingOCR(ocr)
+    b.ocr = counter
+    screen = fake_b.capture().size
+    real_read = counter.real.read
+
+    def read_but_blind_on_big_images(img, *args, **kwargs):          # whole-screen / tile OCR sees nothing
+        counter.calls.append(img.size)
+        return [] if img.size[0] * img.size[1] >= 0.2 * screen[0] * screen[1] else real_read(img, *args, **kwargs)
+    counter.read = read_but_blind_on_big_images
+    win = b.read_update_window()
+    assert [r.date for r in win.rows] == [D(t) for t in DATES[:VISIBLE]]
+
+
+def test_a_remembered_header_that_no_longer_matches_is_relearned(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    a.read_update_window()
+    png, _ = a._window_cache_files()
+    Image.new("RGB", (120, 20), (0, 0, 0)).save(png)                # a stale / wrong template
+    b, fake_b = make(ocr, anchors, reader="ocr")
+    fake_b.dialog = True
+    win = b.read_update_window()                                     # falls back to OCR and relearns
+    assert len(win.dated()) == VISIBLE and Image.open(png).size != (120, 20)
+
+
+def test_fill_works_from_a_remembered_header_without_any_big_ocr(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    a.read_update_window()
+    b, fake_b = make(ocr, anchors, reader="ocr")
+    fake_b.dialog = True
+    counter = _CountingOCR(ocr)
+    b.ocr = counter
+    b.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
+    assert fake_b.values == {(7, "minimum"): "95", (7, "maximum"): "130"}
+    screen = fake_b.capture().size
+    assert not [c for c in counter.calls if c[0] * c[1] >= 0.2 * screen[0] * screen[1]]

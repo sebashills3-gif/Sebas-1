@@ -442,6 +442,7 @@ class CellTarget:
     maximum: tuple
     matches: list             # every row that has this date
     ambiguous: bool           # more than one row has this date and no `occurrence` was chosen
+    win: "UpdateWindow | None" = None   # the view of the window the cells were found in
 
 
 def median_color(img: Image.Image) -> tuple:
@@ -495,10 +496,12 @@ def locate_template(screenshot: Image.Image, template: Image.Image) -> tuple[int
 
     a = cv2.cvtColor(np.asarray(screenshot.convert("RGB")), cv2.COLOR_RGB2GRAY)
     t = cv2.cvtColor(np.asarray(template.convert("RGB")), cv2.COLOR_RGB2GRAY)
-    if t.shape[0] > a.shape[0] or t.shape[1] > a.shape[1]:
-        return 0, 0, 0.0
+    if t.shape[0] > a.shape[0] or t.shape[1] > a.shape[1] or float(t.std()) < 1.0:
+        return 0, 0, 0.0                                  # too big, or a flat image that matches "everywhere"
     res = cv2.matchTemplate(a, t, cv2.TM_CCOEFF_NORMED)
     _, best, _, pos = cv2.minMaxLoc(res)
+    if not np.isfinite(best):
+        return 0, 0, 0.0
     return int(pos[0]), int(pos[1]), float(best)
 
 
@@ -789,6 +792,9 @@ class Automator:
         self._widened = False          # the widening was already attempted this session
         self._widened_by = 0           # how many px Term's right border was dragged
         self._screen_width = 10 ** 6
+        self._win_cache: dict | None = None    # what is known about the update window (see read_update_window)
+        self.trace = False                      # save a screenshot at every step of fill_values
+        self._trace_n = 0
         self._first_click_done = False
         self._last_typed_at = -1e9
         self._clipboard_works = True
@@ -1253,30 +1259,131 @@ class Automator:
         return Result(str(shown), term, i, window)
 
     # ── stage 2: find where the values go in the update window (nothing is clicked or typed) ──
-    def read_update_window(self) -> UpdateWindow:
-        """Reads the open update window: the Maturity / Minimum / Maximum / Ric columns and the date of every
-        visible row, with the on-screen position of each. Read-only."""
-        shot = self.s.capture()
-        lines = self.ocr.read(shot, scale=2, margin=8)
-        header = find_header(lines)
-        if header is None:
-            path = self.save_debug("update_window_header_not_found", shot)
-            raise SophisError("Could not find the Maturity | Minimum | Maximum | Ric header on screen. Is the "
-                              f"update window open and fully visible? Screenshot: {path}")
-        hy, xm = header["y"], header["maturity"]
-        half = 0.6 * (header["minimum"] - xm)                     # a bit less than half the Maturity column
+    def _ocr_tiled(self, shot: Image.Image, cols: int = 3, rows: int = 2, scale: int = 2) -> list:
+        """OCR a big screenshot in overlapping tiles. One pass over a whole high-resolution screen gets shrunk by
+        the text detector until small text is unreadable; tiles keep the text legible."""
+        w, h = shot.size
+        tw, th = w / cols, h / rows
+        ox, oy = int(tw * 0.15), int(th * 0.15)
+        lines = []
+        for r in range(rows):
+            for c in range(cols):
+                x0, y0 = max(0, int(c * tw) - ox), max(0, int(r * th) - oy)
+                x1, y1 = min(w, int((c + 1) * tw) + ox), min(h, int((r + 1) * th) + oy)
+                for l in self.ocr.read(shot.crop((x0, y0, x1, y1)), scale=scale, margin=8):
+                    lines.append(Line(l.text, l.conf, l.x0 + x0, l.y0 + y0, l.x1 + x0, l.y1 + y0))
+        return lines
 
-        found = []                                                # (cy, text, date, suffix) from the detector
-        for l in lines:
-            if l.cy > hy + 6 and abs(l.cx - xm) <= half:
-                date, suffix = parse_date(l.text)
-                if date:
-                    found.append((l.cy, l.text, date, suffix))
-        found.sort()
+    def _dump_lines(self, name: str, lines: list) -> Path:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        path = DEBUG_DIR / f"{time.strftime('%H%M%S')}_{name}.txt"
+        path.write_text("\n".join(f"{l.text!r:40} cx={l.cx} cy={l.cy} conf={l.conf:.2f}"
+                                  for l in sorted(lines, key=lambda l: (l.cy, l.cx))), encoding="utf-8")
+        return path
+
+    def _window_cache_files(self) -> tuple[Path, Path]:
+        return ANCHOR_DIR / "update_window.png", ANCHOR_DIR / "update_window.json"
+
+    def _load_window_cache(self) -> None:
+        """Remembers from an earlier run how the update window's header looks (see _save_window_cache)."""
+        png, meta = self._window_cache_files()
+        try:
+            if png.exists() and meta.exists():
+                m = json.loads(meta.read_text(encoding="utf-8"))
+                self._win_cache = {"template": Image.open(png).convert("RGB"), "origin": tuple(m["origin"]),
+                                   "header": m["header"], "extras": {k: tuple(v) if v else None
+                                                                     for k, v in m["extras"].items()},
+                                   "pitch": m.get("pitch"), "n_rows": m.get("n_rows")}
+        except (OSError, ValueError, KeyError):
+            self._win_cache = None
+
+    def _save_window_cache(self) -> None:
+        """Keeps the header template so that, once it has been read ONCE, later runs follow it as an image and
+        never depend on the OCR recognizing the header words again."""
+        c = self._win_cache
+        if not c:
+            return
+        try:
+            ANCHOR_DIR.mkdir(exist_ok=True)
+            png, meta = self._window_cache_files()
+            c["template"].save(png)
+            meta.write_text(json.dumps({"origin": list(c["origin"]), "header": c["header"],
+                                        "extras": {k: list(v) if v else None for k, v in c["extras"].items()},
+                                        "pitch": c["pitch"], "n_rows": c["n_rows"]}, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _find_window_header(self, shot: Image.Image) -> tuple[dict, dict, list | None]:
+        """Where the Maturity | Minimum | Maximum | Ric header is. The first time it is recognized with OCR (whole
+        screen, then in tiles). Afterwards it is followed as an IMAGE (template matching), which is fast and does
+        not depend on the OCR getting every word right each time. Returns (header, extras, ocr lines or None)."""
+        if self._win_cache is None:
+            self._load_window_cache()
+        cache = self._win_cache
+        if cache:
+            x, y, score = locate_template(shot, cache["template"])
+            if score >= 0.85:
+                dx, dy = x - cache["origin"][0], y - cache["origin"][1]
+                h = cache["header"]
+                header = {"y": h["y"] + dy, "maturity": h["maturity"] + dx, "minimum": h["minimum"] + dx,
+                          "maximum": h["maximum"] + dx, "ric": h["ric"] + dx if h["ric"] else None}
+                extras = {k: (v[0] + dx, v[1] + dy) if v else None for k, v in cache["extras"].items()}
+                return header, extras, None
+        lines, header = [], None
+        for attempt in range(4):                   # whole screen x2, whole screen x1, then tiles x2, tiles x3
+            lines = (self.ocr.read(shot, scale=2, margin=8) if attempt == 0
+                     else self.ocr.read(shot, scale=1, margin=8) if attempt == 1
+                     else self._ocr_tiled(shot, scale=2 if attempt == 2 else 3))
+            header = find_header(lines)
+            if header:
+                break
+        if header is None:
+            shot_path = self.save_debug("update_window_header_not_found", shot)
+            lines_path = self._dump_lines("update_window_ocr_lines", lines)
+            raise SophisError("Could not find the Maturity | Minimum | Maximum | Ric header on screen. Is the "
+                              f"update window open and fully visible? Screenshot: {shot_path}; what the OCR "
+                              f"read: {lines_path}")
+        hy = header["y"]
+        title = next((l for l in lines if l.cy < hy and len(_norm(l.text)) > 8 and contains_word(l.text, "Strikes")),
+                     None)
+        cancel = next((l for l in lines if l.cy > hy and len(_norm(l.text)) <= 8
+                       and _best_window(_norm(l.text), "cancel") >= 0.8), None)
+        ok = next((l for l in lines if l.cy > hy and _norm(l.text) == "ok"
+                   and (cancel is None or (abs(l.cy - cancel.cy) <= 12 and l.cx < cancel.cx))), None)
+        extras = {"title": (title.cx, title.cy) if title else None, "ok": (ok.cx, ok.cy) if ok else None,
+                  "cancel": (cancel.cx, cancel.cy) if cancel else None}
+        d = header["minimum"] - header["maturity"]
+        box = (max(0, int(header["maturity"] - 0.85 * d)), max(0, hy - 10),
+               min(shot.width, int(header["maximum"] + 0.8 * d)), min(shot.height, hy + 10))
+        self._win_cache = {"template": shot.crop(box), "origin": (box[0], box[1]), "header": header,
+                           "extras": extras, "pitch": None, "n_rows": None}
+        self._save_window_cache()
+        return header, extras, lines
+
+    def _read_update_window_once(self) -> UpdateWindow:
+        shot = self.s.capture()
+        header, extras, header_lines = self._find_window_header(shot)
+        cache = self._win_cache
+        hy, xm = header["y"], header["maturity"]
+        d = header["minimum"] - xm
+        half = 0.6 * d                                            # a bit less than half the Maturity column
+
+        # The dates are read from a thin strip over the Maturity column (fast, and the text is big in it).
+        pitch_guess = cache["pitch"] or 0.19 * d
+        n_hint = (cache["n_rows"] or 14) + 2
+        sx0, sy0 = int(xm - half), int(hy + pitch_guess * 0.5)
+        sy1 = min(shot.height, int(hy + pitch_guess * (n_hint + 0.5)))
+        strip_lines = [Line(l.text, l.conf, l.x0 + sx0, l.y0 + sy0, l.x1 + sx0, l.y1 + sy0)
+                       for l in self.ocr.read(shot.crop((sx0, sy0, int(xm + half), sy1)), scale=3, margin=8)]
+        found = self._dates_in(strip_lines, hy, xm, half)
+        if len(found) < 2 and header_lines:                       # first look: the whole-screen OCR can help
+            found = self._dates_in(header_lines, hy, xm, half)
         gaps = [b[0] - a[0] for a, b in zip(found, found[1:]) if 8 <= b[0] - a[0] <= 80]
         if not gaps:
             path = self.save_debug("update_window_no_dates", shot)
-            raise SophisError(f"Found the header but could not read at least two dates below it. Screenshot: {path}")
+            lines_path = self._dump_lines("update_window_strip_lines", strip_lines)
+            raise SophisError("Found the header but could not read at least two dates below it. "
+                              f"Screenshot: {path}; what the OCR read: {lines_path}")
         small = min(gaps)
         pitch = float(statistics.median([g for g in gaps if g <= 1.4 * small]))
 
@@ -1298,16 +1405,54 @@ class Automator:
                     by_index[idx] = WindowRow(idx, cy, text, date, suffix)
                     break
         rows = [by_index[i] for i in sorted(by_index)]
-        title = next((l for l in lines if l.cy < hy and len(_norm(l.text)) > 8 and contains_word(l.text, "Strikes")),
-                     None)
-        cancel = next((l for l in lines if l.cy > hy and len(_norm(l.text)) <= 8
-                       and _best_window(_norm(l.text), "cancel") >= 0.8), None)
-        ok = next((l for l in lines if l.cy > hy and _norm(l.text) == "ok"
-                   and (cancel is None or (abs(l.cy - cancel.cy) <= 12 and l.cx < cancel.cx))), None)
+        learned = cache["pitch"] is None
+        cache["pitch"], cache["n_rows"] = pitch, len(rows)
+        if learned:
+            self._save_window_cache()
         return UpdateWindow(hy, xm, header["minimum"], header["maximum"], header["ric"], pitch, rows, shot,
-                            title=(title.cx, title.cy) if title else None,
-                            ok=(ok.cx, ok.cy) if ok else None,
-                            cancel=(cancel.cx, cancel.cy) if cancel else None)
+                            title=extras["title"], ok=extras["ok"], cancel=extras["cancel"])
+
+    @staticmethod
+    def _dates_in(lines: list, hy: int, xm: int, half: float) -> list:
+        found = []
+        for l in lines:
+            if l.cy > hy + 6 and abs(l.cx - xm) <= half:
+                date, suffix = parse_date(l.text)
+                if date:
+                    found.append((l.cy, l.text, date, suffix))
+        return sorted(found)
+
+    def read_update_window(self) -> UpdateWindow:
+        """Reads the open update window: the Maturity / Minimum / Maximum / Ric columns and the date of every
+        visible row, with the on-screen position of each. Read-only. Once the window has been seen, a failed
+        read is retried (the screen may simply have been mid-redraw) before giving up."""
+        tries = 3
+        for k in range(1, tries + 1):
+            try:
+                return self._read_update_window_once()
+            except SophisError as e:
+                if k == tries:
+                    raise
+                self.log(f"  could not read the update window (attempt {k}/{tries}); trying again")
+                self._wait(1.0)
+        raise AssertionError("unreachable")
+
+    def _trace(self, step: str) -> None:
+        """With trace on, saves a picture of the window at each step so a failed run can be inspected."""
+        if not self.trace:
+            return
+        shot = self.s.capture()
+        c = self._win_cache
+        if c:
+            h, d = c["header"], c["header"]["minimum"] - c["header"]["maturity"]
+            p = c["pitch"] or 0.19 * d
+            box = (max(0, int(h["maturity"] - 2.2 * d)), max(0, int(h["y"] - 6 * p)),
+                   min(shot.width, int((h["ric"] or h["maximum"] + 2 * d) + 1.2 * d)),
+                   min(shot.height, int(h["y"] + ((c["n_rows"] or 14) + 4) * p)))
+            shot = shot.crop(box)
+        self._trace_n += 1
+        path = self.save_debug(f"fill{self._trace_n:02d}_{step}", shot)
+        self.log(f"    [trace] {path}")
 
     def locate_date(self, target: dt.date, occurrence: int | None = None, max_scrolls: int = 15) -> CellTarget:
         """Finds the row whose Maturity is `target` (scrolling the list if needed) and returns where its Minimum
@@ -1324,7 +1469,7 @@ class Automator:
                                       f"{occurrence} (0 is the first).")
                 row = matches[occurrence or 0]
                 return CellTarget(row, (win.x_minimum, row.cy), (win.x_maximum, row.cy), matches,
-                                  ambiguous=len(matches) > 1 and occurrence is None)
+                                  ambiguous=len(matches) > 1 and occurrence is None, win=win)
             dated = win.dated()
             if not dated:
                 raise SophisError("No dates could be read in the update window.")
@@ -1391,14 +1536,18 @@ class Automator:
         other = win.x_maximum if column == "minimum" else (win.x_ric or win.x_maximum + (win.x_maximum - win.x_minimum))
         half = max(8, int(0.4 * abs(other - x)))
         self.log(f"  {column} of {row.date:%d %b %Y}: double click at ({x}, {row.cy}), typing {value!r}")
+        self._trace(f"{column}_1_before")
         self.s.double_click(x, row.cy)
         self._wait(0.5)
+        self._trace(f"{column}_2_after_double_click")
         self.s.hotkey("ctrl", "a")                  # replace whatever the cell held
         self._wait(0.15)
         self.s.type_text(str(value))
         self._wait(0.25)
+        self._trace(f"{column}_3_typed")
         self.s.click(*self._commit_point(win, row, commit))
         self._wait(0.7)
+        self._trace(f"{column}_4_committed")
         if not verify:
             return "unverified"
         seen, readings = self._read_cell_number(win, x, row.cy, half)
@@ -1434,19 +1583,16 @@ class Automator:
         if dry_run:
             return [{"date": e.date, "row": t.row.index, "minimum": t.minimum, "maximum": t.maximum,
                      "written": False} for e, t in plan]
-        # 2) Write.
+        # 2) Write. The row is found again before every cell (the list may have scrolled), with a fresh read.
         for e, _ in plan:
             result = {"date": e.date, "minimum": None, "maximum": None, "written": True}
             for column, value in (("minimum", e.minimum), ("maximum", e.maximum)):
                 if value is None:
                     continue
-                win = self.read_update_window()
-                t = self.locate_date(e.date, e.occurrence)           # re-find the row: the list may have moved
+                t = self.locate_date(e.date, e.occurrence)
                 if t.ambiguous:
                     raise SophisError(f"{e.date:%d %b %Y} became ambiguous while writing; stopped.")
-                win = self.read_update_window()
-                row = next((r for r in win.rows if r.date == e.date and r.index == t.row.index), t.row)
-                result[column] = self.write_cell(win, row, column, value, commit, verify)
+                result[column] = self.write_cell(t.win, t.row, column, value, commit, verify)
             done.append(result)
         self.log("done. The window was left open: check the values and press OK yourself.")
         return done
@@ -1698,8 +1844,7 @@ def cmd_open_code(args) -> None:
 def cmd_window(args) -> None:
     """Reads the open update window and shows where each date's Minimum / Maximum cells are."""
     a = _create(args)
-    print("You have 3 seconds to bring the Sophis update window (Maturity / Minimum / Maximum) to the front ...")
-    time.sleep(3)
+    _countdown_to_front(args)
     try:
         win = a.read_update_window()
         print(f"\nColumns (x): Maturity {win.x_maturity} | Minimum {win.x_minimum} | Maximum {win.x_maximum} | "
@@ -1732,6 +1877,17 @@ def cmd_window(args) -> None:
         sys.exit(1)
 
 
+def _countdown_to_front(args) -> None:
+    """The screenshot is of what is on top: if the terminal covers the Sophis window, nothing can be read."""
+    wait = max(1, int(getattr(args, "click_wait", 5)))
+    print(f"\nBring the Sophis update window (Maturity / Minimum / Maximum) to the FRONT, fully visible and NOT "
+          f"covered by this terminal. Starting in {wait} seconds ...")
+    for sec in range(wait, 0, -1):
+        print(f"   {sec}...", end="\r", flush=True)
+        time.sleep(1)
+    print("   going         ")
+
+
 def cmd_fill(args) -> None:
     """Writes Minimum / Maximum for the given dates in the open update window."""
     try:
@@ -1746,8 +1902,8 @@ def cmd_fill(args) -> None:
         print("ERROR: give at least one  --entry DATE MIN MAX   (e.g. --entry \"20 Nov 2026#1\" 100 120)")
         sys.exit(2)
     a = _create(args)
-    print("You have 3 seconds to bring the Sophis update window (Maturity / Minimum / Maximum) to the front ...")
-    time.sleep(3)
+    a.trace = not args.no_trace
+    _countdown_to_front(args)
     try:
         results = a.fill_values(entries, verify=not args.no_verify, dry_run=args.dry_run, commit=args.commit_click)
     except SophisError as e:
@@ -1769,11 +1925,15 @@ def main() -> None:
                    help="row to use for ALL entries whose date appears more than once (or write DATE#n)")
     s.add_argument("--dry-run", dest="dry_run", action="store_true", help="only locate the cells; click/type nothing")
     s.add_argument("--no-verify", dest="no_verify", action="store_true", help="do not read each cell back")
+    s.add_argument("--no-trace", dest="no_trace", action="store_true",
+                   help="do not save a screenshot at every step (they go to sophis_debug/ by default)")
     s.add_argument("--commit-click", dest="commit_click", choices=["title", "ric"], default="title",
                    help="where to click to leave a cell: the window's title (default) or the Ric cell of the row")
     s.add_argument("--reader", default=None, help=argparse.SUPPRESS)
     s.add_argument("--no-widen", dest="no_widen", action="store_true", help=argparse.SUPPRESS)
     s.add_argument("--slowdown", dest="slowdown", type=float, help="multiplier for waits (2 = twice as slow)")
+    s.add_argument("--click-wait", dest="click_wait", type=int, default=5,
+                   help="seconds you get to bring the update window to the front (default 5)")
     s.set_defaults(fn=cmd_fill)
 
     s = sub.add_parser("window", help="read the open update window: dates and where Minimum / Maximum go")
@@ -1784,6 +1944,8 @@ def main() -> None:
     s.add_argument("--reader", default=None, help=argparse.SUPPRESS)
     s.add_argument("--no-widen", dest="no_widen", action="store_true", help=argparse.SUPPRESS)
     s.add_argument("--slowdown", dest="slowdown", type=float, help="multiplier for waits (2 = twice as slow)")
+    s.add_argument("--click-wait", dest="click_wait", type=int, default=5,
+                   help="seconds you get to bring the update window to the front (default 5)")
     s.set_defaults(fn=cmd_window)
 
     s = sub.add_parser("calibrate", aliases=["calibrar"], help="record the on-screen positions (once)")
