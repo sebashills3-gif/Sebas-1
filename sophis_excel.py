@@ -1,4 +1,4 @@
-"""Reads the Excel (or CSV) with the option strikes and turns it into the dates and Minimum / Maximum values to type
+"""Reads the Excel (.xlsx / .xls) or CSV with the option strikes and turns it into the dates and Minimum / Maximum values to type
 in Sophis.
 
 Columns (by position, the header row, if any, is skipped):
@@ -86,24 +86,29 @@ def parse_excel_number(value) -> float | None:
         return None
 
 
-def load_rows(path: str | Path, sheet: str | None = None) -> list[tuple]:
-    """Every row of the file as a tuple of cell values. .xlsx/.xlsm via openpyxl (computed values, not formulas),
-    .csv via the csv module."""
-    path = Path(path)
-    if not path.exists():
-        raise ExcelError(f"The file {path} does not exist.")
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            return [tuple(r) for r in csv.reader(f)]
-    if suffix not in (".xlsx", ".xlsm"):
-        raise ExcelError(f"Unsupported file type {suffix!r}: use .xlsx, .xlsm or .csv "
-                         "(save an old .xls as .xlsx first).")
+def _sniff(path: Path) -> str:
+    """The real kind of the file, from its first bytes (an .xls is often really an .xlsx or a text export)."""
+    head = path.read_bytes()[:8]
+    if head[:2] == b"PK":
+        return "xlsx"
+    if head == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        return "xls"
+    if path.suffix.lower() in (".csv", ".txt", ".tsv"):
+        return "text"
+    start = path.read_bytes()[:512].lstrip().lower()
+    if start.startswith((b"<html", b"<?xml", b"<table", b"<!doctype")):
+        raise ExcelError(f"{path.name} is an HTML/XML export saved as {path.suffix}: open it in Excel and "
+                         "save it as .xlsx or .xls first.")
+    return "text"
+
+
+def _load_xlsx(path: Path, sheet: str | None) -> list[tuple]:
     try:
         from openpyxl import load_workbook
     except ImportError:
-        raise ExcelError("openpyxl is needed to read Excel files:  pip install openpyxl")
-    wb = load_workbook(path, read_only=True, data_only=True)
+        raise ExcelError("openpyxl is needed to read .xlsx files:  pip install openpyxl")
+    import io
+    wb = load_workbook(io.BytesIO(path.read_bytes()), read_only=True, data_only=True)   # (name-independent)
     try:
         if sheet is not None:
             if sheet not in wb.sheetnames:
@@ -114,6 +119,63 @@ def load_rows(path: str | Path, sheet: str | None = None) -> list[tuple]:
         return [tuple(r) for r in ws.iter_rows(values_only=True)]
     finally:
         wb.close()
+
+
+def _load_xls(path: Path, sheet: str | None) -> list[tuple]:
+    try:
+        import xlrd
+    except ImportError:
+        raise ExcelError("xlrd is needed to read old .xls files:  pip install xlrd")
+    book = xlrd.open_workbook(str(path))
+    try:
+        if sheet is not None:
+            if sheet not in book.sheet_names():
+                raise ExcelError(f"No sheet named {sheet!r}; the file has {book.sheet_names()}.")
+            ws = book.sheet_by_name(sheet)
+        else:
+            ws = book.sheet_by_index(0)
+        rows = []
+        for r in range(ws.nrows):
+            row = []
+            for c in range(ws.ncols):
+                cell = ws.cell(r, c)
+                if cell.ctype == xlrd.XL_CELL_DATE:
+                    row.append(xlrd.xldate_as_datetime(cell.value, book.datemode))
+                elif cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK, xlrd.XL_CELL_ERROR):
+                    row.append(None)
+                else:
+                    row.append(cell.value)
+            rows.append(tuple(row))
+        return rows
+    finally:
+        book.release_resources()
+
+
+def _load_text(path: Path) -> list[tuple]:
+    raw = path.read_bytes()
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    first = text.splitlines()[0] if text.strip() else ""
+    delimiter = max(",;\t", key=first.count) if first else ","
+    return [tuple(r) for r in csv.reader(text.splitlines(), delimiter=delimiter)]
+
+
+def load_rows(path: str | Path, sheet: str | None = None) -> list[tuple]:
+    """Every row of the file as a tuple of cell values (computed values, not formulas). The kind of file is
+    decided by its content: .xlsx / .xlsm, old .xls, or text (.csv / .txt / .tsv)."""
+    path = Path(path)
+    if not path.exists():
+        raise ExcelError(f"The file {path} does not exist.")
+    kind = _sniff(path)
+    if kind == "xlsx":
+        return _load_xlsx(path, sheet)
+    if kind == "xls":
+        return _load_xls(path, sheet)
+    return _load_text(path)
 
 
 def extract(rows: list[tuple]) -> tuple[dict[str, list[DateValues]], list[str]]:
@@ -179,7 +241,7 @@ def describe(plan: dict[str, list[DateValues]]) -> str:
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Show the dates and Minimum / Maximum values found in the Excel.")
     p.add_argument("file")
-    p.add_argument("--sheet", default=None, help="sheet name (default: the active sheet)")
+    p.add_argument("--sheet", default=None, help="sheet name (default: the active sheet; the first one for .xls)")
     p.add_argument("--code", default=None, help="only this code")
     args = p.parse_args(argv)
     try:

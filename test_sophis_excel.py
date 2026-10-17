@@ -88,8 +88,12 @@ def test_clear_errors(tmp_path):
         xl.read_plan(bad)
     old = tmp_path / "old.xls"
     old.write_text("x")
-    with pytest.raises(xl.ExcelError, match="Unsupported"):
+    with pytest.raises(xl.ExcelError, match="No data rows"):        # plain text with an .xls name: read as text
         xl.read_plan(old)
+    html = tmp_path / "export.xls"
+    html.write_text("<html><table></table></html>")
+    with pytest.raises(xl.ExcelError, match="HTML/XML export"):
+        xl.read_plan(html)
 
 
 def _args(path, **kw):
@@ -118,3 +122,39 @@ def test_fill_with_several_codes_needs_a_choice(tmp_path):
     a.code = "XXX"
     with pytest.raises(sa.SophisError, match="not in the Excel"):
         sa._excel_triples(a)
+
+
+def test_reads_an_old_xls_with_text_numbers_and_real_dates(tmp_path):
+    xlwt = pytest.importorskip("xlwt")
+    wb = xlwt.Workbook()
+    ws = wb.add_sheet("Data")
+    for c, v in enumerate(HEADER):
+        ws.write(0, c, v)
+    date_style = xlwt.easyxf(num_format_str="MM/DD/YY")
+    for r, (date, value) in enumerate([("01/15/27", 45.0), ("01/15/27", 100.0)], start=1):
+        ws.write(r, 3, date)                                   # text date
+        ws.write(r, 4, value)
+        ws.write(r, 5, "SNDK")
+    ws.write(3, 3, dt.datetime(2027, 2, 19), date_style)       # real date cell
+    ws.write(3, 4, "30.00")                                    # number stored as text
+    ws.write(3, 5, "SNDK")
+    path = tmp_path / "strikes.xls"
+    wb.save(str(path))
+    plan, _ = xl.read_plan(path)
+    assert [(d.date, d.minimum, d.maximum) for d in plan["SNDK"]] == [
+        (dt.date(2027, 1, 15), 45.0, 100.0), (dt.date(2027, 2, 19), 30.0, 30.0)]
+    assert xl.read_plan(path, "Data")[0].keys() == {"SNDK"}
+    with pytest.raises(xl.ExcelError, match="No sheet named"):
+        xl.read_plan(path, "Other")
+
+
+def test_a_semicolon_or_tab_text_export_and_an_xlsx_named_xls(tmp_path):
+    tab = tmp_path / "t.txt"
+    tab.write_text("a\tb\tc\td\te\tf\n\t\t\t01/15/27\t45.00\tSNDK\n\t\t\t01/15/27\t100.00\tSNDK\n")
+    assert xl.read_plan(tab)[0]["SNDK"][0].maximum == 100.0
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.active.append(("", "", "", "01/15/27", 45.0, "SNDK"))
+    path = tmp_path / "disguised.xls"
+    wb.save(path)
+    assert xl.read_plan(path)[0]["SNDK"][0].minimum == 45.0

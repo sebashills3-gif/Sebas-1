@@ -3,3 +3,4 @@ pillow
 opencv-python
 rapidocr-onnxruntime
 openpyxl
+xlrd
