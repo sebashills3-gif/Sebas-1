@@ -144,6 +144,12 @@ class FakeSophis:
         self.mouse = (0, 0)    # where the pointer is (it stays on the row you clicked)
         self.avail_clicks = 0
         self.dscroll = 0       # first visible row of the update window's grid
+        self.values = {}       # committed cell values of the update window: {(row number, "minimum"|"maximum"): text}
+        self.cell_edit = None  # the cell being edited, (row number, column)
+        self.cell_buf = ""     # text in the open edit box
+        self.sel_all = False   # Ctrl+A pressed inside the edit box
+        self.corrupt = False   # simulate a grid that stores something else than what was typed
+        self.ok_clicks = 0
 
     # drawing
     def _image(self):
@@ -202,6 +208,18 @@ class FakeSophis:
                     d.rectangle((233, y - PITCH // 2 + 1, 659, y + PITCH // 2 - 1), fill=(10, 36, 106))
                 d.text((HX["Maturity"], y), DATES[n], fill=(255, 255, 255) if selected else (0, 0, 0), font=FONT,
                        anchor="mm")
+                for col in ("minimum", "maximum"):
+                    x = HX[col.capitalize()]
+                    if self.cell_edit == (n, col):                                    # the open edit box
+                        d.rectangle((x - 38, y - 9, x + 38, y + 9), fill=(255, 255, 255), outline=(0, 0, 0))
+                        d.text((x, y), self.cell_buf, fill=(0, 0, 0), font=FONT, anchor="mm")
+                    elif (n, col) in self.values:                                     # grid shows two decimals
+                        txt = self.values[(n, col)]
+                        try:
+                            txt = f"{float(txt):.2f}"
+                        except ValueError:
+                            pass
+                        d.text((x, y), txt, fill=(255, 255, 255) if selected else (0, 0, 0), font=FONT, anchor="mm")
             d.text((560, 425), "OK", fill=(0, 0, 0), font=FONT, anchor="mm")
             d.text((640, 425), "Cancel", fill=(0, 0, 0), font=FONT, anchor="mm")
         canvas = Image.new("RGB", (1200, 800), (30, 60, 90))
@@ -227,6 +245,25 @@ class FakeSophis:
         im = self._image()
         return im if region is None else im.crop(tuple(int(v) for v in region))
 
+    def _dialog_cell(self, x, y):
+        """(row number, column) of the Minimum / Maximum cell at window coordinates (x, y), else None."""
+        k = int(round((y - HEADER_Y) / PITCH)) - 1
+        if not (0 <= k < VISIBLE and self.dscroll + k < len(DATES) and abs(y - (HEADER_Y + PITCH * (k + 1))) <= 10):
+            return None
+        col = "minimum" if 335 <= x < 420 else "maximum" if 420 <= x < 500 else None
+        return (self.dscroll + k, col) if col else None
+
+    def _commit_cell(self):
+        if self.cell_edit is not None:
+            v = self.cell_buf
+            if self.corrupt:
+                try:
+                    v = str(float(v) + 1)
+                except ValueError:
+                    pass
+            self.values[self.cell_edit] = v
+            self.cell_edit, self.cell_buf, self.sel_all = None, "", False
+
     def _row_at(self, x, y):
         for i in range(len(ROWS)):
             if abs(y - (Y1 + i * H)) <= H // 2 and 20 <= x <= 640:
@@ -239,6 +276,11 @@ class FakeSophis:
 
     def _click(self, x, y):
         x, y = x - self.dx, y - self.dy
+        if self.dialog:                                         # the update window is modal: only it reacts
+            if 520 <= x <= 600 and 415 <= y <= 435:
+                self.ok_clicks += 1                             # (the script must never do this for now)
+            self._commit_cell()                                 # any click outside an edit box commits it
+            return
         if self.popup:
             if 700 <= x <= 850 and 76 <= y <= 76 + 110:
                 self.dd = TERMS[min(4, (y - 76) // 22)]
@@ -261,6 +303,12 @@ class FakeSophis:
 
     def double_click(self, x, y):
         self.events.append(("double", x, y))
+        if self.dialog:                                         # double click on a Minimum / Maximum cell
+            self._commit_cell()
+            cell = self._dialog_cell(x - self.dx, y - self.dy)
+            if cell:
+                self.cell_edit, self.cell_buf, self.sel_all = cell, self.values.get(cell, ""), False
+            return
         i = self._row_at(x - self.dx, y - self.dy)
         if i is not None:                              # a double click opens the window; it does not edit
             self.sel, self.editing, self.typed = i, None, ""
@@ -268,6 +316,11 @@ class FakeSophis:
 
     def type_text(self, text):
         self.events.append(("type", text))
+        if self.cell_edit is not None:                           # typing into a cell of the update window
+            if self.sel_all:
+                self.cell_buf, self.sel_all = "", False          # Ctrl+A first: the typed text replaces the old
+            self.cell_buf += text
+            return
         if self.editing is not None:                   # typing into the open edit box overwrites the cell
             self.edited += text
             return
@@ -292,6 +345,9 @@ class FakeSophis:
             self.dd, self.popup = TERMS[self.popup_idx], False
 
     def hotkey(self, *keys):
+        if tuple(keys) == ("ctrl", "a"):
+            self.sel_all = self.cell_edit is not None
+            return
         if self.clipboard:
             m, t = ROWS[self.sel]
             self._clip = f"{m}\t\tDESCRIPTION\tUS0000\t\t{t}"
@@ -1095,3 +1151,146 @@ def test_cli_window_options_are_parsed(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "window", "--date", "20 Nov 2026", "--occurrence", "1", "--show"])
     sa.main()
     assert seen == {"date": "20 Nov 2026", "occ": 1, "show": True}
+
+
+# ── stage 2b: writing the values ─────────────────────────────────────────────
+
+def _fill(ocr, anchors, entries, **kw):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr", **{k: v for k, v in kw.items() if k in ("shift",)})
+    fake.dialog = True
+    for attr in ("corrupt",):
+        if attr in kw:
+            setattr(fake, attr, kw[attr])
+    result = a.fill_values([sa.parse_entry(*e) for e in entries], **{k: v for k, v in kw.items()
+                                                                       if k in ("verify", "dry_run", "commit")})
+    return a, fake, lines, result
+
+
+def test_fill_writes_minimum_and_maximum_of_the_chosen_row(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")])
+    assert fake.values == {(8, "minimum"): "100", (8, "maximum"): "120"}
+    assert res[0]["minimum"] == "ok" and res[0]["maximum"] == "ok"        # read back: grid shows 100.00 == 100
+
+
+def test_each_cell_is_double_clicked_typed_and_left_with_a_click_outside(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")])
+    ev = [e for e in fake.events if e[0] in ("double", "type", "click") and e[0] != "scroll"]
+    seq = [e[0] for e in ev]
+    assert seq == ["double", "type", "click", "double", "type", "click"]
+    y = HEADER_Y + PITCH * 9
+    assert abs(ev[0][1] - HX["Minimum"]) <= 4 and abs(ev[0][2] - y) <= 3        # double click on Minimum
+    assert abs(ev[3][1] - HX["Maximum"]) <= 4 and abs(ev[3][2] - y) <= 3        # then on Maximum
+    assert ev[1][1] == "100" and ev[4][1] == "120"
+    for click in (ev[2], ev[5]):                                                 # the click outside: the window title
+        assert abs(click[2] - 158) <= 8
+
+
+def test_the_ric_cell_can_be_used_to_leave_a_cell_instead(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")], commit="ric")
+    outside = [e for e in fake.events if e[0] == "click"]
+    assert outside and all(abs(e[1] - HX["Ric"]) <= 6 for e in outside)
+    assert fake.values[(8, "maximum")] == "120"
+
+
+def test_existing_values_are_replaced_not_appended(ocr, anchors):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.dialog = True
+    fake.values[(7, "minimum")] = "55"
+    a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
+    assert fake.values[(7, "minimum")] == "95" and fake.values[(7, "maximum")] == "130"
+
+
+def test_a_date_that_needs_scrolling_is_filled_too(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("16 Apr 2027", "10", "20")])
+    assert fake.values == {(15, "minimum"): "10", (15, "maximum"): "20"} and fake.dscroll > 0
+
+
+def test_several_dates_in_one_go(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("23 Oct 2026", "1", "2"), ("27 Nov 2026", "3.5", "4.5"),
+                                              ("16 Apr 2027", "7", "8")])
+    assert fake.values == {(1, "minimum"): "1", (1, "maximum"): "2", (7, "minimum"): "3.5", (7, "maximum"): "4.5",
+                           (15, "minimum"): "7", (15, "maximum"): "8"}
+
+
+def test_a_repeated_date_is_never_guessed(ocr, anchors):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.dialog = True
+    with pytest.raises(SophisError, match="appears 2 times.*#0.*#1"):
+        a.fill_values([sa.parse_entry("23 Oct 2026", "1", "2"), sa.parse_entry("20 Nov 2026", "5", "6")])
+    assert fake.values == {} and not [e for e in fake.events if e[0] in ("double", "type")]   # not even the first
+
+
+@pytest.mark.parametrize("which,row", [("#0", 5), ("#1", 6)])
+def test_a_repeated_date_with_its_occurrence(ocr, anchors, which, row):
+    a, fake, lines, res = _fill(ocr, anchors, [("20 Nov 2026" + which, "5", "6")])
+    assert fake.values == {(row, "minimum"): "5", (row, "maximum"): "6"}
+
+
+def test_a_value_that_did_not_take_stops_everything(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.dialog, fake.corrupt = True, True                   # the grid stores 101 when 100 was typed
+    with pytest.raises(SophisError, match="shows 101.0 but 100.0 was typed"):
+        a.fill_values([sa.parse_entry("23 Oct 2026", "100", "120"), sa.parse_entry("27 Nov 2026", "1", "2")])
+    assert list(fake.values) == [(1, "minimum")]            # stopped right after the first cell
+
+
+def test_an_unreadable_cell_only_warns(ocr, anchors):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.dialog = True
+    a._read_cell_number = lambda *args: (None, [])
+    res = a.fill_values([sa.parse_entry("23 Oct 2026", "100", "120")])
+    assert res[0]["minimum"] == "unverified" and fake.values[(1, "minimum")] == "100"
+    assert any("check it by eye" in l for l in lines)
+
+
+def test_dry_run_only_locates(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("23 Oct 2026", "1", "2")], dry_run=True)
+    assert res[0]["written"] is False and res[0]["row"] == 1 and fake.values == {}
+    assert not [e for e in fake.events if e[0] in ("double", "type", "click")]
+
+
+def test_fill_works_with_the_window_somewhere_else(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")], shift=(45, 25))
+    assert fake.values == {(8, "minimum"): "100", (8, "maximum"): "120"}
+
+
+def test_ok_is_never_pressed(ocr, anchors):
+    a, fake, lines, res = _fill(ocr, anchors, [("30 Nov 2026", "100", "120")])
+    assert fake.ok_clicks == 0 and fake.dialog                 # the window stays open for you to check
+    assert any("press OK yourself" in l for l in lines)
+    assert not hasattr(a, "press_ok")
+
+
+def test_the_values_must_be_numbers(ocr, anchors):
+    with pytest.raises(SophisError, match="not a number"):
+        sa.parse_entry("23 Oct 2026", "abc", "2")
+    with pytest.raises(SophisError, match="Could not understand the date"):
+        sa.parse_entry("someday", "1", "2")
+
+
+@pytest.mark.parametrize("text,value", [("100", 100.0), ("100.00", 100.0), ("1,25", 1.25), ("1,234.50", 1234.5),
+                                        ("-0.5", -0.5), ("1O0", 100.0), ("abc", None), ("", None)])
+def test_parse_number(text, value):
+    assert sa.parse_number(text) == value
+
+
+def test_cli_fill_has_no_ok_option_and_parses_entries(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(sa, "cmd_fill", lambda args: seen.update(entry=args.entry, dry=args.dry_run,
+                                                                 commit=args.commit_click))
+    monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "fill", "--entry", "20 Nov 2026#1", "100", "120",
+                                      "--entry", "27 Nov 2026", "95", "130", "--dry-run"])
+    sa.main()
+    assert seen == {"entry": [["20 Nov 2026#1", "100", "120"], ["27 Nov 2026", "95", "130"]], "dry": True,
+                    "commit": "title"}
+    monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "fill", "--entry", "20 Nov 2026", "1", "2", "--ok"])
+    with pytest.raises(SystemExit):
+        sa.main()                                              # --ok no longer exists
+
+
+def test_cli_fill_without_entries_explains_itself(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "fill"])
+    with pytest.raises(SystemExit) as e:
+        sa.main()
+    assert e.value.code == 2 and "--entry" in capsys.readouterr().out

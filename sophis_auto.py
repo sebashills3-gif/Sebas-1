@@ -24,6 +24,9 @@ Usage (in this order the first time):
                                                 # for the update window (--open-with double = double click)
        python sophis_auto.py open --term "Long term share"   # same, but you tell it the Term (skips reading it)
        python sophis_auto.py open-code ZYS ZTS     # (older flow) types the code to find its row; not reliable yet
+    6) python sophis_auto.py fill --entry "20 Nov 2026#1" 100 120 --entry "27 Nov 2026" 95 130 [--dry-run]
+                                                # (update window open) writes Minimum/Maximum per date: double
+                                                # click the cell, type, click outside, read it back; never presses OK
     5) python sophis_auto.py window --date "20 Nov 2026" --show
                                                 # (update window open) reads its dates and shows where that date's
                                                 # Minimum and Maximum cells are; nothing is clicked or typed
@@ -350,6 +353,41 @@ def parse_date(text) -> tuple[dt.date | None, str]:
     return None, ""
 
 
+def parse_number(text) -> float | None:
+    """A number as written in a cell: '100', '100.00', '1,25' (decimal comma) or '-0.5'. None if it is not one."""
+    t = re.sub(r"\s+", "", str(text))
+    t = re.sub(r"(?<=\d)[Oo](?=\d|$)", "0", t)               # OCR: O for 0 between digits
+    if re.fullmatch(r"-?\d{1,3}(,\d{3})+(\.\d+)?", t):         # 1,234.50 -> thousands separators
+        t = t.replace(",", "")
+    elif re.fullmatch(r"-?\d+,\d+", t):                          # 1,25 -> decimal comma
+        t = t.replace(",", ".")
+    try:
+        return float(t) if re.fullmatch(r"-?\d+(\.\d+)?", t) else None
+    except ValueError:
+        return None
+
+
+@dataclass
+class FillEntry:
+    """The values for one maturity date. `occurrence` picks the row when the date appears more than once."""
+    date: dt.date
+    minimum: str | None
+    maximum: str | None
+    occurrence: int | None = None
+
+
+def parse_entry(date_text: str, minimum: str | None, maximum: str | None) -> FillEntry:
+    """'20 Nov 2026' or '20 Nov 2026#1' (the second row with that date) plus the two values."""
+    text, _, occ = str(date_text).partition("#")
+    date, _ = parse_date(text)
+    if date is None:
+        raise SophisError(f"Could not understand the date {date_text!r} (try 19 Oct 2026, 2026-10-19 or 19/10/2026).")
+    for name, value in (("Minimum", minimum), ("Maximum", maximum)):
+        if value is not None and parse_number(value) is None:
+            raise SophisError(f"The {name} value {value!r} for {text} is not a number.")
+    return FillEntry(date, minimum, maximum, int(occ) if occ.strip().isdigit() else None)
+
+
 def find_header(lines: list) -> dict | None:
     """Finds the header row 'Maturity | Minimum | Maximum | Ric' among OCR lines (each a Line). Returns the
     center x of every column and the header's y (the texts are centered in their cells), or None."""
@@ -385,6 +423,9 @@ class UpdateWindow:
     pitch: float
     rows: list
     image: Image.Image | None = None
+    title: tuple | None = None      # center of the window's title text ("Strikes ...")
+    ok: tuple | None = None         # center of the OK button
+    cancel: tuple | None = None
 
     def find(self, date: dt.date) -> list:
         return [r for r in self.rows if r.date == date]
@@ -1257,7 +1298,16 @@ class Automator:
                     by_index[idx] = WindowRow(idx, cy, text, date, suffix)
                     break
         rows = [by_index[i] for i in sorted(by_index)]
-        return UpdateWindow(hy, xm, header["minimum"], header["maximum"], header["ric"], pitch, rows, shot)
+        title = next((l for l in lines if l.cy < hy and len(_norm(l.text)) > 8 and contains_word(l.text, "Strikes")),
+                     None)
+        cancel = next((l for l in lines if l.cy > hy and len(_norm(l.text)) <= 8
+                       and _best_window(_norm(l.text), "cancel") >= 0.8), None)
+        ok = next((l for l in lines if l.cy > hy and _norm(l.text) == "ok"
+                   and (cancel is None or (abs(l.cy - cancel.cy) <= 12 and l.cx < cancel.cx))), None)
+        return UpdateWindow(hy, xm, header["minimum"], header["maximum"], header["ric"], pitch, rows, shot,
+                            title=(title.cx, title.cy) if title else None,
+                            ok=(ok.cx, ok.cy) if ok else None,
+                            cancel=(cancel.cx, cancel.cy) if cancel else None)
 
     def locate_date(self, target: dt.date, occurrence: int | None = None, max_scrolls: int = 15) -> CellTarget:
         """Finds the row whose Maturity is `target` (scrolling the list if needed) and returns where its Minimum
@@ -1313,6 +1363,93 @@ class Automator:
                 if tuple(r.date for r in win.dated()) == before:         # the list did not move: end of the list
                     break
         return win, win.find(target)
+
+    # ── stage 2b: write the values (double click a cell, type, click outside) ─────────────────
+    def _commit_point(self, win: UpdateWindow, row: WindowRow, how: str = "title") -> tuple[int, int]:
+        """Where to click to leave a cell after typing ("click outside the cell"): the window's title text, which
+        is not part of the grid, or failing that the Ric cell of the same row."""
+        if how == "title" and win.title:
+            return win.title
+        return (win.x_ric or win.x_maturity, row.cy)
+
+    def _read_cell_number(self, win: UpdateWindow, x: int, y: int, half: int) -> tuple[float | None, list[str]]:
+        """What the cell at (x, y) shows now, as a number (None if unreadable), plus the raw readings."""
+        h = int(win.pitch / 2) - 1
+        crop = self.s.capture((x - half, y - h, x + half, y + h))
+        readings, _ = self.ocr.read_cell(crop)
+        for r in readings:
+            value = parse_number(r)
+            if value is not None:
+                return value, readings
+        return None, readings
+
+    def write_cell(self, win: UpdateWindow, row: WindowRow, column: str, value: str, commit: str = "title",
+                   verify: bool = True) -> str:
+        """Double click the cell, replace its content with `value`, click outside to commit, and read the cell
+        back. Returns "ok", "unverified" (could not read the cell) or raises if it shows another value."""
+        x = win.x_minimum if column == "minimum" else win.x_maximum
+        other = win.x_maximum if column == "minimum" else (win.x_ric or win.x_maximum + (win.x_maximum - win.x_minimum))
+        half = max(8, int(0.4 * abs(other - x)))
+        self.log(f"  {column} of {row.date:%d %b %Y}: double click at ({x}, {row.cy}), typing {value!r}")
+        self.s.double_click(x, row.cy)
+        self._wait(0.5)
+        self.s.hotkey("ctrl", "a")                  # replace whatever the cell held
+        self._wait(0.15)
+        self.s.type_text(str(value))
+        self._wait(0.25)
+        self.s.click(*self._commit_point(win, row, commit))
+        self._wait(0.7)
+        if not verify:
+            return "unverified"
+        seen, readings = self._read_cell_number(win, x, row.cy, half)
+        wanted = parse_number(value)
+        if seen is None:
+            self.log(f"    WARNING: could not read the {column} cell back (OCR gave {readings}); check it by eye")
+            return "unverified"
+        if abs(seen - wanted) > 1e-9:
+            path = self.save_debug(f"cell_mismatch_{column}")
+            raise SophisError(f"The {column} cell of {row.date:%d %b %Y} shows {seen} but {wanted} was typed "
+                              f"(OCR readings: {readings}). Stopped before touching anything else. Screenshot: {path}")
+        self.log(f"    {column} reads back as {seen:g}")
+        return "ok"
+
+    def fill_values(self, entries: list, verify: bool = True, dry_run: bool = False, commit: str = "title") -> list:
+        """Writes Minimum and Maximum for each entry in the open update window. The row is found again before
+        every cell (the list may have scrolled). A date that appears more than once needs its `occurrence`;
+        nothing is guessed. dry_run only locates the cells. It NEVER presses OK: the window is left open so you
+        can check the values and confirm it yourself."""
+        done = []
+        # 1) Check everything that can be checked BEFORE changing anything.
+        plan = []
+        for e in entries:
+            t = self.locate_date(e.date, e.occurrence)
+            if t.ambiguous:
+                raise SophisError(
+                    f"{e.date:%d %b %Y} appears {len(t.matches)} times (rows {[m.index for m in t.matches]}, "
+                    f"read as {[m.text for m in t.matches]}). Choose one by writing the date as "
+                    f"'{e.date:%d %b %Y}#0' (the first) or '#1' (the second). Nothing was changed.")
+            plan.append((e, t))
+            self.log(f"plan: {e.date:%d %b %Y} -> row {t.row.index}; Minimum {e.minimum} at {t.minimum}, "
+                     f"Maximum {e.maximum} at {t.maximum}")
+        if dry_run:
+            return [{"date": e.date, "row": t.row.index, "minimum": t.minimum, "maximum": t.maximum,
+                     "written": False} for e, t in plan]
+        # 2) Write.
+        for e, _ in plan:
+            result = {"date": e.date, "minimum": None, "maximum": None, "written": True}
+            for column, value in (("minimum", e.minimum), ("maximum", e.maximum)):
+                if value is None:
+                    continue
+                win = self.read_update_window()
+                t = self.locate_date(e.date, e.occurrence)           # re-find the row: the list may have moved
+                if t.ambiguous:
+                    raise SophisError(f"{e.date:%d %b %Y} became ambiguous while writing; stopped.")
+                win = self.read_update_window()
+                row = next((r for r in win.rows if r.date == e.date and r.index == t.row.index), t.row)
+                result[column] = self.write_cell(win, row, column, value, commit, verify)
+            done.append(result)
+        self.log("done. The window was left open: check the values and press OK yourself.")
+        return done
 
     def annotate_window(self, win: UpdateWindow, target: CellTarget | None = None) -> Path:
         """Saves a screenshot with what was understood drawn on it, so you can check it by eye."""
@@ -1595,9 +1732,49 @@ def cmd_window(args) -> None:
         sys.exit(1)
 
 
+def cmd_fill(args) -> None:
+    """Writes Minimum / Maximum for the given dates in the open update window."""
+    try:
+        entries = [parse_entry(d, mn, mx) for d, mn, mx in (args.entry or [])]
+        if args.occurrence is not None:
+            for e in entries:
+                e.occurrence = e.occurrence if e.occurrence is not None else args.occurrence
+    except SophisError as e:
+        print(f"ERROR: {e}")
+        sys.exit(2)
+    if not entries:
+        print("ERROR: give at least one  --entry DATE MIN MAX   (e.g. --entry \"20 Nov 2026#1\" 100 120)")
+        sys.exit(2)
+    a = _create(args)
+    print("You have 3 seconds to bring the Sophis update window (Maturity / Minimum / Maximum) to the front ...")
+    time.sleep(3)
+    try:
+        results = a.fill_values(entries, verify=not args.no_verify, dry_run=args.dry_run, commit=args.commit_click)
+    except SophisError as e:
+        print(f"\nERROR: {e}")
+        sys.exit(1)
+    print("\nDry run: nothing was clicked or typed." if args.dry_run else "\nFinished.")
+    for r in results:
+        print(" ", {k: (v.strftime('%d %b %Y') if hasattr(v, 'strftime') else v) for k, v in r.items()})
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sophis automation (stage 1: search a code and open its window)")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("fill", help="write Minimum / Maximum values in the open update window")
+    s.add_argument("--entry", nargs=3, action="append", metavar=("DATE", "MIN", "MAX"),
+                   help="a date and its two values; repeat for more dates. A repeated date: '20 Nov 2026#1'")
+    s.add_argument("--occurrence", type=int, default=None,
+                   help="row to use for ALL entries whose date appears more than once (or write DATE#n)")
+    s.add_argument("--dry-run", dest="dry_run", action="store_true", help="only locate the cells; click/type nothing")
+    s.add_argument("--no-verify", dest="no_verify", action="store_true", help="do not read each cell back")
+    s.add_argument("--commit-click", dest="commit_click", choices=["title", "ric"], default="title",
+                   help="where to click to leave a cell: the window's title (default) or the Ric cell of the row")
+    s.add_argument("--reader", default=None, help=argparse.SUPPRESS)
+    s.add_argument("--no-widen", dest="no_widen", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--slowdown", dest="slowdown", type=float, help="multiplier for waits (2 = twice as slow)")
+    s.set_defaults(fn=cmd_fill)
 
     s = sub.add_parser("window", help="read the open update window: dates and where Minimum / Maximum go")
     s.add_argument("--date", help="a date to locate, e.g. '19 Oct 2026', 2026-10-19 or 19/10/2026")
