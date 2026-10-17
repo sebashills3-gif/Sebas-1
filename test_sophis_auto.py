@@ -109,6 +109,7 @@ ROWS = [("ZYS", "Short term share"), ("ZTS", "Short term index"), ("ZTO", "Long 
         ("ZM", "Long term share"), ("ZJO", "Short term index")]
 Y1, H, BORDER, RIGHT, RIC_LEFT = 100, 24, 470, 540, 400
 ARROW = (836, 62)
+AVAIL_BTN = (40, 45)         # first small button next to "Available contracts"
 
 ANCHOR_GRID = (22, 62, 330, 84)      # header "Mnemo | Extended Mnemo | Description"
 ANCHOR_RIGHT = (700, 188, 850, 208)  # header "Date | Cycle | Name"
@@ -125,7 +126,8 @@ class FakeSophis:
         self.hidden = hidden
         self.sel, self.typed, self.dd = 0, "", "Short term index"
         self.popup, self.dialog = False, False
-        self.term_extra, self.ric_shift = 0, 0        # how much the Term column was widened / the RIC column shrunk
+        self.term_extra = 0                           # how much the Term column was widened (right border dragged)
+        self.drags = []                               # every header drag: (start x in window coordinates, dx)
         self.popup_idx = 0
         self.clipboard, self.popup_visible = clipboard, popup_visible
         self._clip = None
@@ -133,12 +135,13 @@ class FakeSophis:
         self.events = []       # ("click" | "double" | "type", ...) in the order they happened
         self._last_type_t = -1e9
         self.mouse = (0, 0)    # where the pointer is (it stays on the row you clicked)
+        self.avail_clicks = 0
 
     # drawing
     def _image(self):
         im = Image.new("RGB", (1000, 600), (200, 200, 200))
         d = ImageDraw.Draw(im)
-        term_left = BORDER - self.ric_shift
+        term_left = BORDER
         term_width = RIGHT - BORDER + self.term_extra
         for i, (m, t) in enumerate(ROWS):
             y = Y1 - H // 2 + i * H
@@ -163,6 +166,8 @@ class FakeSophis:
         d.rectangle(ANCHOR_RIGHT, fill=(215, 215, 215))
         d.text((706, 192), "Date     Cycle     Name", fill=(0, 0, 0), font=FONT)
         d.text((term_left + 6, 62), "Term", fill=(0, 0, 0), font=FONT)
+        for k in range(3):                                                  # the three little buttons
+            d.rectangle((32 + 25 * k, 37, 48 + 25 * k, 53), fill=(225, 225, 225), outline=(0, 0, 0))
         d.rectangle((700, 50, 850, 74), fill=(255, 255, 255), outline=(0, 0, 0))
         d.text((706, 55), self.dd, fill=(0, 0, 0), font=FONT)
         d.polygon([(830, 58), (842, 58), (836, 67)], fill=(0, 0, 0))
@@ -206,6 +211,11 @@ class FakeSophis:
             if 700 <= x <= 850 and 76 <= y <= 76 + 110:
                 self.dd = TERMS[min(4, (y - 76) // 22)]
             self.popup = False
+            return
+        if abs(x - AVAIL_BTN[0]) <= 8 and abs(y - AVAIL_BTN[1]) <= 8:     # first button: opens the selected row
+            self.avail_clicks += 1
+            if self.sel is not None:
+                self.dialog = True
             return
         if abs(x - ARROW[0]) <= 14 and abs(y - ARROW[1]) <= 14:
             self.popup, self.popup_idx = True, 0
@@ -255,12 +265,10 @@ class FakeSophis:
             self._clip = f"{m}\t\tDESCRIPTION\tUS0000\t\t{t}"
 
     def drag(self, x0, y0, x1, y1):
-        moved = x1 - x0                                            # horizontal movement (same in any frame)
-        x0 -= self.dx
-        if abs(x0 - RIGHT) <= 4:                                   # right border of Term -> Term gets wider
-            self.term_extra += max(0, moved)
-        elif abs(x0 - BORDER) <= 4:                                # RIC | Term border -> RIC shrinks (min ~10px)
-            self.ric_shift = min(self.ric_shift - moved, BORDER - RIC_LEFT - 10)
+        self.drags.append((x0 - self.dx, x1 - x0))
+        if abs(x0 - self.dx - RIGHT) <= 4:                         # right border of Term -> Term gets wider
+            self.term_extra += max(0, x1 - x0)
+        # any other drag (e.g. the RIC | Term border) would change nothing useful here
 
     def clipboard_set(self, text):
         self._clip = text
@@ -291,7 +299,9 @@ def make(ocr, anchors, **kw):
     cfg = Config(anchors=anchors, points={
         "row1": [45, Y1], "row2": [45, Y1 + H], "rowN": [45, Y1 + 7 * H], "ext": [140, Y1],
         "ric_left": [RIC_LEFT, 70], "term_left": [BORDER, 70], "term_right": [RIGHT, 70], "dd_left": [706, 62], "dd_arrow": list(ARROW),
-    }, slowdown=0.01, **{k: v for k, v in kw.items() if k in ("reader", "verify_mnemonic", "auto_focus")})
+        "avail_btn": list(AVAIL_BTN),
+    }, slowdown=0.01, **{k: v for k, v in kw.items() if k in ("reader", "verify_mnemonic", "auto_focus",
+                                                              "open_method")})
     screen = FakeSophis(**{k: v for k, v in kw.items() if k in ("clipboard", "popup_visible", "shift", "hidden", "always_edit", "tinted_mnemo", "no_highlight")})
     a = Automator(screen, ocr, cfg, log=lambda *_: None)
     a.prepare()
@@ -397,7 +407,7 @@ def _calibrate_with(monkeypatch, tmp_path, fake, positions, only=None):
 
 GOOD_POINTS = [(22, 62), (330, 84), (45, Y1), (45, Y1 + H), (45, Y1 + 7 * H), (140, Y1), (RIC_LEFT, 70),
                (BORDER, 70), (RIGHT, 70),
-               (700, 188), (850, 208), (706, 62), ARROW]
+               (700, 188), (850, 208), (706, 62), ARROW, AVAIL_BTN]
 
 
 def test_full_then_partial_calibration_with_moved_window(ocr, monkeypatch, tmp_path):
@@ -435,6 +445,7 @@ def test_legacy_spanish_config_still_loads_and_works(ocr, anchors, tmp_path):
     with pytest.raises(SophisError, match="calibrate --only ric_left"):     # the one point the old version lacked
         Config.load(path)
     legacy["puntos"]["ric_left"] = [RIC_LEFT, 70]
+    legacy["puntos"]["avail_btn"] = list(AVAIL_BTN)
     path.write_text(json.dumps(legacy), encoding="utf-8")
     cfg = Config.load(path)
     assert cfg.reader == "clipboard" and cfg.widen_px == 140 and set(cfg.anchors) == {"grid", "right"}
@@ -557,14 +568,31 @@ def test_term_strip_does_not_reach_description_or_code(ocr, anchors):
     assert "VANECK" not in text and "US92189" not in text
 
 
-def test_widen_term_makes_it_readable_and_cyc_stays_put(ocr, anchors):
+def test_widen_term_drags_only_the_right_border_of_term(ocr, anchors):
     a, fake = make(ocr, anchors, reader="ocr")
     a.search("ZYS")
     i = a.selected_row()
     assert a._term_by_ocr(i)[0] is None                   # truncated: "Short ter..."
     a.widen_term()
-    assert fake.term_extra == fake.ric_shift > 0          # right border back where it was
-    assert a._term_by_ocr(i)[0] == "Short term share"
+    assert len(fake.drags) == 1                           # one drag...
+    start, moved = fake.drags[0]
+    assert abs(start - RIGHT) <= 1 and moved > 0          # ...of the Term | Cyc border, to the right
+    assert fake.term_extra == moved
+    assert a._term_by_ocr(i)[0] == "Short term share"     # and the strip follows the widened column
+
+
+def test_widen_term_is_attempted_once_per_session(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    a.widen_term()
+    a.widen_term()
+    assert len(fake.drags) == 1
+
+
+def test_widen_term_never_drags_off_the_screen(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    a._screen_width = RIGHT + 20                          # almost no room on the right
+    a.widen_term()
+    assert fake.drags == []                               # not enough room: it does nothing instead of dragging blindly
 
 
 def test_an_unconfirmed_row_is_reread_not_clicked_again(ocr, anchors, tmp_path, monkeypatch):
@@ -596,11 +624,13 @@ def test_a_calibration_missing_one_point_can_be_repaired_with_only(ocr, anchors,
         Config.load()                                         # normal use is still blocked until repaired
     fake = FakeSophis(shift=(25, 15))                         # and the window is not where it was
     monkeypatch.setattr(sa.time, "sleep", lambda *_: None)
-    fake.position = lambda: (RIC_LEFT + 25, 70 + 15)
+    spots = iter([(RIC_LEFT + 25, 70 + 15), (AVAIL_BTN[0] + 25, AVAIL_BTN[1] + 15)])
+    fake.position = lambda: next(spots)
     monkeypatch.setattr(sa, "Screen", lambda *a, **k: fake)
-    sa.cmd_calibrate(_Args(["ric_left"]))
+    sa.cmd_calibrate(_Args(["ric_left", "avail_btn"]))
     cfg = Config.load()                                       # now complete and in the new format
     assert cfg.points["ric_left"] == [RIC_LEFT + 25, 70 + 15]
+    assert cfg.points["avail_btn"] == [AVAIL_BTN[0] + 25, AVAIL_BTN[1] + 15]
     assert cfg.reader == "ocr" and cfg.widen_px == 140        # old settings kept
     a = Automator(fake, ocr, cfg, log=lambda *_: None)
     a.prepare()
@@ -695,11 +725,12 @@ def test_manual_mode_works_whichever_row_you_clicked(ocr, anchors, start_row):
     assert fake.edited == ""
 
 
-def test_manual_mode_open_contract_clicks_only_the_dropdown_and_the_final_double_click(ocr, anchors):
+def test_manual_mode_open_contract_clicks_only_the_dropdown_and_the_button(ocr, anchors):
     a, fake = make(ocr, anchors, reader="ocr")
     a.open_contract("ZTO")
     kinds = [e[0] for e in fake.events]
-    assert kinds[0] == "type" and kinds.count("double") == 1 and fake.dialog and fake.edited == ""
+    assert kinds[0] == "type" and kinds.count("double") == 0 and fake.avail_clicks == 1
+    assert fake.dialog and fake.edited == ""
 
 
 def test_manual_mode_waits_for_the_typeahead_buffer_between_codes(ocr, anchors, monkeypatch):
@@ -763,9 +794,9 @@ def test_open_selected_uses_the_row_you_selected(ocr, anchors, row, term):
     fake.sel = row
     r = a.open_selected()
     assert r.row == row and r.term == term and fake.dd == term and fake.dialog
-    assert not [e for e in fake.events if e[0] == "click" and e[1] < 700]       # nothing clicked on the table
+    assert not [e for e in fake.events if e[0] == "click" and e[1] < 700 and e[2] >= Y1 - H // 2]   # no row clicked
     assert [e[0] for e in fake.events].count("type") == 0 and fake.edited == ""
-    assert [e for e in fake.events if e[0] == "double"] == [("double", 45, Y1 + row * H)]
+    assert fake.avail_clicks == 1 and not [e for e in fake.events if e[0] == "double"]    # opened with the button
 
 
 def test_open_selected_uses_the_mouse_when_the_highlight_cannot_be_seen(ocr, anchors):
@@ -843,3 +874,44 @@ def test_cli_open_refuses_codes_and_points_to_open_code(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         sa.main()
     assert e.value.code == 2 and "open-code ZYS" in capsys.readouterr().out
+
+
+# ── how the update window is opened ──────────────────────────────────────────
+
+def test_the_window_is_opened_with_the_button_next_to_available_contracts(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    fake.sel = 3
+    a.open_selected()
+    assert fake.avail_clicks == 1 and fake.dialog
+    assert not [e for e in fake.events if e[0] == "double"]
+    assert fake.events[-1] == ("click", AVAIL_BTN[0], AVAIL_BTN[1])        # the last thing the script did
+
+
+def test_the_button_click_follows_the_window_when_it_moves(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr", shift=(70, 40))
+    fake.sel = 2
+    a.open_selected()
+    assert fake.events[-1] == ("click", AVAIL_BTN[0] + 70, AVAIL_BTN[1] + 40) and fake.dialog
+
+
+def test_the_button_is_clicked_only_after_the_dropdown_matches(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr")
+    fake.sel = 3                                           # Long term index; the fake starts on Short term index
+    a.open_selected()
+    assert fake.dd == "Long term index" and fake.avail_clicks == 1
+
+
+def test_double_click_can_still_be_chosen(ocr, anchors):
+    a, fake = make(ocr, anchors, reader="ocr", open_method="double")
+    fake.sel = 4
+    a.open_selected()
+    assert fake.avail_clicks == 0 and [e for e in fake.events if e[0] == "double"] == [("double", 45, Y1 + 4 * H)]
+    assert fake.dialog
+
+
+def test_cli_open_with_option_is_parsed(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(sa, "cmd_open", lambda args: seen.update(open_with=args.open_with, term=args.term))
+    monkeypatch.setattr(sys, "argv", ["sophis_auto.py", "open", "--open-with", "double", "--term", "Future"])
+    sa.main()
+    assert seen == {"open_with": "double", "term": "Future"}

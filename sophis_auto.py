@@ -20,7 +20,8 @@ Usage (in this order the first time):
     2) python sophis_auto.py calibrate          # once: point the mouse at 12 spots
     3) python sophis_auto.py diagnose           # checks how your screen is read (send me what it prints)
     4) python sophis_auto.py open               # YOU click the right row; it reads its Term, sets the dropdown,
-                                                # double-clicks the row and waits for the update window
+                                                # clicks the button next to 'Available contracts' and waits
+                                                # for the update window (--open-with double = double click)
        python sophis_auto.py open --term "Long term share"   # same, but you tell it the Term (skips reading it)
        python sophis_auto.py open-code ZYS ZTS     # (older flow) types the code to find its row; not reliable yet
 
@@ -84,12 +85,15 @@ CALIBRATION_POINTS = [
     ("anchor_right_b", "ANCHOR 2 (BOTTOM-RIGHT corner): bottom-right corner of that header (after 'Name')"),
     ("dd_left", "Mouse INSIDE the dropdown ('Short term index'), at the start of the text, vertically centered"),
     ("dd_arrow", "Mouse on the dropdown button / arrow"),
+    ("avail_btn", "Mouse on the FIRST small button next to the 'Available contracts' label (the leftmost of the "
+                  "little icons above the table). It opens the update window of the selected row"),
 ]
 # The corner that closes each anchor (its image crop is saved when it is captured).
 ANCHOR_CLOSING_POINT = {"anchor_grid_b": "grid", "anchor_right_b": "right"}
 # Which anchor each point belongs to (points move together with their anchor).
 POINT_ANCHOR = {"row1": "grid", "row2": "grid", "rowN": "grid", "ext": "grid", "ric_left": "grid",
-                "term_left": "grid", "term_right": "grid", "dd_left": "right", "dd_arrow": "right"}
+                "term_left": "grid", "term_right": "grid", "dd_left": "right", "dd_arrow": "right",
+                "avail_btn": "grid"}
 
 # Names used by the earlier (Spanish) version, so an existing calibration keeps working.
 LEGACY_CONFIG_KEYS = {"puntos": "points", "anclas": "anchors", "ensanchar_px": "widen_px",
@@ -119,6 +123,8 @@ class Config:
     verify_mnemonic: bool = True  # False = accept the row even if its Mnemo cannot be read (NOT recommended)
     weak_verify: bool = True      # accept a Mnemo OCR could not read exactly if its shape fits (same glyph count)
     auto_focus: bool = False      # False = YOU click a row once and the script only types; True = it clicks too
+    open_method: str = "button"   # how the update window is opened: "button" (first button next to 'Available
+                                  # contracts') or "double" (double click on the row)
     type_gap: float = 2.5         # seconds between two typed codes (the grid's type-ahead buffer must expire)
 
     @staticmethod
@@ -636,7 +642,9 @@ class Automator:
         self.log = log
         self.pts: dict = {}
         self.g: Geometry
-        self._widened = False
+        self._widened = False          # the widening was already attempted this session
+        self._widened_by = 0           # how many px Term's right border was dragged
+        self._screen_width = 10 ** 6
         self._first_click_done = False
         self._last_typed_at = -1e9
         self._clipboard_works = True
@@ -651,7 +659,9 @@ class Automator:
 
     def locate(self) -> None:
         """Finds the window on screen (it may be somewhere else than at calibration) and recomputes the points."""
-        self.pts, info = compute_points(self.s.capture(), self.cfg)
+        shot = self.s.capture()
+        self._screen_width = shot.width
+        self.pts, info = compute_points(shot, self.cfg)
         self.g = self._geometry()
         moved = ", ".join(f"{n}: shifted ({dx:+d},{dy:+d}) match {sc:.2f}" for n, (dx, dy, sc) in info.items())
         self.log(f"  window located -> {moved}")
@@ -674,7 +684,7 @@ class Automator:
         return Geometry(
             x_click=r1[0], x_mnemo0=r1[0] - 30, x_mnemo1=max(r1[0] + 12, ext[0] - 2), x_ext=ext[0],
             y1=r1[1], h=float(h), n=n,
-            term_x0=ric[0] + 3, term_x1=tr[0] - 1,
+            term_x0=ric[0] + 3, term_x1=tr[0] + self._widened_by - 1,
         )
 
     def save_debug(self, name: str, img: Image.Image | None = None) -> Path:
@@ -685,23 +695,21 @@ class Automator:
 
     # ── preparation ─────────────────────────────────────────────────────────
     def widen_term(self) -> None:
-        """The Term column shows 'Short ter...'. Two header drags give it room without moving Cyc:
-        1) drag Term's RIGHT border to the right (Term gets wider, Cyc is pushed out),
-        2) drag the RIC|Term border to the left (RIC shrinks, Term slides left, Cyc comes back).
-        The RIC column is normally empty, so nothing useful is lost."""
+        """The Term column shows 'Short ter...'. Widen it the way you do by hand: drag the RIGHT border of Term
+        (the line between Term and Cyc) to the right. Only that border is touched."""
         if self._widened or self.cfg.widen_px <= 0:
             return
-        ric, tl, tr = self._pt("ric_left"), self._pt("term_left"), self._pt("term_right")
-        d = max(0, min(self.cfg.widen_px, tl[0] - ric[0] - 10))   # RIC keeps at least ~10px
-        if d < 15:
-            self.log("  not enough room in the RIC column to widen Term; widen it by hand instead")
-            self._widened = True
+        tr = self._pt("term_right")
+        room = self._screen_width - 5 - tr[0]                  # do not drag off the screen
+        d = max(0, min(self.cfg.widen_px, room))
+        self._widened = True                                   # one attempt per session
+        if d < 30:
+            self.log("  not enough room on screen to widen Term; widen it by hand instead")
             return
-        self.log(f"Widening the Term column by {d}px ...")
+        self.log(f"Widening the Term column by {d}px (dragging its right border) ...")
         self.s.drag(tr[0], tr[1], tr[0] + d, tr[1])
-        self._wait(0.5)
-        self.s.drag(tl[0], tl[1], tl[0] - d, tl[1])
-        self._widened = True
+        self._widened_by = d
+        self.g = self._geometry()                              # the Term strip now reaches the new right edge
         self._wait(0.6)
 
     def prepare(self) -> None:
@@ -1014,8 +1022,7 @@ class Automator:
                                   f"Click a row, then run this code again. Screenshot: {path}")
             self.log("  the list changed after the dropdown; searching again")
             j, _ = self.search(code)
-        self.log(f"  opening window (double click on row {j}) ...")
-        self.click_row(j, double=True)
+        self.open_update_window(j)
         window = self.wait_for_window()
         self.log(f"[{code}] done: term='{reading.term}', update window is open")
         return Result(code, reading.term, j, window)
@@ -1063,6 +1070,15 @@ class Automator:
             return term
         return None
 
+    def open_update_window(self, row: int) -> None:
+        """Opens the update window (Maturity / Minimum / Maximum / Ric) of the selected row."""
+        if self.cfg.open_method == "double":
+            self.log(f"  opening the window (double click on row {row}) ...")
+            self.click_row(row, double=True)
+        else:
+            self.log("  opening the window (click on the first button next to 'Available contracts') ...")
+            self.s.click(*self._pt("avail_btn"))
+
     def open_selected(self, term: str | None = None) -> Result:
         """Assumes YOU already selected the right row. Reads its Term (or uses `term`), matches the dropdown,
         double-clicks the row and waits for the update window. Nothing is typed and no row is searched."""
@@ -1086,8 +1102,7 @@ class Automator:
         after = clean_cell(self.s.capture(self._cell_region(i, self.g.x_mnemo0, self.g.x_mnemo1)))[0]
         if float(np.mean(np.abs(before.astype(np.int16) - after.astype(np.int16)))) > 12:
             self.log("  WARNING: the text of the row changed after setting the dropdown; check the window that opens")
-        self.log(f"  opening the window (double click on row {i}) ...")
-        self.click_row(i, double=True)
+        self.open_update_window(i)
         window = self.wait_for_window()
         self.log(f"done: Mnemo '{shown}', Term '{term}', update window is open")
         return Result(str(shown), term, i, window)
@@ -1168,6 +1183,8 @@ def _create(args) -> Automator:
         cfg.slowdown = args.slowdown
     if getattr(args, "auto_focus", False):
         cfg.auto_focus = True
+    if getattr(args, "open_with", None):
+        cfg.open_method = args.open_with
     print("Loading OCR ...")
     return Automator(Screen(cfg.key_interval), OCR(), cfg)
 
@@ -1332,6 +1349,9 @@ def main() -> None:
                        help="multiplier for waits (2 = twice as slow)")
         s.add_argument("--click-wait", dest="click_wait", type=int, default=6,
                        help="seconds you get to select the row in Sophis before the script continues (default 6)")
+        s.add_argument("--open-with", dest="open_with", choices=["button", "double"],
+                       help="how to open the update window: the button next to 'Available contracts' (default) "
+                            "or a double click on the row")
         s.add_argument("--auto-focus", dest="auto_focus", action="store_true",
                        help="(open-code only) let the script click an unselected row itself")
         s.set_defaults(fn=fn)
