@@ -1250,7 +1250,7 @@ class Automator:
             self.log("  opening the window (click on the first button next to 'Available contracts') ...")
             self.s.click(*self._pt("avail_btn"))
 
-    def open_selected(self, term: str | None = None) -> Result:
+    def open_selected(self, term: str | None = None, wait: bool = True) -> Result:
         """Assumes YOU already selected the right row. Reads its Term (or uses `term`), matches the dropdown,
         double-clicks the row and waits for the update window. Nothing is typed and no row is searched."""
         self.locate()
@@ -1274,6 +1274,9 @@ class Automator:
         if float(np.mean(np.abs(before.astype(np.int16) - after.astype(np.int16)))) > 12:
             self.log("  WARNING: the text of the row changed after setting the dropdown; check the window that opens")
         self.open_update_window(i)
+        if not wait:                                  # the caller detects the window itself (see run)
+            self.log(f"done: Mnemo '{shown}', Term '{term}', update window requested")
+            return Result(str(shown), term, i, {})
         window = self.wait_for_window()
         self.log(f"done: Mnemo '{shown}', Term '{term}', update window is open")
         self.report_update_window()
@@ -1457,6 +1460,24 @@ class Automator:
                 self.log(f"  could not read the update window (attempt {k}/{tries}); trying again")
                 self._wait(1.0)
         raise AssertionError("unreachable")
+
+    def wait_for_update_window(self, timeout: float = 60.0, poll: float = 1.0) -> UpdateWindow:
+        """Polls the screen until the update window (Maturity | Minimum | Maximum) shows up, and returns how it
+        was read. Nothing is clicked, so the window may be opened by the script or by hand."""
+        t0 = time.time()
+        last = None
+        while True:
+            try:
+                self._read_update_window_once()
+                self._wait(0.8)                                    # let the window finish drawing
+                return self.read_update_window()
+            except SophisError as e:
+                last = e
+            if time.time() - t0 >= timeout * max(1.0, self.cfg.slowdown):
+                path = self.save_debug("update_window_not_detected")
+                raise SophisError(f"The update window did not appear within {timeout:.0f} s ({last}). "
+                                  f"Screenshot: {path}")
+            self._wait(poll)
 
     def _trace(self, step: str) -> None:
         """With trace on, saves a picture of the window at each step so a failed run can be inspected."""
@@ -1723,27 +1744,38 @@ class Automator:
                           previous.matches, ambiguous=False, win=win)
 
     def fill_values(self, entries: list, verify: bool = True, dry_run: bool = False, commit: str = "enter",
-                    check_edit: bool = True, recheck_row: bool = False) -> list:
+                    check_edit: bool = True, recheck_row: bool = False,
+                    skip_problems: bool = False) -> list:
         """Writes Minimum and Maximum for each entry in the open update window. The row is found again before
         every cell (the list may have scrolled). A date that appears more than once needs its `occurrence`;
-        nothing is guessed. dry_run only locates the cells. It NEVER presses OK: the window is left open so you
+        nothing is guessed. With skip_problems, a date that is missing, repeated or unreadable is left out (and
+        reported with written=False and a "skipped" reason) instead of stopping the whole batch. dry_run only locates the cells. It NEVER presses OK: the window is left open so you
         can check the values and confirm it yourself."""
         done = []
         # 1) Check everything that can be checked BEFORE changing anything.
         plan = []
+        skipped = []
         for e in entries:
-            t = self.locate_date(e.date, e.occurrence)
-            if t.ambiguous:
-                raise SophisError(
-                    f"{e.date:%d %b %Y} appears {len(t.matches)} times (rows {[m.index for m in t.matches]}, "
-                    f"read as {[m.text for m in t.matches]}). Choose one by writing the date as "
-                    f"'{e.date:%d %b %Y}#0' (the first) or '#1' (the second). Nothing was changed.")
+            try:
+                t = self.locate_date(e.date, e.occurrence)
+                if t.ambiguous:
+                    raise SophisError(
+                        f"{e.date:%d %b %Y} appears {len(t.matches)} times (rows {[m.index for m in t.matches]}, "
+                        f"read as {[m.text for m in t.matches]}). Choose one by writing the date as "
+                        f"'{e.date:%d %b %Y}#0' (the first) or '#1' (the second). Nothing was changed.")
+            except SophisError as err:
+                if not skip_problems:
+                    raise
+                self.log(f"  SKIPPED {e.date:%d %b %Y}: {err}")
+                skipped.append({"date": e.date, "minimum": None, "maximum": None, "written": False,
+                                "skipped": str(err)})
+                continue
             plan.append((e, t))
             self.log(f"plan: {e.date:%d %b %Y} -> row {t.row.index}; Minimum {e.minimum} at {t.minimum}, "
                      f"Maximum {e.maximum} at {t.maximum}")
         if dry_run:
             return [{"date": e.date, "row": t.row.index, "minimum": t.minimum, "maximum": t.maximum,
-                     "written": False} for e, t in plan]
+                     "written": False} for e, t in plan] + skipped
         # 2) Write. The row is found again before every cell (the list may have scrolled), with a fresh read.
         def view(win):
             return (tuple((r.index, r.date, r.suffix) for r in win.rows), round(win.header_y), round(win.x_maturity))
@@ -1766,7 +1798,7 @@ class Automator:
                 previous = t
             done.append(result)
         self.log("done. The window was left open: check the values and press OK yourself.")
-        return done
+        return done + skipped
 
     def annotate_window(self, win: UpdateWindow, target: CellTarget | None = None) -> Path:
         """Saves a screenshot with what was understood drawn on it, so you can check it by eye."""
@@ -2113,6 +2145,141 @@ def cmd_fill(args) -> None:
         print(" ", {k: (v.strftime('%d %b %Y') if hasattr(v, 'strftime') else v) for k, v in r.items()})
 
 
+def _summary_of(code: str, results: list) -> str:
+    written = [r for r in results if r.get("written")]
+    skipped = [r for r in results if r.get("skipped")]
+    lines = [f"{code}: {len(written)} date(s) written, {len(skipped)} skipped"]
+    for r in skipped:
+        lines.append(f"   SKIPPED {r['date']:%d %b %Y}: {r['skipped']}")
+    return "\n".join(lines)
+
+
+def run_codes(a: Automator, plan: dict, fill_opts: dict, countdown: int = 6, hotkey: str | None = None,
+              window_timeout: float = 60.0, input_fn=input, say=print, sleep_fn=time.sleep,
+              hotkey_fn=None) -> dict:
+    """The three stages for every code of the Excel plan, one code at a time.
+
+    1. (done by the caller) the Excel was read and the summary printed.
+    2. YOU find and select the code's row in the Listed market grid, then trigger the script (hotkey, or ENTER /
+       a number of seconds in the console). It reads the row's Term, sets the dropdown and opens the update window.
+    3. Automatic: as soon as the update window is on the screen, every date of that code is located and its
+       Minimum / Maximum typed. OK is never pressed: you check and press it yourself.
+    Returns {code: results, ...} (results as returned by fill_values; "quit" in the dict key list if stopped)."""
+    import sophis_excel as xl
+    outcome: dict = {}
+    total = len(plan)
+    for n, (code, items) in enumerate(plan.items(), start=1):
+        entries = [parse_entry(*t) for t in xl.entries_for(items)]
+        say(f"\n{'=' * 70}\nCode {n}/{total}: {code}   ({len(entries)} dates)\n{'=' * 70}")
+        window_open = False
+        while True:
+            if not window_open:
+                action, seconds = _wait_for_go(code, n, hotkey, countdown, input_fn, say, hotkey_fn)
+                if action == "quit":
+                    outcome["__stopped__"] = code
+                    return outcome
+                if action == "skip":
+                    say(f"Skipping {code}.")
+                    outcome[code] = []
+                    break
+                for sec in range(seconds, 0, -1):
+                    say(f"   switch to Sophis and do not touch anything ... {sec}")
+                    sleep_fn(1)
+            try:
+                if not window_open:
+                    say(f"\n[stage 2] {code}: reading the selected row, setting the Term, opening the update window ...")
+                    a.open_selected(None, wait=False)
+                    window_open = True
+                say(f"\n[stage 3] {code}: waiting for the update window, then filling {len(entries)} date(s) ...")
+                a.wait_for_update_window(window_timeout)
+                results = a.fill_values(entries, skip_problems=True, **fill_opts)
+            except SophisError as e:
+                say(f"\nERROR: {e}")
+                ans = input_fn("r = retry" + (" (the window stays as it is)" if window_open else "")
+                               + ", s = skip this code, q = quit [r]: ").strip().lower()
+                if ans == "q":
+                    outcome["__stopped__"] = code
+                    return outcome
+                if ans == "s":
+                    outcome[code] = []
+                    break
+                continue
+            outcome[code] = results
+            say("\n" + _summary_of(code, results))
+            say("The update window was LEFT OPEN: check the values and press OK in Sophis yourself.")
+            break
+    return outcome
+
+
+def _wait_for_go(code: str, n: int, hotkey: str | None, countdown: int, input_fn, say, hotkey_fn) -> tuple:
+    """Stage 2 trigger. Returns ("go", seconds_to_switch_to_sophis) / ("skip", 0) / ("quit", 0)."""
+    after_first = "" if n == 1 else "   (first press OK in the previous update window)\n"
+    say(f"\nIn Sophis, find {code} in the Listed market grid and select its row with ONE click.\n{after_first}")
+    if hotkey and hotkey_fn is not None:
+        say(f"When the row is selected, press {hotkey.upper()} (with Sophis in front) to continue. Ctrl+C quits.")
+        hotkey_fn(hotkey)
+        return "go", 1
+    answer = input_fn("When the row is selected, come back here and press ENTER to continue\n"
+                      "(or type the seconds you need to switch back to Sophis, e.g. 8; s = skip this code, "
+                      "q = quit): ").strip().lower()
+    if answer == "q":
+        return "quit", 0
+    if answer == "s":
+        return "skip", 0
+    return "go", int(answer) if answer.isdigit() and int(answer) > 0 else countdown
+
+
+def _global_hotkey(key: str) -> None:
+    import keyboard
+    keyboard.wait(key, suppress=True)          # suppress: Sophis does not also receive the key
+
+
+def cmd_run(args) -> None:
+    """All three stages in one go: Excel -> select the row yourself -> automatic Term check, window and values."""
+    import sophis_excel as xl
+    try:
+        plan, warnings = xl.read_plan(args.excel, args.sheet)
+        if args.code:
+            plan = {k: v for k, v in plan.items() if k.upper() == args.code.upper()}
+            if not plan:
+                raise xl.ExcelError(f"Code {args.code!r} is not in the file.")
+    except xl.ExcelError as e:
+        print(f"ERROR: {e}")
+        sys.exit(2)
+    print("\n[stage 1] Excel read\n" + xl.describe(plan))
+    for w in warnings:
+        print("WARNING:", w)
+    codes = list(plan)
+    print(f"\nSearch FIRST in Sophis: {codes[0]}")
+    if len(codes) > 1:
+        print(f"Then, one after the other: {', '.join(codes[1:])}")
+    hotkey_fn = None
+    if args.hotkey:
+        try:
+            import keyboard  # noqa: F401
+            hotkey_fn = _global_hotkey
+        except ImportError:
+            print(f"(--hotkey needs the `keyboard` package: pip install keyboard. Using ENTER in this console.)")
+    a = _create(args)
+    a.trace = not args.no_trace
+    a.strict_verify = args.strict_verify
+    fill_opts = dict(verify=not args.no_verify, commit=args.commit_click, check_edit=not args.no_edit_check,
+                     recheck_row=args.recheck_row)
+    try:
+        outcome = run_codes(a, plan, fill_opts, countdown=args.click_wait, hotkey=args.hotkey,
+                            window_timeout=args.window_timeout, hotkey_fn=hotkey_fn)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        sys.exit(130)
+    print("\n" + "=" * 70 + "\nSummary")
+    for code, results in outcome.items():
+        if code != "__stopped__":
+            print(_summary_of(code, results) if results else f"{code}: skipped")
+    if "__stopped__" in outcome:
+        print(f"Stopped at {outcome['__stopped__']}.")
+    print("OK was never pressed: check each update window and confirm it yourself.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sophis automation (stage 1: search a code and open its window)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2146,6 +2313,34 @@ def main() -> None:
     s.add_argument("--click-wait", dest="click_wait", type=int, default=5,
                    help="seconds you get to bring the update window to the front (default 5)")
     s.set_defaults(fn=cmd_fill)
+
+    s = sub.add_parser("run", help="everything: read the Excel, you select each code's row, then the Term check, "
+                                   "the update window and all the dates are done automatically")
+    s.add_argument("excel", help="the Excel / CSV with the strikes")
+    s.add_argument("--sheet", default=None, help="sheet of the Excel (default: the active one)")
+    s.add_argument("--code", default=None, help="only this code of the Excel")
+    s.add_argument("--hotkey", default=None, metavar="KEY",
+                   help="trigger stage 2 with a global key (e.g. f9; needs `pip install keyboard`) instead of ENTER "
+                        "in this console. Pressing it keeps Sophis in front")
+    s.add_argument("--click-wait", dest="click_wait", type=int, default=6,
+                   help="seconds you get to switch back to Sophis after pressing ENTER (default 6; you can also "
+                        "type a number instead of ENTER)")
+    s.add_argument("--window-timeout", dest="window_timeout", type=float, default=60.0,
+                   help="seconds to wait for the update window to appear (default 60)")
+    s.add_argument("--open-with", dest="open_with", choices=["button", "double"], default=None, help=argparse.SUPPRESS)
+    s.add_argument("--no-verify", dest="no_verify", action="store_true", help="do not read each cell back")
+    s.add_argument("--recheck-row", dest="recheck_row", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--strict-verify", dest="strict_verify", action="store_true",
+                   help="stop if a cell reads back as a different number (default: warn and go on)")
+    s.add_argument("--no-edit-check", dest="no_edit_check", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--no-trace", dest="no_trace", action="store_true",
+                   help="do not save a screenshot at every step")
+    s.add_argument("--commit-click", dest="commit_click", choices=["enter", "title", "ric"], default="enter",
+                   help=argparse.SUPPRESS)
+    s.add_argument("--reader", default=None, help=argparse.SUPPRESS)
+    s.add_argument("--no-widen", dest="no_widen", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--slowdown", dest="slowdown", type=float, help="multiplier for waits (2 = twice as slow)")
+    s.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("window", help="read the open update window: dates and where Minimum / Maximum go")
     s.add_argument("--date", help="a date to locate, e.g. '19 Oct 2026', 2026-10-19 or 19/10/2026")

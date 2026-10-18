@@ -1717,3 +1717,105 @@ def test_one_unreadable_row_between_its_neighbours_is_the_missing_date(ocr, anch
     a.read_update_window = lambda: real
     t = a.locate_date(D("27 Nov 2026"))
     assert t.row.index == row.index and not t.ambiguous
+
+
+# ── run: Excel plan -> you select the row -> Term + window -> dates, all in one go ──
+
+def _plan(*codes):
+    import sophis_excel as xl
+    return {c: [xl.DateValues(D(d), mn, mx, 2) for d, mn, mx in rows] for c, rows in codes}
+
+
+def _script(answers):
+    asked = []
+    it = iter(answers)
+    def input_fn(prompt):
+        asked.append(prompt)
+        return next(it)
+    return input_fn, asked
+
+
+def test_run_does_the_three_stages_for_one_code(ocr, anchors):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.sel = 3                                              # you selected the row by hand
+    said = []
+    input_fn, asked = _script([""])
+    plan = _plan(("SNDK", [("27 Nov 2026", 95.0, 130.0), ("30 Nov 2026", 1.0, 2.0)]))
+    out = sa.run_codes(a, plan, {}, countdown=1, input_fn=input_fn, say=said.append, sleep_fn=lambda s: None)
+    assert fake.dd == "Long term index" and fake.dialog                           # stage 2: Term set, window open
+    assert fake.values == {(7, "minimum"): "95", (7, "maximum"): "130", (8, "minimum"): "1", (8, "maximum"): "2"}
+    assert [r["written"] for r in out["SNDK"]] == [True, True]                    # stage 3
+    assert len(asked) == 1 and "SNDK" in " ".join(said) and "press OK" in " ".join(said)
+    ok = a.read_update_window().ok
+    if ok:                                                                        # OK was never pressed
+        assert not [e for e in fake.events if e[0] == "click" and abs(e[1] - ok[0]) < 6 and abs(e[2] - ok[1]) < 6]
+    assert fake.dialog
+
+
+def test_run_skips_a_date_that_is_not_in_the_list_and_keeps_going(ocr, anchors):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.sel = 3
+    input_fn, _ = _script([""])
+    plan = _plan(("SNDK", [("24 Oct 2026", 5.0, 6.0), ("27 Nov 2026", 95.0, 130.0)]))
+    out = sa.run_codes(a, plan, {}, countdown=1, input_fn=input_fn, say=lambda *_: None, sleep_fn=lambda s: None)
+    assert fake.values == {(7, "minimum"): "95", (7, "maximum"): "130"}
+    skipped = [r for r in out["SNDK"] if r.get("skipped")]
+    assert len(skipped) == 1 and skipped[0]["date"] == D("24 Oct 2026") and not skipped[0]["written"]
+    assert "SKIPPED 24 Oct 2026" in sa._summary_of("SNDK", out["SNDK"])
+
+
+def test_run_second_code_asks_first_for_ok_and_s_skips_q_quits(ocr, anchors):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.sel = 3
+    said = []
+    input_fn, asked = _script(["s", "q"])
+    plan = _plan(("AAA", [("27 Nov 2026", 1.0, 2.0)]), ("BBB", [("27 Nov 2026", 3.0, 4.0)]),
+                 ("CCC", [("27 Nov 2026", 5.0, 6.0)]))
+    out = sa.run_codes(a, plan, {}, countdown=1, input_fn=input_fn, say=said.append, sleep_fn=lambda s: None)
+    assert out == {"AAA": [], "__stopped__": "BBB"} and fake.values == {} and not fake.dialog
+    assert "first press OK in the previous update window" in " ".join(said)       # only from the 2nd code on
+
+
+def test_run_typed_number_sets_the_seconds_and_a_hotkey_replaces_enter(ocr, anchors):
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.sel = 3
+    slept, keys = [], []
+    input_fn, _ = _script(["3"])
+    sa.run_codes(a, _plan(("SNDK", [("27 Nov 2026", 1.0, 2.0)])), {}, countdown=9, input_fn=input_fn,
+                 say=lambda *_: None, sleep_fn=slept.append)
+    assert slept == [1, 1, 1]
+    a2, fake2, _ = _logged(ocr, anchors, reader="ocr")
+    fake2.sel = 3
+    def no_input(prompt):
+        raise AssertionError("the console must not be asked when a hotkey is used")
+    sa.run_codes(a2, _plan(("SNDK", [("27 Nov 2026", 1.0, 2.0)])), {}, countdown=9, hotkey="f9", input_fn=no_input,
+                 say=lambda *_: None, sleep_fn=lambda s: None, hotkey_fn=keys.append)
+    assert keys == ["f9"] and fake2.values == {(7, "minimum"): "1", (7, "maximum"): "2"}
+
+
+def test_wait_for_update_window_gives_up_with_a_clear_error(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    with pytest.raises(SophisError, match="did not appear within"):
+        a.wait_for_update_window(timeout=0.01, poll=0.01)
+
+
+def test_run_retry_after_a_window_that_never_appeared(ocr, anchors, tmp_path, monkeypatch):
+    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+    a, fake, lines = _logged(ocr, anchors, reader="ocr")
+    fake.sel = 3
+    real = a.wait_for_update_window
+    calls = []
+    def flaky(timeout=60.0, poll=1.0):
+        calls.append(1)
+        if len(calls) == 1:
+            raise SophisError("simulated: no window")
+        return real(timeout, poll)
+    a.wait_for_update_window = flaky
+    input_fn, asked = _script(["", "r"])
+    said = []
+    out = sa.run_codes(a, _plan(("SNDK", [("27 Nov 2026", 1.0, 2.0)])), {}, countdown=1, input_fn=input_fn,
+                       say=said.append, sleep_fn=lambda s: None)
+    assert len(calls) == 2 and fake.values == {(7, "minimum"): "1", (7, "maximum"): "2"}
+    assert fake.avail_clicks == 1                                  # the window was NOT opened a second time
+    assert "window stays as it is" in asked[1]
