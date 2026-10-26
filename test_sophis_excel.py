@@ -244,3 +244,12 @@ def test_run_without_a_file_opens_the_picker(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(xl, "pick_file", lambda *a, **k: None)
     with pytest.raises(SystemExit):
         sa.main()
+
+
+def test_an_outdated_sophis_excel_is_reported_clearly(monkeypatch, capsys):
+    import sophis_auto as sa
+    monkeypatch.delattr(xl, "pick_file")
+    with pytest.raises(SystemExit):
+        sa._import_excel_module()
+    out = capsys.readouterr().out
+    assert "out of date" in out and "pick_file" in out and "git pull" in out

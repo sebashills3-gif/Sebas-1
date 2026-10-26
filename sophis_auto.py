@@ -2073,6 +2073,19 @@ def _countdown_to_front(args) -> None:
     print("   going         ")
 
 
+def _import_excel_module():
+    """sophis_excel.py must be the same version as this file; an old copy (e.g. from a partial download) would
+    otherwise fail later with an obscure AttributeError."""
+    import sophis_excel as xl
+    missing = [n for n in ("pick_file", "read_plan", "describe", "entries_for") if not hasattr(xl, n)]
+    if missing:
+        print(f"ERROR: the file {xl.__file__} is out of date (it has no {', '.join(missing)}).\n"
+              "Update BOTH sophis_auto.py and sophis_excel.py to the same version: run `git pull` in the project "
+              "folder, or download both files again, and delete any other old copy of sophis_excel.py.")
+        sys.exit(2)
+    return xl
+
+
 def _excel_triples(args) -> list:
     """(date, Minimum, Maximum) for the code chosen with --code (or the only one in the Excel)."""
     import sophis_excel as xl
@@ -2222,7 +2235,7 @@ def _global_hotkey(key: str) -> None:
 
 def cmd_run(args) -> None:
     """All three stages in one go: Excel -> select the row yourself -> automatic Term check, window and values."""
-    import sophis_excel as xl
+    xl = _import_excel_module()
     if not args.excel:
         print("Choose the Excel file in the window that opens ...")
         args.excel = xl.pick_file()
