@@ -225,11 +225,13 @@ The update window was LEFT OPEN: check the values and press OK in Sophis yoursel
 4. At the end the script prints a final summary of all codes (written / skipped dates).
 
 ### 5.5 What gets skipped (and why)
-A date is **skipped, not guessed**, and reported in the summary, when:
+A date is **skipped** and reported in the summary when:
 * it is **not in the Maturity list** of the Strikes window;
-* it appears **more than once** in the list (including rows with a suffix such as `-1`), because the script cannot
-  know which row you mean. Fill those by hand, or fill them with the advanced command in section 6.3.
 * its row cannot be read.
+
+**Repeated dates** (the same date on several rows, including rows with a suffix such as `-1`): the script writes the
+values in the **first** row with that date (the topmost one) and says so in the console. To use another one with
+`fill`, write `DATE#1` (the second), `DATE#2`, and so on.
 
 Everything else in the batch continues normally.
 
@@ -261,7 +263,7 @@ python sophis_auto.py fill --excel strikes.xlsx --code SNDK
 python sophis_auto.py fill --entry "15 Jan 2027" 45 100 --entry "20 Nov 2026#1" 30 70
 ```
 `DATE#0` is the first row with a repeated date and `DATE#1` the second one.
-The dates are processed **one at a time** (find the date, type its Minimum and Maximum, then the next date). With `fill` (unlike `run`) a missing or repeated date **stops** the run at that date; the dates before it have already been written. `--dry-run` is the only mode that scans all the dates first.
+The dates are processed **one at a time** (find the date, type its Minimum and Maximum, then the next date). With `fill` (unlike `run`) a date that is not in the list **stops** the run at that date; the dates before it have already been written. `--dry-run` is the only mode that scans all the dates first.
 
 ---
 

@@ -1277,12 +1277,12 @@ def test_several_dates_in_one_go(ocr, anchors):
                            (15, "minimum"): "7", (15, "maximum"): "8"}
 
 
-def test_a_repeated_date_is_never_guessed(ocr, anchors):
+def test_a_repeated_date_goes_to_its_first_row_unless_an_occurrence_is_given(ocr, anchors):
     a, fake, lines = _logged(ocr, anchors, reader="ocr")
     fake.dialog = True
-    with pytest.raises(SophisError, match="appears 2 times.*#0.*#1.*before this one were already written"):
-        a.fill_values([sa.parse_entry("23 Oct 2026", "1", "2"), sa.parse_entry("20 Nov 2026", "5", "6")])
-    assert fake.values == {(1, "minimum"): "1", (1, "maximum"): "2"}     # the first date is done, the repeated is not
+    a.fill_values([sa.parse_entry("23 Oct 2026", "1", "2"), sa.parse_entry("20 Nov 2026", "5", "6")])
+    assert fake.values == {(1, "minimum"): "1", (1, "maximum"): "2", (5, "minimum"): "5", (5, "maximum"): "6"}
+    assert any("using the first one (row 5)" in l for l in lines)           # rows 5 and 6 both read 20 Nov 2026
 
 
 def test_dates_are_done_one_by_one_not_all_located_first(ocr, anchors):
@@ -1864,3 +1864,24 @@ def test_far_dates_are_reached_with_growing_scroll_steps(ocr, anchors):
     assert t.row.date == days[250]
     assert len(state["scrolls"]) <= 8, state["scrolls"]            # fixed 3-click steps would need ~27
     assert max(abs(c) for c in state["scrolls"]) > 5
+
+
+def test_the_wheel_is_sent_as_separate_notches_and_the_mouse_only_moves_when_needed():
+    calls = []
+
+    class PG:
+        def __init__(self):
+            self.pos = (0, 0)
+        def position(self):
+            return self.pos
+        def moveTo(self, x, y, duration=0):
+            calls.append(("move", x, y))
+            self.pos = (x, y)
+        def scroll(self, n, **kw):
+            calls.append(("wheel", n, kw.get("_pause")))
+
+    screen = object.__new__(sa.Screen)
+    screen.pg = PG()
+    screen.scroll(-4, 300, 200)
+    screen.scroll(2, 301, 201)                                  # already there (within 2 px): no move
+    assert calls == [("move", 300, 200)] + [("wheel", -1, False)] * 4 + [("wheel", 1, False)] * 2

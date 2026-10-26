@@ -728,9 +728,16 @@ class Screen:
         self.pg.hotkey(*keys)
 
     def scroll(self, clicks: int, x: int, y: int) -> None:
-        """Mouse wheel over (x, y): positive scrolls up, negative scrolls down."""
-        self.pg.moveTo(x, y, duration=0.15)
-        self.pg.scroll(clicks)
+        """Mouse wheel over (x, y): positive scrolls up, negative scrolls down. The wheel is sent as that many
+        SEPARATE one-notch events in a quick burst: a single event with a big delta ('scroll(20)') is treated by
+        Citrix and many grids as ONE notch, so asking for more clicks did not scroll any faster."""
+        px, py = self.pg.position()
+        if abs(px - x) > 2 or abs(py - y) > 2:               # already over the list: no need to move again
+            self.pg.moveTo(x, y, duration=0.15)
+        step = 1 if clicks > 0 else -1
+        for _ in range(abs(int(clicks))):
+            self.pg.scroll(step, _pause=False)
+            time.sleep(0.012)
 
     def drag(self, x0: int, y0: int, x1: int, y1: int) -> None:
         self.pg.moveTo(x0, y0, duration=0.2)
@@ -1483,6 +1490,7 @@ class Automator:
         and Maximum cells are. If several rows have that date, `occurrence` (0, 1, ...) picks one; without it the
         first is returned and `ambiguous` is True. Nothing is clicked or typed."""
         previous = None
+        t_step = time.time()
         clicks, last_down = 5, None             # wheel clicks per step: doubled while going the same way, halved on overshoot
         for _ in range(max_scrolls + 1):
             win = self.read_update_window()
@@ -1516,7 +1524,9 @@ class Automator:
                 clicks = min(clicks * 2, 24) if down == last_down else max(1, clicks // 2)
             last_down = down
             self.log(f"  {target:%d %b %Y} not visible ({dated[0].date:%d %b %Y} ... {dated[-1].date:%d %b %Y}); "
-                     f"scrolling {'down' if down else 'up'} ({clicks} clicks)")
+                     f"scrolling {'down' if down else 'up'} ({clicks} clicks; last step took "
+                     f"{time.time() - t_step:.1f} s)")
+            t_step = time.time()
             mid = win.rows[len(win.rows) // 2].cy
             self.s.scroll(-clicks if down else clicks, win.x_maturity, mid)
             self._wait(0.4)
@@ -1734,8 +1744,8 @@ class Automator:
                     skip_problems: bool = False) -> list:
         """Writes Minimum and Maximum for each entry in the open update window, ONE DATE AT A TIME: find the
         date, type its Minimum, type its Maximum, then go on with the next date (the list is never scanned for all
-        the dates first). A date that appears more than once needs its `occurrence`; nothing is guessed. With
-        skip_problems, a date that is missing, repeated or unreadable is left out (reported with written=False and
+        the dates first). A date that appears more than once goes to its FIRST row (the topmost one) unless an
+        `occurrence` is given. With skip_problems, a date that is missing or unreadable is left out (reported with written=False and
         a "skipped" reason) instead of stopping the batch; without it the run stops there, and the dates before it
         have already been written. dry_run only locates the cells (it does scan every date). It NEVER presses OK:
         the window is left open so you can check the values and confirm it yourself."""
@@ -1743,12 +1753,10 @@ class Automator:
 
         def locate(e):
             t = self.locate_date(e.date, e.occurrence)
-            if t.ambiguous:
-                raise SophisError(
-                    f"{e.date:%d %b %Y} appears {len(t.matches)} times (rows {[m.index for m in t.matches]}, "
-                    f"read as {[m.text for m in t.matches]}). Choose one by writing the date as "
-                    f"'{e.date:%d %b %Y}#0' (the first) or '#1' (the second)."
-                    + ("" if dry_run else " The dates before this one were already written."))
+            if t.ambiguous:                       # a repeated date without a chosen occurrence: the first one seen
+                self.log(f"  {e.date:%d %b %Y} appears {len(t.matches)} times (rows {[m.index for m in t.matches]}, "
+                         f"read as {[m.text for m in t.matches]}); using the first one (row {t.row.index}). "
+                         f"To use another write '{e.date:%d %b %Y}#1' (the second), '#2' ...")
             return t
 
         def skipped(e, err):
