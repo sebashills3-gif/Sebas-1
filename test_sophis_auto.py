@@ -1797,7 +1797,7 @@ def test_run_typed_number_sets_the_seconds_and_a_hotkey_replaces_enter(ocr, anch
     input_fn, _ = _script(["3"])
     sa.run_codes(a, _plan(("SNDK", [("27 Nov 2026", 1.0, 2.0)])), {}, countdown=9, input_fn=input_fn,
                  say=lambda *_: None, sleep_fn=slept.append)
-    assert slept == [1, 1, 1, 3.0]                       # 3 s countdown typed by you, then the 3 s after the icon
+    assert slept == [1, 1, 1, 1.0]                       # 3 s countdown typed by you, then the 1 s after the icon
     a2, fake2, _ = _logged(ocr, anchors, reader="ocr")
     fake2.sel = 3
     def no_input(prompt):
@@ -1818,7 +1818,7 @@ def test_run_fills_a_fixed_delay_after_the_click_without_looking_for_the_window(
     input_fn, _ = _script([""])
     sa.run_codes(a, _plan(("SNDK", [("27 Nov 2026", 1.0, 2.0)])), {}, countdown=1, input_fn=input_fn,
                  say=lambda *_: None, sleep_fn=slept.append)
-    assert order == ["icon", "fill"] and slept == [1, 3.0]        # 1 s countdown, then exactly 3 s after the icon
+    assert order == ["icon", "fill"] and slept == [1, 1.0]        # 1 s countdown, then exactly 1 s after the icon
     assert not hasattr(a, "wait_for_update_window")               # no visual trigger any more
     assert fake.values == {(7, "minimum"): "1", (7, "maximum"): "2"}
 
@@ -1863,4 +1863,4 @@ def test_far_dates_are_reached_with_growing_scroll_steps(ocr, anchors):
     t = a.locate_date(days[250])
     assert t.row.date == days[250]
     assert len(state["scrolls"]) <= 8, state["scrolls"]            # fixed 3-click steps would need ~27
-    assert max(abs(c) for c in state["scrolls"]) > 3
+    assert max(abs(c) for c in state["scrolls"]) > 5

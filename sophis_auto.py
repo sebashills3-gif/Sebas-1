@@ -1483,7 +1483,7 @@ class Automator:
         and Maximum cells are. If several rows have that date, `occurrence` (0, 1, ...) picks one; without it the
         first is returned and `ambiguous` is True. Nothing is clicked or typed."""
         previous = None
-        clicks, last_down = 3, None             # wheel clicks per step: doubled while going the same way, halved on overshoot
+        clicks, last_down = 5, None             # wheel clicks per step: doubled while going the same way, halved on overshoot
         for _ in range(max_scrolls + 1):
             win = self.read_update_window()
             matches = win.find(target)
@@ -1519,7 +1519,7 @@ class Automator:
                      f"scrolling {'down' if down else 'up'} ({clicks} clicks)")
             mid = win.rows[len(win.rows) // 2].cy
             self.s.scroll(-clicks if down else clicks, win.x_maturity, mid)
-            self._wait(0.7)
+            self._wait(0.4)
         raise SophisError(f"{target:%d %b %Y} was not found after {max_scrolls} scrolls.")
 
     @staticmethod
@@ -2157,14 +2157,14 @@ def _summary_of(code: str, results: list) -> str:
 
 
 def run_codes(a: Automator, plan: dict, fill_opts: dict, countdown: int = 6, hotkey: str | None = None,
-              open_delay: float = 3.0, input_fn=input, say=print, sleep_fn=time.sleep,
+              open_delay: float = 1.0, input_fn=input, say=print, sleep_fn=time.sleep,
               hotkey_fn=None) -> dict:
     """The three stages for every code of the Excel plan, one code at a time.
 
     1. (done by the caller) the Excel was read and the summary printed.
     2. YOU find and select the code's row in the Listed market grid, then trigger the script (hotkey, or ENTER /
        a number of seconds in the console). It reads the row's Term, sets the dropdown and opens the update window.
-    3. Automatic: `open_delay` seconds (3) after the click on the "Available contracts" icon, with no check of
+    3. Automatic: `open_delay` seconds (1) after the click on the "Available contracts" icon, with no check of
        what is on the screen first, every date of that code is located and its Minimum / Maximum typed.
        OK is never pressed: you check and press it yourself.
     Returns {code: results, ...} (results as returned by fill_values; "quit" in the dict key list if stopped)."""
@@ -2339,9 +2339,9 @@ def main() -> None:
     s.add_argument("--click-wait", dest="click_wait", type=int, default=6,
                    help="seconds you get to switch back to Sophis after pressing ENTER (default 6; you can also "
                         "type a number instead of ENTER)")
-    s.add_argument("--open-delay", dest="open_delay", type=float, default=3.0,
+    s.add_argument("--open-delay", dest="open_delay", type=float, default=1.0,
                    help="seconds between the click on the 'Available contracts' icon and the start of the filling "
-                        "(default 3; there is no check that the window is open - raise it if Sophis is slow)")
+                        "(default 1; there is no check that the window is open - raise it if Sophis is slow)")
     s.add_argument("--open-with", dest="open_with", choices=["button", "double"], default=None, help=argparse.SUPPRESS)
     s.add_argument("--no-verify", dest="no_verify", action="store_true", help="do not read each cell back")
     s.add_argument("--recheck-row", dest="recheck_row", action="store_true", help=argparse.SUPPRESS)

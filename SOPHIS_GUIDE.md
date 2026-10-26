@@ -16,7 +16,7 @@ The script does this for you, starting from an Excel file:
 |-------|--------------|-------------|
 | **1. Extraction** | The Excel is read. The script prints a summary and tells you **which code to look for first** in Sophis. | Script |
 | **2. Selection and opening** | You find the code in the *Listed market* grid and select its row. The script then reads the row's **Term**, sets the same Term in the dropdown above the right-hand table, and opens the **Strikes** window with the first button next to *Available contracts*. | You (selection) + Script |
-| **3. Filling** | **3 seconds after** it clicks the icon, the script starts filling the **Strikes** window (Maturity / Minimum / Maximum / Ric): it finds each date and types its Minimum and Maximum, confirming each value with Enter. It does not check first whether the window is open. | Script (automatic) |
+| **3. Filling** | **1 second after** it clicks the icon, the script starts filling the **Strikes** window (Maturity / Minimum / Maximum / Ric): it finds each date and types its Minimum and Maximum, confirming each value with Enter. It does not check first whether the window is open. | Script (automatic) |
 
 > **The script never presses OK.** When it finishes, the **Strikes** window is left open so that you can check every
 > value and press **OK yourself**.
@@ -178,7 +178,7 @@ python sophis_auto.py run
 A **file selector window opens**: choose the Excel (`.xlsx`, `.xls` or `.csv`). (If your computer cannot show the
 window, the console asks you to paste the path instead. You can also give the path directly:
 `python sophis_auto.py run strikes.xlsx`.) Useful options: `--code SNDK` to process only one code,
-`--sheet NAME`, `--click-wait 8`, `--open-delay 5`, `--slowdown 1.5` for a slower, more careful run; see section 7.
+`--sheet NAME`, `--click-wait 8`, `--open-delay 3`, `--slowdown 1.5` for a slower, more careful run; see section 7.
 
 **Stage 1 – Extraction.** The console prints something like:
 ```
@@ -204,9 +204,9 @@ If the file has more codes, it also lists the order in which they will be proces
    * sets the **dropdown** above the right-hand table to that Term and checks that it matches,
    * clicks the first button next to **Available contracts** to open the **Strikes** window.
 
-**Stage 3 – Automatic filling.** Exactly **3 seconds after the click on the icon** the script starts by itself
+**Stage 3 – Automatic filling.** Exactly **1 second after the click on the icon** the script starts by itself
 (it does not wait to "see" the window, so make sure the Strikes window really opens in that time; if Sophis is slow,
-use `--open-delay 5`). For every date of the code it:
+use `--open-delay 3`). For every date of the code it:
 1. finds the row with that date in the Maturity column (scrolling the list if needed),
 2. double-clicks the **Minimum** cell, types the value and presses **Enter**,
 3. moves to the **Maximum** cell of the same row, types the value and presses **Enter**.
@@ -271,7 +271,7 @@ The dates are processed **one at a time** (find the date, type its Minimum and M
 |--------|--------|
 | `--slowdown 1.5` (or `2`) | Waits longer after each action. Use it if Citrix is slow and clicks arrive late. |
 | `--click-wait 8` | More seconds to switch back to Sophis after pressing ENTER (stage 2). |
-| `--open-delay 5` | Seconds between the click on the *Available contracts* icon and the start of the filling (default 3). Raise it if the Strikes window opens slowly. |
+| `--open-delay 3` | Seconds between the click on the *Available contracts* icon and the start of the filling (default 1). Raise it if the Strikes window opens slowly. |
 | `--no-widen` | Does not try to enlarge the Term column automatically. |
 | `--strict-verify` | Stops if a typed value reads back differently (default: warn and continue, because the on-screen text is sometimes misread). |
 | `--no-verify` | Does not read the cells back after typing. |
