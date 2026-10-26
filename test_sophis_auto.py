@@ -1783,7 +1783,7 @@ def test_run_typed_number_sets_the_seconds_and_a_hotkey_replaces_enter(ocr, anch
     input_fn, _ = _script(["3"])
     sa.run_codes(a, _plan(("SNDK", [("27 Nov 2026", 1.0, 2.0)])), {}, countdown=9, input_fn=input_fn,
                  say=lambda *_: None, sleep_fn=slept.append)
-    assert slept == [1, 1, 1]
+    assert slept == [1, 1, 1, 3.0]                       # 3 s countdown typed by you, then the 3 s after the icon
     a2, fake2, _ = _logged(ocr, anchors, reader="ocr")
     fake2.sel = 3
     def no_input(prompt):
