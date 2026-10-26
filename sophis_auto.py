@@ -1488,15 +1488,23 @@ class Automator:
     def locate_date(self, target: dt.date, occurrence: int | None = None, max_scrolls: int = 30) -> CellTarget:
         """Finds the row whose Maturity is `target` (scrolling the list if needed) and returns where its Minimum
         and Maximum cells are. If several rows have that date, `occurrence` (0, 1, ...) picks one; without it the
-        first is returned and `ambiguous` is True. Nothing is clicked or typed."""
+        first is returned and `ambiguous` is True. Nothing is clicked or typed.
+
+        Scrolling is sized from what is on the screen: how many rows one wheel notch moves is measured after
+        every step, and the number of notches for the next step comes from how far (in days, at the local
+        density of dates) the target is."""
         previous = None
         t_step = time.time()
-        clicks, last_down = 5, None             # wheel clicks per step: doubled while going the same way, halved on overshoot
+        per_notch = None                        # rows moved by one wheel notch (measured)
+        last = None                             # (dates of the rows before the last scroll, notches, went down)
+        rereads = 0
         for _ in range(max_scrolls + 1):
             win = self.read_update_window()
             matches = win.find(target)
             if matches:
                 win, matches = self._reveal_duplicates(win, target)
+                if not matches:                 # the nudging lost the date (misread row): look for it again
+                    continue
                 if occurrence is not None and occurrence >= len(matches):
                     win, matches = self._more_occurrences(win, target, occurrence, matches)
                 row = matches[occurrence or 0]
@@ -1506,6 +1514,11 @@ class Automator:
             if not dated:
                 raise SophisError("No dates could be read in the update window.")
             if dated[0].date <= target <= dated[-1].date:
+                if rereads < 2:                 # the row may simply have been misread this time
+                    rereads += 1
+                    self.log(f"  {target:%d %b %Y} falls inside the visible dates but was not read; reading again")
+                    self._wait(0.6)
+                    continue
                 slot = self._unreadable_slot(win, target)
                 if slot is not None:
                     self.log(f"  WARNING: {target:%d %b %Y} was not read, but row {slot.index} (unreadable) sits exactly "
@@ -1520,17 +1533,51 @@ class Automator:
                                   f"{dated[0].date:%d %b %Y} ... {dated[-1].date:%d %b %Y}.")
             previous = signature
             down = target > dated[-1].date
-            if last_down is not None:
-                clicks = min(clicks * 2, 24) if down == last_down else max(1, clicks // 2)
-            last_down = down
+            if last is not None:
+                per_notch = self._rows_per_notch(last, dated, per_notch)
+            clicks = self._notches_needed(target, dated, down, per_notch)
             self.log(f"  {target:%d %b %Y} not visible ({dated[0].date:%d %b %Y} ... {dated[-1].date:%d %b %Y}); "
-                     f"scrolling {'down' if down else 'up'} ({clicks} clicks; last step took "
-                     f"{time.time() - t_step:.1f} s)")
+                     f"scrolling {'down' if down else 'up'} ({clicks} clicks"
+                     + (f", ~{per_notch:.1f} rows per click" if per_notch else "")
+                     + f"; last step took {time.time() - t_step:.1f} s)")
             t_step = time.time()
+            last = ([r.date for r in dated], clicks, down)
             mid = win.rows[len(win.rows) // 2].cy
             self.s.scroll(-clicks if down else clicks, win.x_maturity, mid)
             self._wait(0.4)
         raise SophisError(f"{target:%d %b %Y} was not found after {max_scrolls} scrolls.")
+
+    @staticmethod
+    def _rows_per_notch(last: tuple, dated: list, current: float | None) -> float | None:
+        """How many rows one wheel notch moved the list, from the view before the last scroll and the view now."""
+        before, clicks, down = last
+        now = [r.date for r in dated]
+        if not clicks or not before:
+            return current
+        if down:       # the old LAST row moved up by `moved` rows
+            idx = [k for k, d in enumerate(now) if d == before[-1]]
+            moved = (len(before) - 1) - idx[0] if idx else None
+        else:          # the old FIRST row moved down by `moved` rows
+            idx = [k for k, d in enumerate(now) if d == before[0]]
+            moved = idx[-1] if idx else None
+        if moved is not None and moved > 0:
+            return moved / clicks
+        if moved is None:                       # jumped more than a whole screen: at least this much per notch
+            return max(current or 0, len(before) / clicks)
+        return current
+
+    @staticmethod
+    def _notches_needed(target: dt.date, dated: list, down: bool, per_notch: float | None) -> int:
+        """Notches for the next scroll: rows to travel (days to the target / days per row of the visible dates)
+        divided by the rows one notch moves, aiming a bit short so it does not overshoot far."""
+        n = len(dated)
+        span = max(1, (dated[-1].date - dated[0].date).days)
+        days_per_row = max(0.5, span / max(1, n - 1))
+        edge = dated[-1].date if down else dated[0].date
+        rows = abs((target - edge).days) / days_per_row
+        if per_notch is None:                   # first step: also measures how far one notch goes
+            return int(max(2, min(8, round(rows / 3 * 0.7))))
+        return int(max(1, min(40, round(0.75 * rows / per_notch))))
 
     @staticmethod
     def _unreadable_slot(win: UpdateWindow, target: dt.date) -> WindowRow | None:
@@ -1590,11 +1637,19 @@ class Automator:
                 if edge.date != target:
                     break
                 before = tuple(r.date for r in dated)
-                self.s.scroll(direction, win.x_maturity, win.rows[len(win.rows) // 2].cy)
+                mid = win.rows[len(win.rows) // 2].cy
+                self.s.scroll(direction, win.x_maturity, mid)
                 self._wait(0.6)
-                win = self.read_update_window()
-                if tuple(r.date for r in win.dated()) == before:         # the list did not move: end of the list
+                moved = self.read_update_window()
+                if tuple(r.date for r in moved.dated()) == before:       # the list did not move: end of the list
+                    win = moved
                     break
+                if not moved.find(target):                               # one notch took the date out of view
+                    self.s.scroll(-direction, win.x_maturity, mid)       # put it back and stop nudging
+                    self._wait(0.6)
+                    win = self.read_update_window()
+                    break
+                win = moved
         return win, win.find(target)
 
     # ── stage 2b: write the values (double click a cell, type, click outside) ─────────────────

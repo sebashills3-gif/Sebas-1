@@ -1885,3 +1885,56 @@ def test_the_wheel_is_sent_as_separate_notches_and_the_mouse_only_moves_when_nee
     screen.scroll(-4, 300, 200)
     screen.scroll(2, 301, 201)                                  # already there (within 2 px): no move
     assert calls == [("move", 300, 200)] + [("wheel", -1, False)] * 4 + [("wheel", 1, False)] * 2
+
+
+def _long_list(a, days, rows_per_notch):
+    import dataclasses
+    base = a.read_update_window()
+    state = {"top": 0, "scrolls": []}
+
+    def read():
+        rows = [sa.WindowRow(i, base.rows[i].cy, f"{days[state['top'] + i]:%d %b %Y}", days[state["top"] + i])
+                for i in range(len(base.rows))]
+        return dataclasses.replace(base, rows=rows)
+
+    def scroll(clicks, x, y):
+        state["scrolls"].append(clicks)
+        state["top"] = max(0, min(len(days) - len(base.rows), state["top"] - rows_per_notch * clicks))
+
+    a.read_update_window, a.s.scroll = read, scroll
+    return state
+
+
+@pytest.mark.parametrize("per_notch", [1, 3, 8])
+def test_scroll_converges_fast_whatever_the_rows_per_notch_and_the_date_density(ocr, anchors, per_notch):
+    a, fake = _open_window(ocr, anchors)
+    # weekly dates for a year, then monthly, then quarterly: the density changes along the list
+    days, d = [], dt.date(2026, 10, 19)
+    for step in [7] * 52 + [30] * 36 + [91] * 20:
+        days.append(d)
+        d += dt.timedelta(days=step)
+    state = _long_list(a, days, per_notch)
+    for idx in (60, 100, 5):                                      # far down, further down, then back up
+        t = a.locate_date(days[idx])
+        assert t.row.date == days[idx]
+    assert len(state["scrolls"]) <= 14, state["scrolls"]
+
+
+def test_a_date_lost_by_the_duplicate_nudging_does_not_crash(ocr, anchors):
+    """Reported: IndexError (list index out of range) when the nudge took the date out of view or a re-read misread it."""
+    a, fake = _open_window(ocr, anchors)
+    real = a.read_update_window()
+    calls = []
+
+    def read():
+        calls.append(1)
+        win = real
+        if len(calls) == 2:                       # the re-read after the nudge: the date is not read this time
+            import dataclasses
+            win = dataclasses.replace(real, rows=[r for r in real.rows if r.date != D("27 Nov 2026")])
+        return win
+
+    a.read_update_window = read
+    a.s.scroll = lambda *x: None
+    t = a.locate_date(D("27 Nov 2026"))
+    assert t.row.date == D("27 Nov 2026")
