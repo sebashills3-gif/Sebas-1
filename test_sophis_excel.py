@@ -92,7 +92,7 @@ def test_clear_errors(tmp_path):
         xl.read_plan(old)
     html = tmp_path / "export.xls"
     html.write_text("<html><table></table></html>")
-    with pytest.raises(xl.ExcelError, match="HTML/XML export"):
+    with pytest.raises(xl.ExcelError, match="No data rows"):        # an HTML page without data rows
         xl.read_plan(html)
 
 
@@ -158,3 +158,89 @@ def test_a_semicolon_or_tab_text_export_and_an_xlsx_named_xls(tmp_path):
     path = tmp_path / "disguised.xls"
     wb.save(path)
     assert xl.read_plan(path)[0]["SNDK"][0].minimum == 45.0
+
+
+def test_an_xls_that_is_really_an_html_table(tmp_path):
+    path = tmp_path / "export.xls"
+    path.write_text("<html><body><table><tr><th>Equity</th><th>Date</th></tr>"
+                    "<tr><td>SNDK US Equity</td><td>x</td><td>y</td><td>01/15/27</td><td>45.00</td><td>SNDK</td></tr>"
+                    "<tr><td></td><td></td><td></td><td>01/15/27</td><td>1,100.50</td><td>SNDK</td></tr>"
+                    "</table></body></html>", encoding="utf-8")
+    plan, _ = xl.read_plan(path)
+    d = plan["SNDK"][0]
+    assert (d.date, d.minimum, d.maximum) == (dt.date(2027, 1, 15), 45.0, 1100.5)
+
+
+def test_an_xls_that_is_really_an_xml_spreadsheet(tmp_path):
+    path = tmp_path / "export.xls"
+    path.write_text('''<?xml version="1.0"?>
+<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">
+ <Worksheet ss:Name="Data"><Table>
+  <Row><Cell><Data ss:Type="String">h</Data></Cell></Row>
+  <Row><Cell ss:Index="4"><Data ss:Type="String">01/15/27</Data></Cell><Cell><Data ss:Type="Number">45</Data></Cell>
+       <Cell><Data ss:Type="String">SNDK</Data></Cell></Row>
+  <Row><Cell ss:Index="4"><Data ss:Type="String">01/15/27</Data></Cell><Cell><Data ss:Type="Number">100</Data></Cell>
+       <Cell><Data ss:Type="String">SNDK</Data></Cell></Row>
+ </Table></Worksheet>
+</Workbook>''', encoding="utf-8")
+    plan, _ = xl.read_plan(path)
+    assert (plan["SNDK"][0].minimum, plan["SNDK"][0].maximum) == (45.0, 100.0)
+    with pytest.raises(xl.ExcelError, match="No sheet named"):
+        xl.read_plan(path, "Other")
+
+
+def test_a_broken_xls_gives_a_clear_message(tmp_path):
+    path = tmp_path / "broken.xls"
+    path.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 40)
+    with pytest.raises(xl.ExcelError, match="save it as .xlsx"):
+        xl.read_plan(path)
+
+
+def test_the_file_picker_falls_back_to_the_console_without_a_screen(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+    def no_tk(name, *a, **k):
+        if name.startswith("tkinter"):
+            raise ImportError("no display")
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", no_tk)
+    assert xl.pick_file(input_fn=lambda prompt: ' "C:\\data\\strikes.xls" ') == "C:\\data\\strikes.xls"
+    assert xl.pick_file(input_fn=lambda prompt: "") is None
+
+
+def test_the_file_picker_returns_what_the_window_chose(monkeypatch):
+    import sys, types
+    root = types.SimpleNamespace(withdraw=lambda: None, attributes=lambda *a: None, destroy=lambda: None)
+    tk = types.ModuleType("tkinter")
+    tk.Tk = lambda: root
+    fd = types.ModuleType("tkinter.filedialog")
+    seen = {}
+    def ask(**kw):
+        seen.update(kw)
+        return "/data/strikes.xls"
+    fd.askopenfilename = ask
+    tk.filedialog = fd
+    monkeypatch.setitem(sys.modules, "tkinter", tk)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fd)
+    assert xl.pick_file() == "/data/strikes.xls"
+    assert any("*.xls" in pattern for _, pattern in seen["filetypes"])
+
+
+def test_run_without_a_file_opens_the_picker(monkeypatch, tmp_path, capsys):
+    import sophis_auto as sa
+    f = tmp_path / "s.csv"
+    f.write_text(",,,01/15/27,45.00,SNDK\n")
+    monkeypatch.setattr(xl, "pick_file", lambda *a, **k: str(f))
+    class Stop(Exception):
+        pass
+    def boom(args):
+        raise Stop
+    monkeypatch.setattr(sa, "_create", boom)
+    monkeypatch.setattr("sys.argv", ["x", "run"])
+    with pytest.raises(Stop):
+        sa.main()
+    out = capsys.readouterr().out
+    assert "Search FIRST in Sophis: SNDK" in out and str(f) in out
+    monkeypatch.setattr(xl, "pick_file", lambda *a, **k: None)
+    with pytest.raises(SystemExit):
+        sa.main()

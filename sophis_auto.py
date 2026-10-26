@@ -1461,24 +1461,6 @@ class Automator:
                 self._wait(1.0)
         raise AssertionError("unreachable")
 
-    def wait_for_update_window(self, timeout: float = 60.0, poll: float = 1.0) -> UpdateWindow:
-        """Polls the screen until the update window (Maturity | Minimum | Maximum) shows up, and returns how it
-        was read. Nothing is clicked, so the window may be opened by the script or by hand."""
-        t0 = time.time()
-        last = None
-        while True:
-            try:
-                self._read_update_window_once()
-                self._wait(0.8)                                    # let the window finish drawing
-                return self.read_update_window()
-            except SophisError as e:
-                last = e
-            if time.time() - t0 >= timeout * max(1.0, self.cfg.slowdown):
-                path = self.save_debug("update_window_not_detected")
-                raise SophisError(f"The update window did not appear within {timeout:.0f} s ({last}). "
-                                  f"Screenshot: {path}")
-            self._wait(poll)
-
     def _trace(self, step: str) -> None:
         """With trace on, saves a picture of the window at each step so a failed run can be inspected."""
         if not self.trace:
@@ -2155,15 +2137,16 @@ def _summary_of(code: str, results: list) -> str:
 
 
 def run_codes(a: Automator, plan: dict, fill_opts: dict, countdown: int = 6, hotkey: str | None = None,
-              window_timeout: float = 60.0, input_fn=input, say=print, sleep_fn=time.sleep,
+              open_delay: float = 3.0, input_fn=input, say=print, sleep_fn=time.sleep,
               hotkey_fn=None) -> dict:
     """The three stages for every code of the Excel plan, one code at a time.
 
     1. (done by the caller) the Excel was read and the summary printed.
     2. YOU find and select the code's row in the Listed market grid, then trigger the script (hotkey, or ENTER /
        a number of seconds in the console). It reads the row's Term, sets the dropdown and opens the update window.
-    3. Automatic: as soon as the update window is on the screen, every date of that code is located and its
-       Minimum / Maximum typed. OK is never pressed: you check and press it yourself.
+    3. Automatic: `open_delay` seconds (3) after the click on the "Available contracts" icon, with no check of
+       what is on the screen first, every date of that code is located and its Minimum / Maximum typed.
+       OK is never pressed: you check and press it yourself.
     Returns {code: results, ...} (results as returned by fill_values; "quit" in the dict key list if stopped)."""
     import sophis_excel as xl
     outcome: dict = {}
@@ -2190,8 +2173,11 @@ def run_codes(a: Automator, plan: dict, fill_opts: dict, countdown: int = 6, hot
                     say(f"\n[stage 2] {code}: reading the selected row, setting the Term, opening the update window ...")
                     a.open_selected(None, wait=False)
                     window_open = True
-                say(f"\n[stage 3] {code}: waiting for the update window, then filling {len(entries)} date(s) ...")
-                a.wait_for_update_window(window_timeout)
+                    say(f"\n[stage 3] {code}: icon clicked; filling {len(entries)} date(s) in {open_delay:g} seconds "
+                        "(do not touch anything) ...")
+                    sleep_fn(open_delay)
+                else:
+                    say(f"\n[stage 3] {code}: filling {len(entries)} date(s) again ...")
                 results = a.fill_values(entries, skip_problems=True, **fill_opts)
             except SophisError as e:
                 say(f"\nERROR: {e}")
@@ -2237,6 +2223,13 @@ def _global_hotkey(key: str) -> None:
 def cmd_run(args) -> None:
     """All three stages in one go: Excel -> select the row yourself -> automatic Term check, window and values."""
     import sophis_excel as xl
+    if not args.excel:
+        print("Choose the Excel file in the window that opens ...")
+        args.excel = xl.pick_file()
+        if not args.excel:
+            print("No file selected.")
+            sys.exit(2)
+    print(f"File: {args.excel}")
     try:
         plan, warnings = xl.read_plan(args.excel, args.sheet)
         if args.code:
@@ -2267,7 +2260,7 @@ def cmd_run(args) -> None:
                      recheck_row=args.recheck_row)
     try:
         outcome = run_codes(a, plan, fill_opts, countdown=args.click_wait, hotkey=args.hotkey,
-                            window_timeout=args.window_timeout, hotkey_fn=hotkey_fn)
+                            open_delay=args.open_delay, hotkey_fn=hotkey_fn)
     except KeyboardInterrupt:
         print("\nStopped.")
         sys.exit(130)
@@ -2316,7 +2309,8 @@ def main() -> None:
 
     s = sub.add_parser("run", help="everything: read the Excel, you select each code's row, then the Term check, "
                                    "the update window and all the dates are done automatically")
-    s.add_argument("excel", help="the Excel / CSV with the strikes")
+    s.add_argument("excel", nargs="?", default=None,
+                   help="the Excel (.xlsx / .xls) or CSV with the strikes; omit it to choose the file in a window")
     s.add_argument("--sheet", default=None, help="sheet of the Excel (default: the active one)")
     s.add_argument("--code", default=None, help="only this code of the Excel")
     s.add_argument("--hotkey", default=None, metavar="KEY",
@@ -2325,8 +2319,9 @@ def main() -> None:
     s.add_argument("--click-wait", dest="click_wait", type=int, default=6,
                    help="seconds you get to switch back to Sophis after pressing ENTER (default 6; you can also "
                         "type a number instead of ENTER)")
-    s.add_argument("--window-timeout", dest="window_timeout", type=float, default=60.0,
-                   help="seconds to wait for the update window to appear (default 60)")
+    s.add_argument("--open-delay", dest="open_delay", type=float, default=3.0,
+                   help="seconds between the click on the 'Available contracts' icon and the start of the filling "
+                        "(default 3; there is no check that the window is open - raise it if Sophis is slow)")
     s.add_argument("--open-with", dest="open_with", choices=["button", "double"], default=None, help=argparse.SUPPRESS)
     s.add_argument("--no-verify", dest="no_verify", action="store_true", help="do not read each cell back")
     s.add_argument("--recheck-row", dest="recheck_row", action="store_true", help=argparse.SUPPRESS)

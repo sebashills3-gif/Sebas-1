@@ -1,5 +1,5 @@
-"""Reads the Excel (.xlsx / .xls) or CSV with the option strikes and turns it into the dates and Minimum / Maximum values to type
-in Sophis.
+"""Reads the Excel (.xlsx / .xls, also HTML or XML tables saved as .xls) or CSV with the option strikes and turns
+it into the dates and Minimum / Maximum values to type in Sophis.
 
 Columns (by position, the header row, if any, is skipped):
     A  Bloomberg equity       "SNDK US Equity"
@@ -10,7 +10,7 @@ Columns (by position, the header row, if any, is skipped):
     F  code                   "SNDK"              <- one plan per code
     G..L  not used
 
-Usage:  python sophis_excel.py FILE.xlsx [--sheet NAME] [--code SNDK]
+Usage:  python sophis_excel.py [FILE.xlsx]  (without a file, a window opens to choose it) [--sheet NAME] [--code SNDK]
 """
 from __future__ import annotations
 
@@ -87,19 +87,97 @@ def parse_excel_number(value) -> float | None:
 
 
 def _sniff(path: Path) -> str:
-    """The real kind of the file, from its first bytes (an .xls is often really an .xlsx or a text export)."""
-    head = path.read_bytes()[:8]
-    if head[:2] == b"PK":
+    """The real kind of the file, from its first bytes (an .xls is often really an .xlsx, a text export, an HTML
+    table or an XML spreadsheet)."""
+    raw = path.read_bytes()
+    if raw[:2] == b"PK":
         return "xlsx"
-    if head == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+    if raw[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
         return "xls"
     if path.suffix.lower() in (".csv", ".txt", ".tsv"):
         return "text"
-    start = path.read_bytes()[:512].lstrip().lower()
-    if start.startswith((b"<html", b"<?xml", b"<table", b"<!doctype")):
-        raise ExcelError(f"{path.name} is an HTML/XML export saved as {path.suffix}: open it in Excel and "
-                         "save it as .xlsx or .xls first.")
+    head = raw[:2048].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    if b"<workbook" in head or (head.startswith(b"<?xml") and b"urn:schemas-microsoft-com:office:spreadsheet" in head):
+        return "xml"
+    if head.startswith((b"<html", b"<table", b"<!doctype", b"<?xml", b"<meta", b"<head", b"<body")):
+        return "html"
     return "text"
+
+
+def _decode(raw: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-16", "cp1252"):
+        try:
+            return raw.decode(enc)
+        except UnicodeError:
+            continue
+    return raw.decode("latin-1")
+
+
+def _load_html(path: Path) -> list[tuple]:
+    """An .xls that is really an HTML page with a table (many systems export like this): the rows of every table,
+    one after the other."""
+    from html.parser import HTMLParser
+
+    class Tables(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.rows, self._row, self._cell, self._depth = [], None, None, 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "tr":
+                self._row = []
+            elif tag in ("td", "th") and self._row is not None:
+                self._cell = []
+            elif tag == "br" and self._cell is not None:
+                self._cell.append(" ")
+
+        def handle_endtag(self, tag):
+            if tag in ("td", "th") and self._cell is not None and self._row is not None:
+                self._row.append("".join(self._cell).strip())
+                self._cell = None
+            elif tag == "tr" and self._row is not None:
+                if any(c != "" for c in self._row):
+                    self.rows.append(tuple(c if c != "" else None for c in self._row))
+                self._row = None
+
+        def handle_data(self, data):
+            if self._cell is not None:
+                self._cell.append(data)
+
+    parser = Tables()
+    parser.feed(_decode(path.read_bytes()))
+    return parser.rows
+
+
+def _load_xml(path: Path, sheet: str | None) -> list[tuple]:
+    """'XML Spreadsheet 2003' saved with the extension .xls."""
+    import xml.etree.ElementTree as ET
+    ns = "{urn:schemas-microsoft-com:office:spreadsheet}"
+    try:
+        root = ET.fromstring(path.read_bytes())
+    except ET.ParseError as e:
+        raise ExcelError(f"{path.name} looks like an XML spreadsheet but cannot be parsed ({e}). "
+                         "Open it in Excel and save it as .xlsx.")
+    sheets = root.findall(f"{ns}Worksheet")
+    names = [w.get(f"{ns}Name") for w in sheets]
+    if sheet is not None:
+        if sheet not in names:
+            raise ExcelError(f"No sheet named {sheet!r}; the file has {names}.")
+        sheets = [sheets[names.index(sheet)]]
+    elif sheets:
+        sheets = sheets[:1]
+    rows = []
+    for ws in sheets:
+        for tr in ws.iter(f"{ns}Row"):
+            row, col = [], 0
+            for cell in tr.findall(f"{ns}Cell"):
+                idx = cell.get(f"{ns}Index")
+                if idx:
+                    row.extend([None] * (int(idx) - 1 - len(row)))
+                data = cell.find(f"{ns}Data")
+                row.append(data.text if data is not None and data.text not in ("",) else None)
+            rows.append(tuple(row))
+    return rows
 
 
 def _load_xlsx(path: Path, sheet: str | None) -> list[tuple]:
@@ -126,7 +204,11 @@ def _load_xls(path: Path, sheet: str | None) -> list[tuple]:
         import xlrd
     except ImportError:
         raise ExcelError("xlrd is needed to read old .xls files:  pip install xlrd")
-    book = xlrd.open_workbook(str(path))
+    try:
+        book = xlrd.open_workbook(str(path))
+    except Exception as e:                                   # xlrd.XLRDError, a corrupt or password protected file
+        raise ExcelError(f"{path.name} could not be opened as an old Excel file ({e}). Open it in Excel and save "
+                         "it as .xlsx, then try again.")
     try:
         if sheet is not None:
             if sheet not in book.sheet_names():
@@ -175,6 +257,10 @@ def load_rows(path: str | Path, sheet: str | None = None) -> list[tuple]:
         return _load_xlsx(path, sheet)
     if kind == "xls":
         return _load_xls(path, sheet)
+    if kind == "xml":
+        return _load_xml(path, sheet)
+    if kind == "html":
+        return _load_html(path)
     return _load_text(path)
 
 
@@ -238,12 +324,39 @@ def describe(plan: dict[str, list[DateValues]]) -> str:
     return "\n".join(lines)
 
 
+FILE_TYPES = [("Excel / CSV files", "*.xlsx *.xlsm *.xls *.csv *.txt"), ("All files", "*.*")]
+
+
+def pick_file(title: str = "Select the Excel file with the strikes", input_fn=input) -> str | None:
+    """Opens the usual 'open file' window. Without a screen / tkinter it asks for the path in the console instead.
+    Returns None if nothing was chosen."""
+    try:
+        import tkinter
+        from tkinter import filedialog
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)              # otherwise it can open behind the terminal
+        try:
+            chosen = filedialog.askopenfilename(title=title, filetypes=FILE_TYPES)
+        finally:
+            root.destroy()
+        return chosen or None
+    except Exception:
+        answer = input_fn(f"{title}\nType or paste its path (empty = cancel): ").strip().strip('"').strip("'")
+        return answer or None
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description="Show the dates and Minimum / Maximum values found in the Excel.")
-    p.add_argument("file")
+    p.add_argument("file", nargs="?", default=None, help="the file (omit it to choose it in a window)")
     p.add_argument("--sheet", default=None, help="sheet name (default: the active sheet; the first one for .xls)")
     p.add_argument("--code", default=None, help="only this code")
     args = p.parse_args(argv)
+    if not args.file:
+        args.file = pick_file()
+        if not args.file:
+            print("No file selected.")
+            sys.exit(2)
     try:
         plan, warnings = read_plan(args.file, args.sheet)
         if args.code:

@@ -1793,29 +1793,37 @@ def test_run_typed_number_sets_the_seconds_and_a_hotkey_replaces_enter(ocr, anch
     assert keys == ["f9"] and fake2.values == {(7, "minimum"): "1", (7, "maximum"): "2"}
 
 
-def test_wait_for_update_window_gives_up_with_a_clear_error(ocr, anchors, tmp_path, monkeypatch):
-    monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
+def test_run_fills_a_fixed_delay_after_the_click_without_looking_for_the_window(ocr, anchors):
     a, fake, lines = _logged(ocr, anchors, reader="ocr")
-    with pytest.raises(SophisError, match="did not appear within"):
-        a.wait_for_update_window(timeout=0.01, poll=0.01)
+    fake.sel = 3
+    order = []
+    real_open, real_fill = a.open_selected, a.fill_values
+    a.open_selected = lambda *x, **k: (order.append("icon"), real_open(*x, **k))[1]
+    a.fill_values = lambda *x, **k: (order.append("fill"), real_fill(*x, **k))[1]
+    slept = []
+    input_fn, _ = _script([""])
+    sa.run_codes(a, _plan(("SNDK", [("27 Nov 2026", 1.0, 2.0)])), {}, countdown=1, input_fn=input_fn,
+                 say=lambda *_: None, sleep_fn=slept.append)
+    assert order == ["icon", "fill"] and slept == [1, 3.0]        # 1 s countdown, then exactly 3 s after the icon
+    assert not hasattr(a, "wait_for_update_window")               # no visual trigger any more
+    assert fake.values == {(7, "minimum"): "1", (7, "maximum"): "2"}
 
 
-def test_run_retry_after_a_window_that_never_appeared(ocr, anchors, tmp_path, monkeypatch):
+def test_run_retry_only_repeats_the_filling_not_the_opening(ocr, anchors, tmp_path, monkeypatch):
     monkeypatch.setattr(sa, "DEBUG_DIR", tmp_path)
     a, fake, lines = _logged(ocr, anchors, reader="ocr")
     fake.sel = 3
-    real = a.wait_for_update_window
+    real = a.fill_values
     calls = []
-    def flaky(timeout=60.0, poll=1.0):
+    def flaky(*args, **kw):
         calls.append(1)
         if len(calls) == 1:
-            raise SophisError("simulated: no window")
-        return real(timeout, poll)
-    a.wait_for_update_window = flaky
+            raise SophisError("simulated: could not read the window")
+        return real(*args, **kw)
+    a.fill_values = flaky
     input_fn, asked = _script(["", "r"])
-    said = []
     out = sa.run_codes(a, _plan(("SNDK", [("27 Nov 2026", 1.0, 2.0)])), {}, countdown=1, input_fn=input_fn,
-                       say=said.append, sleep_fn=lambda s: None)
+                       say=lambda *_: None, sleep_fn=lambda s: None)
     assert len(calls) == 2 and fake.values == {(7, "minimum"): "1", (7, "maximum"): "2"}
     assert fake.avail_clicks == 1                                  # the window was NOT opened a second time
     assert "window stays as it is" in asked[1]

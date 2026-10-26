@@ -16,7 +16,7 @@ The script does this for you, starting from an Excel file:
 |-------|--------------|-------------|
 | **1. Extraction** | The Excel is read. The script prints a summary and tells you **which code to look for first** in Sophis. | Script |
 | **2. Selection and opening** | You find the code in the *Listed market* grid and select its row. The script then reads the row's **Term**, sets the same Term in the dropdown above the right-hand table, and opens the **Strikes** window with the first button next to *Available contracts*. | You (selection) + Script |
-| **3. Filling** | As soon as the **Strikes** window (Maturity / Minimum / Maximum / Ric) is on the screen, the script finds each date and types its Minimum and Maximum, confirming each value with Enter. | Script (automatic) |
+| **3. Filling** | **3 seconds after** it clicks the icon, the script starts filling the **Strikes** window (Maturity / Minimum / Maximum / Ric): it finds each date and types its Minimum and Maximum, confirming each value with Enter. It does not check first whether the window is open. | Script (automatic) |
 
 > **The script never presses OK.** When it finishes, the **Strikes** window is left open so that you can check every
 > value and press **OK yourself**.
@@ -55,7 +55,7 @@ Two Sophis screens are used:
    to *Available contracts*).
 
 ### 2.4 The Excel file
-The Excel (`.xlsx`, `.xls` or `.csv`) must always have this layout (a header row is fine, it is skipped):
+The Excel (`.xlsx`, `.xls` or `.csv`; an `.xls` that is really an HTML or XML table is also read) must always have this layout (a header row is fine, it is skipped):
 
 | Column | Content | Example | Used? |
 |--------|---------|---------|-------|
@@ -166,16 +166,19 @@ Sophis layout (columns, grid size), or the script keeps failing to find the grid
 This only reads the file and prints what the script understood; it does not touch Sophis:
 ```
 python sophis_excel.py strikes.xlsx
+python sophis_excel.py                 # no file given: a window opens to choose it
 ```
 Check that each code, each date and each Minimum/Maximum is what you expect. Use `--code SNDK` to see one code and
 `--sheet NAME` to choose a sheet (for `.xls`, the first sheet is used by default).
 
 ### 5.3 Run the three stages
 ```
-python sophis_auto.py run strikes.xlsx
+python sophis_auto.py run
 ```
-(Replace `strikes.xlsx` with the path of your file. Useful options: `--code SNDK` to process only one code,
-`--sheet NAME`, `--click-wait 8`, `--slowdown 1.5` for a slower, more careful run; see section 7.)
+A **file selector window opens**: choose the Excel (`.xlsx`, `.xls` or `.csv`). (If your computer cannot show the
+window, the console asks you to paste the path instead. You can also give the path directly:
+`python sophis_auto.py run strikes.xlsx`.) Useful options: `--code SNDK` to process only one code,
+`--sheet NAME`, `--click-wait 8`, `--open-delay 5`, `--slowdown 1.5` for a slower, more careful run; see section 7.
 
 **Stage 1 – Extraction.** The console prints something like:
 ```
@@ -201,8 +204,9 @@ If the file has more codes, it also lists the order in which they will be proces
    * sets the **dropdown** above the right-hand table to that Term and checks that it matches,
    * clicks the first button next to **Available contracts** to open the **Strikes** window.
 
-**Stage 3 – Automatic filling.** As soon as the **Strikes** window is detected (it waits up to 60 seconds), the
-script, for every date of the code:
+**Stage 3 – Automatic filling.** Exactly **3 seconds after the click on the icon** the script starts by itself
+(it does not wait to "see" the window, so make sure the Strikes window really opens in that time; if Sophis is slow,
+use `--open-delay 5`). For every date of the code it:
 1. finds the row with that date in the Maturity column (scrolling the list if needed),
 2. double-clicks the **Minimum** cell, types the value and presses **Enter**,
 3. moves to the **Maximum** cell of the same row, types the value and presses **Enter**.
@@ -267,7 +271,7 @@ With `fill` (unlike `run`) a missing or repeated date **stops** the run *before*
 |--------|--------|
 | `--slowdown 1.5` (or `2`) | Waits longer after each action. Use it if Citrix is slow and clicks arrive late. |
 | `--click-wait 8` | More seconds to switch back to Sophis after pressing ENTER (stage 2). |
-| `--window-timeout 120` | Waits longer for the Strikes window to appear (stage 3). |
+| `--open-delay 5` | Seconds between the click on the *Available contracts* icon and the start of the filling (default 3). Raise it if the Strikes window opens slowly. |
 | `--no-widen` | Does not try to enlarge the Term column automatically. |
 | `--strict-verify` | Stops if a typed value reads back differently (default: warn and continue, because the on-screen text is sometimes misread). |
 | `--no-verify` | Does not read the cells back after typing. |
@@ -284,7 +288,8 @@ With `fill` (unlike `run`) a missing or repeated date **stops** the run *before*
 | It cannot tell which row is selected | Select the row again with **one** click, wait a second, press ENTER and do not move the mouse. Check that the row is visibly highlighted. |
 | `Could not read the Term of row …` | The Term column is too narrow. Widen it by dragging the right border of its header, then retry. |
 | The dropdown is not set to the right Term | Check that the Term text is fully visible; retry with a bigger `--slowdown`. Send the screenshot from `sophis_debug/` if it persists. |
-| `The Maturity/Minimum/Maximum window did not appear` / `The update window did not appear within …` | The button next to *Available contracts* was not clicked, or Sophis was slow. Retry (answer `r` when asked) or open the window by hand: stage 3 starts automatically when it detects it. Increase `--window-timeout`. |
+| `could not read the update window` / `Could not find the Maturity … header on screen` | The filling started before the Strikes window was open (Sophis was slow) or the icon was not clicked. Make sure the window is open and answer `r` (retry only repeats the filling), or run again with a bigger `--open-delay`. |
+| `could not be opened as an old Excel file` | The `.xls` is damaged or protected. Open it in Excel and save it as `.xlsx`. |
 | `The minimum cell … did not open for editing … NOTHING was typed` | Another cell/editor may be open, or the window lost focus. Click the title bar of the Strikes window once and answer `r`. |
 | `WARNING: the … cell was read back as … but … was typed` | Usually a misread of the screen, not a typing error. Compare the cell with the Excel value by eye. |
 | `SKIPPED <date>: … not in the list / appears N times` | See section 5.5. Fill that date by hand, or use `fill --entry "DATE#n" MIN MAX`. |
@@ -313,7 +318,7 @@ re-types all dates of that code, which is harmless but worth checking afterwards
 | File | Purpose |
 |------|---------|
 | `sophis_auto.py` | Main program (commands: `calibrate`, `run`, `open`, `fill`, `window`, `diagnose`). |
-| `sophis_excel.py` | Reads the Excel/CSV and extracts the codes, dates and Minimum/Maximum values. |
+| `sophis_excel.py` | Reads the Excel/CSV, shows the file selector, and extracts the codes, dates and Minimum/Maximum values. |
 | `requirements_sophis.txt` | Libraries to install. |
 | `test_sophis_auto.py`, `test_sophis_excel.py` | Automatic tests (developers only; run with `pytest`). |
 | `sophis_config.json`, `sophis_anchors/` | Your calibration (created by `calibrate`; specific to your computer). |
