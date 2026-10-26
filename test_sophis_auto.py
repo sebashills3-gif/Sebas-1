@@ -1280,9 +1280,23 @@ def test_several_dates_in_one_go(ocr, anchors):
 def test_a_repeated_date_is_never_guessed(ocr, anchors):
     a, fake, lines = _logged(ocr, anchors, reader="ocr")
     fake.dialog = True
-    with pytest.raises(SophisError, match="appears 2 times.*#0.*#1"):
+    with pytest.raises(SophisError, match="appears 2 times.*#0.*#1.*before this one were already written"):
         a.fill_values([sa.parse_entry("23 Oct 2026", "1", "2"), sa.parse_entry("20 Nov 2026", "5", "6")])
-    assert fake.values == {} and not [e for e in fake.events if e[0] in ("double", "type")]   # not even the first
+    assert fake.values == {(1, "minimum"): "1", (1, "maximum"): "2"}     # the first date is done, the repeated is not
+
+
+def test_dates_are_done_one_by_one_not_all_located_first(ocr, anchors):
+    a, fake, lines = _grid(ocr, anchors, "double")
+    order = []
+    real_locate, real_write = a.locate_date, a.write_cell
+    a.locate_date = lambda d, *x, **k: (order.append(f"find {d:%d %b}"), real_locate(d, *x, **k))[1]
+    a.write_cell = lambda win, row, column, *x, **k: (order.append(f"{column} {row.date:%d %b}"),
+                                                       real_write(win, row, column, *x, **k))[1]
+    a.fill_values([sa.parse_entry("23 Oct 2026", "1", "2"), sa.parse_entry("27 Nov 2026", "3", "4"),
+                   sa.parse_entry("30 Nov 2026", "5", "6")])
+    assert order == ["find 23 Oct", "minimum 23 Oct", "maximum 23 Oct",
+                     "find 27 Nov", "minimum 27 Nov", "maximum 27 Nov",
+                     "find 30 Nov", "minimum 30 Nov", "maximum 30 Nov"]
 
 
 @pytest.mark.parametrize("which,row", [("#0", 5), ("#1", 6)])
@@ -1635,7 +1649,7 @@ def test_when_nothing_moved_the_second_cell_does_not_search_the_date_again(ocr, 
     real = a.locate_date
     a.locate_date = lambda *args, **kw: (calls.append(1), real(*args, **kw))[1]
     a.fill_values([sa.parse_entry("27 Nov 2026", "95", "130")])
-    assert len(calls) == 2                                       # the plan, and the first cell; Maximum reuses the row
+    assert len(calls) == 1                                       # one search for the date; Maximum reuses the row
     assert fake.values == {(7, "minimum"): "95", (7, "maximum"): "130"}
 
 
@@ -1827,3 +1841,26 @@ def test_run_retry_only_repeats_the_filling_not_the_opening(ocr, anchors, tmp_pa
     assert len(calls) == 2 and fake.values == {(7, "minimum"): "1", (7, "maximum"): "2"}
     assert fake.avail_clicks == 1                                  # the window was NOT opened a second time
     assert "window stays as it is" in asked[1]
+
+
+def test_far_dates_are_reached_with_growing_scroll_steps(ocr, anchors):
+    import dataclasses
+    a, fake = _open_window(ocr, anchors)
+    base = a.read_update_window()
+    days = [dt.date(2026, 10, 19) + dt.timedelta(days=7 * k) for k in range(300)]
+    state = {"top": 0, "scrolls": []}
+
+    def read():
+        rows = [sa.WindowRow(i, base.rows[i].cy, f"{days[state['top'] + i]:%d %b %Y}", days[state["top"] + i])
+                for i in range(len(base.rows))]
+        return dataclasses.replace(base, rows=rows)
+
+    def scroll(clicks, x, y):
+        state["scrolls"].append(clicks)
+        state["top"] = max(0, min(len(days) - len(base.rows), state["top"] - 3 * clicks))     # 3 rows per click
+
+    a.read_update_window, a.s.scroll = read, scroll
+    t = a.locate_date(days[250])
+    assert t.row.date == days[250]
+    assert len(state["scrolls"]) <= 8, state["scrolls"]            # fixed 3-click steps would need ~27
+    assert max(abs(c) for c in state["scrolls"]) > 3

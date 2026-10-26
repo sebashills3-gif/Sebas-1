@@ -261,7 +261,7 @@ python sophis_auto.py fill --excel strikes.xlsx --code SNDK
 python sophis_auto.py fill --entry "15 Jan 2027" 45 100 --entry "20 Nov 2026#1" 30 70
 ```
 `DATE#0` is the first row with a repeated date and `DATE#1` the second one.
-With `fill` (unlike `run`) a missing or repeated date **stops** the run *before* anything is typed.
+The dates are processed **one at a time** (find the date, type its Minimum and Maximum, then the next date). With `fill` (unlike `run`) a missing or repeated date **stops** the run at that date; the dates before it have already been written. `--dry-run` is the only mode that scans all the dates first.
 
 ---
 

@@ -1478,11 +1478,12 @@ class Automator:
         path = self.save_debug(f"fill{self._trace_n:02d}_{step}", shot)
         self.log(f"    [trace] {path}")
 
-    def locate_date(self, target: dt.date, occurrence: int | None = None, max_scrolls: int = 15) -> CellTarget:
+    def locate_date(self, target: dt.date, occurrence: int | None = None, max_scrolls: int = 30) -> CellTarget:
         """Finds the row whose Maturity is `target` (scrolling the list if needed) and returns where its Minimum
         and Maximum cells are. If several rows have that date, `occurrence` (0, 1, ...) picks one; without it the
         first is returned and `ambiguous` is True. Nothing is clicked or typed."""
         previous = None
+        clicks, last_down = 3, None             # wheel clicks per step: doubled while going the same way, halved on overshoot
         for _ in range(max_scrolls + 1):
             win = self.read_update_window()
             matches = win.find(target)
@@ -1511,10 +1512,13 @@ class Automator:
                                   f"{dated[0].date:%d %b %Y} ... {dated[-1].date:%d %b %Y}.")
             previous = signature
             down = target > dated[-1].date
+            if last_down is not None:
+                clicks = min(clicks * 2, 24) if down == last_down else max(1, clicks // 2)
+            last_down = down
             self.log(f"  {target:%d %b %Y} not visible ({dated[0].date:%d %b %Y} ... {dated[-1].date:%d %b %Y}); "
-                     f"scrolling {'down' if down else 'up'}")
+                     f"scrolling {'down' if down else 'up'} ({clicks} clicks)")
             mid = win.rows[len(win.rows) // 2].cy
-            self.s.scroll(-3 if down else 3, win.x_maturity, mid)
+            self.s.scroll(-clicks if down else clicks, win.x_maturity, mid)
             self._wait(0.7)
         raise SophisError(f"{target:%d %b %Y} was not found after {max_scrolls} scrolls.")
 
@@ -1728,59 +1732,62 @@ class Automator:
     def fill_values(self, entries: list, verify: bool = True, dry_run: bool = False, commit: str = "enter",
                     check_edit: bool = True, recheck_row: bool = False,
                     skip_problems: bool = False) -> list:
-        """Writes Minimum and Maximum for each entry in the open update window. The row is found again before
-        every cell (the list may have scrolled). A date that appears more than once needs its `occurrence`;
-        nothing is guessed. With skip_problems, a date that is missing, repeated or unreadable is left out (and
-        reported with written=False and a "skipped" reason) instead of stopping the whole batch. dry_run only locates the cells. It NEVER presses OK: the window is left open so you
-        can check the values and confirm it yourself."""
-        done = []
-        # 1) Check everything that can be checked BEFORE changing anything.
-        plan = []
-        skipped = []
-        for e in entries:
-            try:
-                t = self.locate_date(e.date, e.occurrence)
-                if t.ambiguous:
-                    raise SophisError(
-                        f"{e.date:%d %b %Y} appears {len(t.matches)} times (rows {[m.index for m in t.matches]}, "
-                        f"read as {[m.text for m in t.matches]}). Choose one by writing the date as "
-                        f"'{e.date:%d %b %Y}#0' (the first) or '#1' (the second). Nothing was changed.")
-            except SophisError as err:
-                if not skip_problems:
-                    raise
-                self.log(f"  SKIPPED {e.date:%d %b %Y}: {err}")
-                skipped.append({"date": e.date, "minimum": None, "maximum": None, "written": False,
-                                "skipped": str(err)})
-                continue
-            plan.append((e, t))
-            self.log(f"plan: {e.date:%d %b %Y} -> row {t.row.index}; Minimum {e.minimum} at {t.minimum}, "
-                     f"Maximum {e.maximum} at {t.maximum}")
-        if dry_run:
-            return [{"date": e.date, "row": t.row.index, "minimum": t.minimum, "maximum": t.maximum,
-                     "written": False} for e, t in plan] + skipped
-        # 2) Write. The row is found again before every cell (the list may have scrolled), with a fresh read.
+        """Writes Minimum and Maximum for each entry in the open update window, ONE DATE AT A TIME: find the
+        date, type its Minimum, type its Maximum, then go on with the next date (the list is never scanned for all
+        the dates first). A date that appears more than once needs its `occurrence`; nothing is guessed. With
+        skip_problems, a date that is missing, repeated or unreadable is left out (reported with written=False and
+        a "skipped" reason) instead of stopping the batch; without it the run stops there, and the dates before it
+        have already been written. dry_run only locates the cells (it does scan every date). It NEVER presses OK:
+        the window is left open so you can check the values and confirm it yourself."""
+        results = []
+
+        def locate(e):
+            t = self.locate_date(e.date, e.occurrence)
+            if t.ambiguous:
+                raise SophisError(
+                    f"{e.date:%d %b %Y} appears {len(t.matches)} times (rows {[m.index for m in t.matches]}, "
+                    f"read as {[m.text for m in t.matches]}). Choose one by writing the date as "
+                    f"'{e.date:%d %b %Y}#0' (the first) or '#1' (the second)."
+                    + ("" if dry_run else " The dates before this one were already written."))
+            return t
+
+        def skipped(e, err):
+            self.log(f"  SKIPPED {e.date:%d %b %Y}: {err}")
+            return {"date": e.date, "minimum": None, "maximum": None, "written": False, "skipped": str(err)}
+
         def view(win):
             return (tuple((r.index, r.date, r.suffix) for r in win.rows), round(win.header_y), round(win.x_maturity))
 
-        for e, _ in plan:
+        for e in entries:
+            try:
+                t = locate(e)
+            except SophisError as err:
+                if not skip_problems:
+                    raise
+                results.append(skipped(e, err))
+                continue
+            self.log(f"{e.date:%d %b %Y} -> row {t.row.index}; Minimum {e.minimum} at {t.minimum}, "
+                     f"Maximum {e.maximum} at {t.maximum}")
+            if dry_run:
+                results.append({"date": e.date, "row": t.row.index, "minimum": t.minimum, "maximum": t.maximum,
+                                "written": False})
+                continue
             result = {"date": e.date, "minimum": None, "maximum": None, "written": True}
             previous = None                                              # the target of the cell written just before
             for column, value in (("minimum", e.minimum), ("maximum", e.maximum)):
                 if value is None:
                     continue
-                t = None
                 if previous is not None:
                     t = (self._reuse_row(previous, view) if recheck_row
                          else self._next_cell_same_row(previous))
-                if t is None:
-                    t = self.locate_date(e.date, e.occurrence)
-                    if t.ambiguous:
-                        raise SophisError(f"{e.date:%d %b %Y} became ambiguous while writing; stopped.")
+                    if t is None:                                        # the list moved: search the date again
+                        t = locate(e)
                 result[column] = self.write_cell(t.win, t.row, column, value, commit, verify, check_edit)
                 previous = t
-            done.append(result)
-        self.log("done. The window was left open: check the values and press OK yourself.")
-        return done + skipped
+            results.append(result)
+        if not dry_run:
+            self.log("done. The window was left open: check the values and press OK yourself.")
+        return results
 
     def annotate_window(self, win: UpdateWindow, target: CellTarget | None = None) -> Path:
         """Saves a screenshot with what was understood drawn on it, so you can check it by eye."""
