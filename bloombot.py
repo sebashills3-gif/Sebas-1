@@ -10,6 +10,7 @@ import pandas as pd
 NOMBRE_LIBRO = "BLR00441 - GDS BLOOMBOT"
 HOJA_REQUEST_FILE = "Request File"
 HOJA_REQUEST_BUILDER = "Request Builder"
+MACRO_SUBMIT = "ThisWorkbook.submit_RBO"
 
 
 def _texto(valor):
@@ -69,16 +70,24 @@ def _buscar_hoja(libro, nombre, indice):
     return libro.sheets[indice - 1]
 
 
-def _hacer_click_submit(hoja, macro=None):
-    """Ejecuta la macro del botón Submit de la hoja.
+def _hacer_click_submit(hoja, macro=MACRO_SUBMIT):
+    """Ejecuta la macro del botón Submit (por defecto ThisWorkbook.submit_RBO).
 
-    Si se da `macro` se ejecuta por nombre; si no, se busca el botón cuyo
-    texto contenga 'submit' y se ejecuta la macro que tiene asignada.
+    Se llama con Application.Run calificando el libro, para que funcione
+    aunque haya otros libros abiertos. Si falla, se busca el botón Submit de
+    la hoja y se ejecuta la macro que tiene asignada.
     """
     libro = hoja.book
+    app = libro.app.api
+    errores = []
+
     if macro:
-        libro.macro(macro)()
-        return
+        for nombre in (f"'{libro.name}'!{macro}", macro):
+            try:
+                app.Run(nombre)
+                return
+            except Exception as error:
+                errores.append(f"{nombre}: {error}")
 
     for forma in hoja.api.Shapes:
         try:
@@ -86,15 +95,15 @@ def _hacer_click_submit(hoja, macro=None):
         except Exception:
             continue
         if "submit" in texto.lower() and forma.OnAction:
-            libro.app.api.Run(forma.OnAction.strip("'"))
+            app.Run(forma.OnAction.strip("'"))
             return
+
     raise RuntimeError(
-        "No se encontró el botón Submit. Indica el nombre de la macro "
-        "con el parámetro `macro`."
+        "No se pudo ejecutar la macro de Submit:\n" + "\n".join(errores)
     )
 
 
-def enviar_a_bloombot(codigos, macro=None, limpiar=True):
+def enviar_a_bloombot(codigos, macro=MACRO_SUBMIT, limpiar=True):
     """Pega los códigos en Request File!A y pulsa Submit en Request Builder.
 
     El libro BLR00441 - GDS BLOOMBOT debe estar ya abierto en Excel.
@@ -126,7 +135,7 @@ def enviar_a_bloombot(codigos, macro=None, limpiar=True):
     _hacer_click_submit(request_builder, macro)
 
 
-def procesar_y_enviar(ruta_excel, macro=None):
+def procesar_y_enviar(ruta_excel, macro=MACRO_SUBMIT):
     """Flujo completo a partir del Excel que genera la extracción."""
     codigos, omitidos = obtener_codigos(ruta_excel)
 
