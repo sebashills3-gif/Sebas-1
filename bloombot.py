@@ -10,7 +10,7 @@ import pandas as pd
 NOMBRE_LIBRO = "BLR00441 - GDS BLOOMBOT"
 HOJA_REQUEST_FILE = "Request File"
 HOJA_REQUEST_BUILDER = "Request Builder"
-MACRO_SUBMIT = "ThisWorkbook.submit_RBO"
+MACRO_SUBMIT = "creates_req"
 
 
 def _texto(valor):
@@ -49,11 +49,20 @@ def obtener_codigos(ruta_excel):
     col_name = _columna(df, "Name")
     col_cusip = _columna(df, "Cusip")
 
-    etiquetados, omitidos = [], []
+    # Primero se obtienen los códigos y se quitan duplicados (conservando
+    # el orden); la etiqueta |CUSIP| o |ISIN| se agrega después.
+    codigos = []
     for nombre, cusip in zip(df[col_name], df[col_cusip]):
         codigo = _texto(nombre) or _texto(cusip)
-        if not codigo:
-            continue
+        if codigo:
+            codigos.append(codigo)
+
+    unicos = list(dict.fromkeys(c.upper() for c in codigos))
+    if len(unicos) < len(codigos):
+        print(f"Duplicados eliminados: {len(codigos) - len(unicos)}")
+
+    etiquetados, omitidos = [], []
+    for codigo in unicos:
         etiquetado = etiquetar_codigo(codigo)
         if etiquetado is None:
             omitidos.append(codigo)
@@ -71,7 +80,7 @@ def _buscar_hoja(libro, nombre, indice):
 
 
 def _hacer_click_submit(hoja, macro=MACRO_SUBMIT):
-    """Ejecuta la macro del botón Submit (por defecto ThisWorkbook.submit_RBO).
+    """Ejecuta la macro del botón Submit (por defecto creates_req).
 
     Se llama con Application.Run calificando el libro, para que funcione
     aunque haya otros libros abiertos. Si falla, se busca el botón Submit de
