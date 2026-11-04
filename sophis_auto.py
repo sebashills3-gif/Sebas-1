@@ -40,6 +40,7 @@ If anything does not match, the script stops and saves screenshots in ./sophis_d
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
 import difflib
 import json
@@ -1498,19 +1499,18 @@ class Automator:
         per_notch = None                        # rows moved by one wheel notch (measured)
         last = None                             # (dates of the rows before the last scroll, notches, went down)
         rereads = 0
+        seen = set()                            # views already visited: seeing one again means it is going round
         for _ in range(max_scrolls + 1):
             win = self.read_update_window()
             matches = win.find(target)
             if matches:
                 win, matches = self._reveal_duplicates(win, target)
-                if not matches:                 # the nudging lost the date (misread row): look for it again
-                    continue
                 if occurrence is not None and occurrence >= len(matches):
                     win, matches = self._more_occurrences(win, target, occurrence, matches)
                 row = matches[occurrence or 0]
                 return CellTarget(row, (win.x_minimum, row.cy), (win.x_maximum, row.cy), matches,
                                   ambiguous=len(matches) > 1 and occurrence is None, win=win)
-            dated = win.dated()
+            dated = self._in_order(win.dated())          # a misread date breaking the order would mislead the scroll
             if not dated:
                 raise SophisError("No dates could be read in the update window.")
             if dated[0].date <= target <= dated[-1].date:
@@ -1519,8 +1519,9 @@ class Automator:
                     self.log(f"  {target:%d %b %Y} falls inside the visible dates but was not read; reading again")
                     self._wait(0.6)
                     continue
-                slot = self._unreadable_slot(win, target)
+                slot = self._unreadable_slot(win, target, dated)
                 if slot is not None:
+                    slot = dataclasses.replace(slot, date=target, text=f"{slot.text} (inferred)")
                     self.log(f"  WARNING: {target:%d %b %Y} was not read, but row {slot.index} (unreadable) sits exactly "
                              f"where it belongs between its neighbours; using that row")
                     return CellTarget(slot, (win.x_minimum, slot.cy), (win.x_maximum, slot.cy), [slot],
@@ -1531,6 +1532,11 @@ class Automator:
             if signature == previous:
                 raise SophisError(f"{target:%d %b %Y} was not found: the list stopped scrolling at "
                                   f"{dated[0].date:%d %b %Y} ... {dated[-1].date:%d %b %Y}.")
+            if signature in seen:
+                raise SophisError(f"{target:%d %b %Y} was not found: the list went back to a view it had already "
+                                  f"shown ({dated[0].date:%d %b %Y} ... {dated[-1].date:%d %b %Y}) without the date "
+                                  "being read; stopped instead of scrolling up and down.")
+            seen.add(signature)
             previous = signature
             down = target > dated[-1].date
             if last is not None:
@@ -1580,16 +1586,39 @@ class Automator:
         return int(max(1, min(40, round(0.75 * rows / per_notch))))
 
     @staticmethod
-    def _unreadable_slot(win: UpdateWindow, target: dt.date) -> WindowRow | None:
+    def _in_order(dated: list) -> list:
+        """The list is sorted by date, so a row read as a date that breaks that order was misread: keep the
+        longest run of rows whose dates go up (or stay equal) from top to bottom, drop the rest."""
+        n = len(dated)
+        if n < 3:
+            return dated
+        best = [1] * n
+        prev = [-1] * n
+        for i in range(n):
+            for j in range(i):
+                if dated[j].date <= dated[i].date and best[j] + 1 > best[i]:
+                    best[i], prev[i] = best[j] + 1, j
+        i = max(range(n), key=lambda k: best[k])
+        keep = []
+        while i != -1:
+            keep.append(dated[i])
+            i = prev[i]
+        return keep[::-1]
+
+    @staticmethod
+    def _unreadable_slot(win: UpdateWindow, target: dt.date, valid: list | None = None) -> WindowRow | None:
         """The dates are sorted. If the rows right before and after the target's place were read and exactly one
-        row between them could not be read (often the highlighted one), that row must be the target's."""
-        before = [r for r in win.rows if r.date and r.date < target]
-        after = [r for r in win.rows if r.date and r.date > target]
+        row between them could not be read (often the highlighted one), that row must be the target's. Rows not in
+        `valid` (dates that were misread out of order) count as unreadable."""
+        valid_ids = {id(r) for r in valid} if valid is not None else {id(r) for r in win.rows if r.date}
+        good = [r for r in win.rows if id(r) in valid_ids]
+        before = [r for r in good if r.date < target]
+        after = [r for r in good if r.date > target]
         if not before or not after:
             return None
         lo, hi = before[-1].index, after[0].index
         gap = [r for r in win.rows if lo < r.index < hi]
-        if len(gap) == 1 and gap[0].date is None:
+        if len(gap) == 1 and id(gap[0]) not in valid_ids:
             return gap[0]
         return None
 
@@ -1618,6 +1647,7 @@ class Automator:
                 break
         if occurrence < len(chain):
             guessed = [r.index for r in chain if r.date is None]
+            chain = [r if r.date else dataclasses.replace(r, date=target, text=f"{r.text} (inferred)") for r in chain]
             self.log(f"  WARNING: the row(s) {guessed} next to {target:%d %b %Y} could not be read; taking "
                      f"them as the next occurrence(s) of that date")
             return win, chain
@@ -1642,13 +1672,14 @@ class Automator:
                 self._wait(0.6)
                 moved = self.read_update_window()
                 if tuple(r.date for r in moved.dated()) == before:       # the list did not move: end of the list
-                    win = moved
                     break
-                if not moved.find(target):                               # one notch took the date out of view
-                    self.s.scroll(-direction, win.x_maturity, mid)       # put it back and stop nudging
+                if not moved.find(target):
+                    # The date was not read in the nudged view (often because it is the highlighted row). Put the
+                    # list back where it was and keep the view in which it WAS read: positions are the same again.
+                    self.log(f"  (after nudging the list, {target:%d %b %Y} was not read; moving it back)")
+                    self.s.scroll(-direction, win.x_maturity, mid)
                     self._wait(0.6)
-                    win = self.read_update_window()
-                    break
+                    return win, win.find(target)
                 win = moved
         return win, win.find(target)
 

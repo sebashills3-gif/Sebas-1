@@ -1938,3 +1938,77 @@ def test_a_date_lost_by_the_duplicate_nudging_does_not_crash(ocr, anchors):
     a.s.scroll = lambda *x: None
     t = a.locate_date(D("27 Nov 2026"))
     assert t.row.date == D("27 Nov 2026")
+
+
+def test_the_reported_up_and_down_loop_ends_on_the_date(ocr, anchors):
+    """Reported: the date on the last visible row was found, the duplicate nudge moved it onto the highlighted row
+    (unreadable), the list went back, and this repeated forever. Now the view where it was read is kept."""
+    a, fake = _open_window(ocr, anchors)
+    days = [dt.date(2026, 10, 19) + dt.timedelta(days=7 * k) for k in range(60)]
+    state = _long_list(a, days, 3)
+    real_read = a.read_update_window
+    highlighted = {"pos": 6}                                   # the selection sits on screen row 6 after Enter
+
+    def read():
+        win = real_read()
+        import dataclasses
+        rows = [dataclasses.replace(r, date=None, text="?") if r.index == highlighted["pos"]
+                and r.date == days[19] else r for r in win.rows]
+        return dataclasses.replace(win, rows=rows)
+
+    a.read_update_window = read
+    state["top"] = 10                                          # days[19] is the LAST visible row (index 9)
+    t = a.locate_date(days[19])
+    assert t.row.date == days[19]
+    assert len(state["scrolls"]) <= 2, state["scrolls"]        # one nudge and its way back, no loop
+
+
+def test_a_misread_date_out_of_order_does_not_send_the_scroll_the_wrong_way(ocr, anchors):
+    import dataclasses
+    a, fake = _open_window(ocr, anchors)
+    days = [dt.date(2026, 10, 19) + dt.timedelta(days=7 * k) for k in range(60)]
+    state = _long_list(a, days, 3)
+    real_read = a.read_update_window
+
+    def read():
+        win = real_read()
+        rows = list(win.rows)
+        rows[-1] = dataclasses.replace(rows[-1], date=dt.date(2021, 1, 15), text="15 Jan 2021")   # misread year
+        return dataclasses.replace(win, rows=rows)
+
+    a.read_update_window = read
+    t = a.locate_date(days[30])
+    assert t.row.date == days[30]
+    assert all(c < 0 for c in state["scrolls"])                # always down, never back up because of the misread
+
+
+def test_going_round_in_circles_stops_with_a_clear_error(ocr, anchors):
+    import dataclasses
+    a, fake = _open_window(ocr, anchors)
+    base = a.read_update_window()
+    views = [[dt.date(2026, 10, 19) + dt.timedelta(days=k) for k in range(10)],
+             [dt.date(2026, 12, 19) + dt.timedelta(days=k) for k in range(10)]]
+    n = {"i": 0}
+
+    def read():
+        dates = views[n["i"] % 2]
+        return dataclasses.replace(base, rows=[sa.WindowRow(i, base.rows[i].cy, f"{d:%d %b %Y}", d)
+                                               for i, d in enumerate(dates)])
+
+    def scroll(clicks, x, y):
+        n["i"] += 1                                            # a list that jumps back and forth
+
+    a.read_update_window, a.s.scroll = read, scroll
+    with pytest.raises(SophisError, match="already shown"):
+        a.locate_date(dt.date(2026, 11, 20))
+    assert n["i"] <= 3
+
+
+def test_an_inferred_row_has_the_date_so_writing_it_does_not_crash(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    real = a.read_update_window()
+    row = next(r for r in real.rows if r.date == D("27 Nov 2026"))
+    row.date, row.text = None, "?"
+    a.read_update_window = lambda: real
+    t = a.locate_date(D("27 Nov 2026"))
+    assert t.row.date == D("27 Nov 2026") and "inferred" in t.row.text
