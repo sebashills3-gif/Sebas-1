@@ -242,6 +242,10 @@ class FakeSophis:
     def position(self):
         return self.mouse
 
+    def move(self, x, y):
+        self.mouse = (x, y)
+        self.events.append(("move", x, y))
+
     def scroll(self, clicks, x, y):
         x, y = x - self.dx, y - self.dy
         if self.dialog and 232 <= x <= 660 and HEADER_Y <= y <= HEADER_Y + PITCH * VISIBLE:
@@ -2012,3 +2016,35 @@ def test_an_inferred_row_has_the_date_so_writing_it_does_not_crash(ocr, anchors)
     a.read_update_window = lambda: real
     t = a.locate_date(D("27 Nov 2026"))
     assert t.row.date == D("27 Nov 2026") and "inferred" in t.row.text
+
+
+@pytest.mark.parametrize("text,month", [("17 Sap 2027", 9), ("17 5ep 2027", 9), ("17 Sop 2027", 9),
+                                        ("17 Sep 2027", 9), ("16 Apr 2027", 4), ("19 0ct 2026", 10),
+                                        ("20 Avg 2027", 8), ("17 Dee 2027", 12)])
+def test_ocr_slips_in_the_month_do_not_turn_september_into_april(text, month):
+    assert sa.parse_date(text)[0].month == month
+
+
+def test_a_month_that_fits_two_months_equally_is_not_guessed():
+    assert sa.parse_date("17 Jvn 2027")[0] is None              # Jun or Jan?
+    assert sa.parse_date("19 Mav 2027")[0] is None              # Mar or May?
+
+
+def test_the_pointer_is_moved_off_the_list_before_each_read(ocr, anchors):
+    a, fake = _open_window(ocr, anchors)
+    a.locate_date(D("16 Apr 2027"))                              # needs a scroll
+    kinds = [e[0] for e in fake.events]
+    assert "scroll" in kinds
+    after = kinds[kinds.index("scroll") + 1:]
+    assert "move" in after                                       # parked after scrolling, before the next read
+
+
+def test_rows_per_notch_with_repeated_dates():
+    d = [dt.date(2027, 3, 19)] * 4 + [dt.date(2027, 4, 16), dt.date(2027, 5, 21), dt.date(2027, 6, 17),
+                                      dt.date(2027, 7, 16), dt.date(2027, 8, 20), dt.date(2027, 9, 17),
+                                      dt.date(2027, 10, 15), dt.date(2027, 11, 19)]
+    before, now = d[0:10], d[2:12]                               # moved 2 rows with 1 notch
+    rows = [sa.WindowRow(i, 0, "", x) for i, x in enumerate(now)]
+    assert sa.Automator._rows_per_notch((before, 1, True), rows, None) == 2.0
+    rows_up = [sa.WindowRow(i, 0, "", x) for i, x in enumerate(before)]
+    assert sa.Automator._rows_per_notch((now, 2, False), rows_up, None) == 1.0

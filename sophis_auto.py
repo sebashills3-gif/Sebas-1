@@ -340,6 +340,24 @@ _MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
 _DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1", "|": "1", "S": "5", "B": "8"})
 
 
+def _month_of(word: str) -> str | None:
+    """The month a 3-letter OCR reading stands for. Letters in the right place count most, so 'sap' is Sep
+    (s_p), not Apr; ties and weak readings give None rather than a guess."""
+    def score(mo):
+        same_place = sum(a == b for a, b in zip(word, mo))
+        return same_place + difflib.SequenceMatcher(None, word, mo).ratio()
+    ranked = sorted(_MONTHS, key=score, reverse=True)
+    best, second = ranked[0], ranked[1]
+    if word == best:
+        return best
+    if score(best) - score(second) < 0.3:                  # two months fit as well: do not guess
+        return None
+    same_place = sum(a == b for a, b in zip(word, best))
+    if same_place >= 2 or difflib.SequenceMatcher(None, word, best).ratio() >= 0.66:
+        return best
+    return None
+
+
 def _to_int(text: str) -> int:
     return int(text.translate(_DIGIT_FIX))
 
@@ -353,12 +371,12 @@ def parse_date(text) -> tuple[dt.date | None, str]:
         m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", t)                       # ISO
         if m:
             return dt.date(int(m[1]), int(m[2]), int(m[3])), ""
-        m = re.search(r"([0-9OolI|S]{1,2})\s*[-/. ]?\s*([A-Za-z0]{3,9})\.?\s*[-/. ]?\s*([0-9OolI|SB]{4})"
+        m = re.search(r"([0-9OolI|S]{1,2})\s*[-/. ]?\s*([A-Za-z05]{3,9})\.?\s*[-/. ]?\s*([0-9OolI|SB]{4})"
                       r"(?:\s*(-\s*\d+))?", t)
         if m:                                                                      # 19 Oct 2026 (-1)
-            word = m[2].lower().replace("0", "o")[:3]
-            best = max(_MONTHS, key=lambda mo: difflib.SequenceMatcher(None, word, mo).ratio())
-            if difflib.SequenceMatcher(None, word, best).ratio() >= 0.66:
+            word = m[2].lower().replace("0", "o").replace("5", "s")[:3]
+            best = _month_of(word)
+            if best is not None:
                 day, year = _to_int(m[1]), _to_int(m[3])
                 if 1990 <= year <= 2100:
                     return dt.date(year, _MONTHS.index(best) + 1, day), re.sub(r"\s+", "", m[4] or "")
@@ -703,6 +721,10 @@ class Screen:
         remaining = self._last_click + self._double_interval + 0.15 - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
+
+    def move(self, x: int, y: int) -> None:
+        """Only moves the pointer (no click)."""
+        self.pg.moveTo(x, y)
 
     def click(self, x: int, y: int) -> None:
         """A single click (never merged with the previous click)."""
@@ -1501,7 +1523,9 @@ class Automator:
         rereads = 0
         seen = set()                            # views already visited: seeing one again means it is going round
         for _ in range(max_scrolls + 1):
+            self._park_mouse()
             win = self.read_update_window()
+            self._last_win = win
             matches = win.find(target)
             if matches:
                 win, matches = self._reveal_duplicates(win, target)
@@ -1553,22 +1577,36 @@ class Automator:
             self._wait(0.4)
         raise SophisError(f"{target:%d %b %Y} was not found after {max_scrolls} scrolls.")
 
+    def _park_mouse(self, win: "UpdateWindow | None" = None) -> None:
+        """Moves the pointer off the list before reading it: resting on a cell can pop up a tooltip that hides
+        the rows under it, which then cannot be read. Goes to the window's title (or above the header)."""
+        win = win or getattr(self, "_last_win", None)
+        move = getattr(self.s, "move", None)
+        if win is None or move is None:
+            return
+        x, y = win.title if win.title else (win.x_maturity, int(win.header_y - 2 * win.pitch))
+        move(x, y)
+        self._wait(0.15)
+
     @staticmethod
     def _rows_per_notch(last: tuple, dated: list, current: float | None) -> float | None:
-        """How many rows one wheel notch moved the list, from the view before the last scroll and the view now."""
+        """How many rows one wheel notch moved the list: the shift that lines the view before the last scroll up
+        with the view now (whole sequences are compared, so repeated dates do not confuse it)."""
         before, clicks, down = last
         now = [r.date for r in dated]
-        if not clicks or not before:
+        if not clicks or not before or not now:
             return current
-        if down:       # the old LAST row moved up by `moved` rows
-            idx = [k for k, d in enumerate(now) if d == before[-1]]
-            moved = (len(before) - 1) - idx[0] if idx else None
-        else:          # the old FIRST row moved down by `moved` rows
-            idx = [k for k, d in enumerate(now) if d == before[0]]
-            moved = idx[-1] if idx else None
-        if moved is not None and moved > 0:
-            return moved / clicks
-        if moved is None:                       # jumped more than a whole screen: at least this much per notch
+        best, best_hits = None, 0
+        for shift in range(1, len(before)):
+            pairs = [(before[i], now[i - shift]) if down else (before[i - shift], now[i])
+                     for i in range(shift, len(before)) if i - shift < len(now)]
+            hits = sum(a == b for a, b in pairs)
+            if len(pairs) >= 2 and hits == len(pairs) and hits >= best_hits:
+                best, best_hits = shift, hits
+                break                                          # the smallest shift that lines up exactly
+        if best is not None:
+            return best / clicks
+        if not set(before) & set(now):                         # jumped more than a whole screen
             return max(current or 0, len(before) / clicks)
         return current
 
@@ -1670,6 +1708,7 @@ class Automator:
                 mid = win.rows[len(win.rows) // 2].cy
                 self.s.scroll(direction, win.x_maturity, mid)
                 self._wait(0.6)
+                self._park_mouse(win)
                 moved = self.read_update_window()
                 if tuple(r.date for r in moved.dated()) == before:       # the list did not move: end of the list
                     break
@@ -1679,6 +1718,7 @@ class Automator:
                     self.log(f"  (after nudging the list, {target:%d %b %Y} was not read; moving it back)")
                     self.s.scroll(-direction, win.x_maturity, mid)
                     self._wait(0.6)
+                    self._park_mouse(win)
                     return win, win.find(target)
                 win = moved
         return win, win.find(target)
