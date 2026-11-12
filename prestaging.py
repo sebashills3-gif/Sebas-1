@@ -22,9 +22,12 @@ FILAS_XLS = {
     "ISIN": 21,
     "CUSIP": 22,
     "COMMON": 23,
-    "SEDOL": 82,
     "FIGI_ID": 91,
 }
+# El SEDOL puede aparecer en cualquiera de estas filas (puede haber varios).
+FILAS_SEDOL = range(82, 87)
+# Valores que Bloomberg devuelve cuando no hay dato; no cuentan como SEDOL.
+SIN_DATO = ("#N/A", "N.A.", "N/A", "#NAME", "#VALUE", "#REF")
 ULTIMA_FILA_XLS = 102
 
 # Columna del PreStaging File donde se pega cada identificador.
@@ -149,25 +152,59 @@ def _a_texto(valor):
     return texto or None
 
 
+def _es_sedol(valor):
+    return valor is not None and not valor.upper().startswith(SIN_DATO)
+
+
 def extraer_securities(matriz):
     """De la matriz de celdas (fila 1 = matriz[0]) saca un dict por security.
 
-    Cada columna desde la B es un security. Las columnas vacías al final se
-    descartan; las vacías intermedias se conservan para no desalinear filas.
+    Cada columna desde la B es un security. "SEDOL" es una lista con los
+    SEDOL distintos de las filas 82 a 86, en el orden en que aparecen. Las
+    columnas vacías al final se descartan; las vacías intermedias se
+    conservan para no desalinear filas.
     """
     columnas = len(matriz[0]) if matriz else 0
     securities = []
 
     for col in range(1, columnas):
-        securities.append({
+        security = {
             clave: _a_texto(matriz[fila - 1][col])
             for clave, fila in FILAS_XLS.items()
-        })
+        }
+        sedols = [_a_texto(matriz[fila - 1][col]) for fila in FILAS_SEDOL]
+        security["SEDOL"] = list(dict.fromkeys(v for v in sedols if _es_sedol(v)))
+        securities.append(security)
 
     while securities and not any(securities[-1].values()):
         securities.pop()
 
     return securities
+
+
+def construir_filas(securities):
+    """Convierte los securities en las filas del PreStaging File.
+
+    Primera fila de cada security: todos los identificadores y el primer
+    SEDOL. Por cada SEDOL adicional, una fila con el mismo ISIN, ese SEDOL
+    y el resto vacío.
+    """
+    filas = []
+
+    for security in securities:
+        sedols = security["SEDOL"]
+        filas.append({**security, "SEDOL": sedols[0] if sedols else None})
+
+        for sedol in sedols[1:]:
+            filas.append({
+                "ISIN": security["ISIN"],
+                "SEDOL": sedol,
+                "CUSIP": None,
+                "COMMON": None,
+                "FIGI_ID": None,
+            })
+
+    return filas
 
 
 def leer_securities_xls(ruta):
@@ -189,6 +226,8 @@ def leer_securities_xls(ruta):
     print("Mnemonics leídos del XLS:")
     for clave, fila in FILAS_XLS.items():
         print(f"  {clave} (fila {fila}): {matriz[fila - 1][0]}")
+    for fila in FILAS_SEDOL:
+        print(f"  SEDOL (fila {fila}): {matriz[fila - 1][0]}")
 
     return extraer_securities(matriz)
 
@@ -207,6 +246,8 @@ def _para_excel(valor):
 
 def pegar_en_prestaging(securities, hoja=None):
     """Pega los identificadores desde la fila 5 y guarda el libro.
+
+    Un security con varios SEDOL ocupa varias filas (ver construir_filas).
 
     Sobrescribe las celdas destino (si el valor viene vacío, la celda queda
     vacía) y borra el contenido que hubiera más abajo en esas mismas
@@ -228,14 +269,16 @@ def pegar_en_prestaging(securities, hoja=None):
 
     destino = libro.sheets[hoja] if hoja else libro.sheets.active
 
-    for i, security in enumerate(securities):
+    filas = construir_filas(securities)
+
+    for i, valores in enumerate(filas):
         fila = FILA_INICIAL_PRESTAGING + i
         for clave, columna in COLUMNAS_PRESTAGING.items():
-            destino.range(f"{columna}{fila}").value = _para_excel(security[clave])
+            destino.range(f"{columna}{fila}").value = _para_excel(valores[clave])
 
     # Limpia los restos de corridas anteriores (solo las 5 columnas de
     # identificadores, y solo el contenido, no el formato).
-    primera_sobrante = FILA_INICIAL_PRESTAGING + len(securities)
+    primera_sobrante = FILA_INICIAL_PRESTAGING + len(filas)
     ultima_fila = destino.used_range.last_cell.row
     if ultima_fila >= primera_sobrante:
         for columna in COLUMNAS_PRESTAGING.values():
@@ -245,8 +288,8 @@ def pegar_en_prestaging(securities, hoja=None):
 
     libro.save()
     print(
-        f"{len(securities)} securities pegados en '{libro.name}' "
-        f"(hoja '{destino.name}') y archivo guardado."
+        f"{len(securities)} securities ({len(filas)} filas) pegados en "
+        f"'{libro.name}' (hoja '{destino.name}') y archivo guardado."
     )
 
 
