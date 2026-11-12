@@ -209,7 +209,9 @@ def pegar_en_prestaging(securities, hoja=None):
     """Pega los identificadores desde la fila 5 y guarda el libro.
 
     Sobrescribe las celdas destino (si el valor viene vacío, la celda queda
-    vacía). `hoja` es el nombre de la hoja; por defecto, la hoja activa.
+    vacía) y borra el contenido que hubiera más abajo en esas mismas
+    columnas, de corridas anteriores. `hoja` es el nombre de la hoja; por
+    defecto, la hoja activa.
     """
     import xlwings as xw
 
@@ -230,6 +232,16 @@ def pegar_en_prestaging(securities, hoja=None):
         fila = FILA_INICIAL_PRESTAGING + i
         for clave, columna in COLUMNAS_PRESTAGING.items():
             destino.range(f"{columna}{fila}").value = _para_excel(security[clave])
+
+    # Limpia los restos de corridas anteriores (solo las 5 columnas de
+    # identificadores, y solo el contenido, no el formato).
+    primera_sobrante = FILA_INICIAL_PRESTAGING + len(securities)
+    ultima_fila = destino.used_range.last_cell.row
+    if ultima_fila >= primera_sobrante:
+        for columna in COLUMNAS_PRESTAGING.values():
+            destino.range(
+                f"{columna}{primera_sobrante}:{columna}{ultima_fila}"
+            ).clear_contents()
 
     libro.save()
     print(
