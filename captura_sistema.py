@@ -7,6 +7,7 @@ import pandas as pd
 from playwright.sync_api import sync_playwright
 
 from bloombot import procesar_y_enviar
+from prestaging import procesar_gimp
 
 
 # ============================================================
@@ -639,16 +640,34 @@ def ejecutar_extraccion_con_reintentos(
 
 def enviar_a_bloombot(archivo_filtrado):
     """
-    Pasa los códigos del Excel filtrado a BLOOMBOT.
-    Un error aquí no interrumpe el programa.
+    Pasa los códigos del Excel filtrado a BLOOMBOT y, cuando la macro
+    termina, mueve los archivos GIMP a la carpeta de evidencia y llena
+    el PreStaging File. Un error aquí no interrumpe el programa.
     """
 
+    inicio = datetime.now()
+
     try:
-        procesar_y_enviar(archivo_filtrado)
+        cantidad = procesar_y_enviar(archivo_filtrado)
 
     except Exception as error:
         print()
         print(f"No se pudo enviar a BLOOMBOT: {error}")
+        return
+
+    if not cantidad:
+        return
+
+    try:
+        procesar_gimp(
+            cantidad,
+            inicio,
+            Path(archivo_filtrado).parent,
+        )
+
+    except Exception as error:
+        print()
+        print(f"No se pudo completar el PreStaging File: {error}")
 
 
 # ============================================================

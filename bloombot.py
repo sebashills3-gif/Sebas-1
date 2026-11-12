@@ -145,7 +145,10 @@ def enviar_a_bloombot(codigos, macro=MACRO_SUBMIT, limpiar=True):
 
 
 def procesar_y_enviar(ruta_excel, macro=MACRO_SUBMIT):
-    """Flujo completo a partir del Excel que genera la extracción."""
+    """Flujo completo a partir del Excel que genera la extracción.
+
+    Devuelve cuántos códigos se enviaron (None si no se envió ninguno).
+    """
     codigos, omitidos = obtener_codigos(ruta_excel)
 
     if omitidos:
@@ -156,3 +159,4 @@ def procesar_y_enviar(ruta_excel, macro=MACRO_SUBMIT):
 
     enviar_a_bloombot(codigos, macro=macro)
     print(f"{len(codigos)} códigos enviados a {NOMBRE_LIBRO}.")
+    return len(codigos)
