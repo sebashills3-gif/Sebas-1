@@ -8,6 +8,7 @@ from playwright.sync_api import sync_playwright
 
 from bloombot import procesar_y_enviar
 from prestaging import procesar_gimp
+from genie import hacer_click_sanction_check
 
 
 # ============================================================
@@ -641,8 +642,9 @@ def ejecutar_extraccion_con_reintentos(
 def enviar_a_bloombot(archivo_filtrado):
     """
     Pasa los códigos del Excel filtrado a BLOOMBOT y, cuando la macro
-    termina, mueve los archivos GIMP a la carpeta de evidencia y llena
-    el PreStaging File. Un error aquí no interrumpe el programa.
+    termina, mueve los archivos GIMP a la carpeta de evidencia, llena
+    el PreStaging File y pulsa "Perform Sanctions Check" en Genie.
+    Un error aquí no interrumpe el programa.
     """
 
     inicio = datetime.now()
@@ -668,6 +670,14 @@ def enviar_a_bloombot(archivo_filtrado):
     except Exception as error:
         print()
         print(f"No se pudo completar el PreStaging File: {error}")
+        return
+
+    try:
+        hacer_click_sanction_check()
+
+    except Exception as error:
+        print()
+        print(f"No se pudo pulsar el botón en Genie: {error}")
 
 
 # ============================================================
