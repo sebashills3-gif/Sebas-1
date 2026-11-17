@@ -10,8 +10,6 @@ import pandas as pd
 NOMBRE_LIBRO = "BLR00441 - GDS BLOOMBOT"
 HOJA_REQUEST_FILE = "Request File"
 HOJA_REQUEST_BUILDER = "Request Builder"
-# Solo se trabajan los securities de estas entidades (columna Entity del TUR).
-ENTIDADES_PERMITIDAS = {"HBSI"}
 MACRO_SUBMIT = "creates_req"
 
 
@@ -43,46 +41,46 @@ def etiquetar_codigo(codigo):
 
 
 def obtener_codigos(ruta_excel):
-    """Lee el Excel de salida y devuelve (codigos_etiquetados, omitidos).
+    """Lee el Excel de salida y devuelve (codigos_etiquetados, omitidos,
+    entidades).
 
-    Solo considera las entidades de ENTIDADES_PERMITIDAS. Toma la columna
-    Name y, solo si la celda está vacía, la columna Cusip.
+    Toma la columna Name y, solo si la celda está vacía, la columna Cusip.
+    `entidades` va alineada con `codigos_etiquetados` (misma posición = misma
+    columna del XLS de BLOOMBOT): cada elemento es el conjunto de entidades
+    (columna Entity) de las que viene ese código.
     """
     df = pd.read_excel(ruta_excel, dtype=str)
     col_name = _columna(df, "Name")
     col_cusip = _columna(df, "Cusip")
     col_entity = _columna(df, "Entity")
 
-    permitidas = {e.upper() for e in ENTIDADES_PERMITIDAS}
-    entidades = df[col_entity].map(lambda e: _texto(e).upper())
-    omitidas = df[~entidades.isin(permitidas)]
-    if len(omitidas):
-        print(
-            f"Securities de otras entidades (no se trabajan): {len(omitidas)} "
-            f"({sorted(set(entidades[omitidas.index]))})"
-        )
-    df = df[entidades.isin(permitidas)]
-
     # Primero se obtienen los códigos y se quitan duplicados (conservando
     # el orden); la etiqueta |CUSIP| o |ISIN| se agrega después.
     codigos = []
-    for nombre, cusip in zip(df[col_name], df[col_cusip]):
+    entidades_de = {}
+    for nombre, cusip, entidad in zip(
+        df[col_name], df[col_cusip], df[col_entity]
+    ):
         codigo = _texto(nombre) or _texto(cusip)
         if codigo:
             codigos.append(codigo)
+            entidades_de.setdefault(codigo.upper(), set()).add(
+                _texto(entidad).upper()
+            )
 
     unicos = list(dict.fromkeys(c.upper() for c in codigos))
     if len(unicos) < len(codigos):
         print(f"Duplicados eliminados: {len(codigos) - len(unicos)}")
 
-    etiquetados, omitidos = [], []
+    etiquetados, omitidos, entidades = [], [], []
     for codigo in unicos:
         etiquetado = etiquetar_codigo(codigo)
         if etiquetado is None:
             omitidos.append(codigo)
         else:
             etiquetados.append(etiquetado)
-    return etiquetados, omitidos
+            entidades.append(entidades_de[codigo])
+    return etiquetados, omitidos, entidades
 
 
 def _buscar_hoja(libro, nombre, indice):
@@ -161,9 +159,10 @@ def enviar_a_bloombot(codigos, macro=MACRO_SUBMIT, limpiar=True):
 def procesar_y_enviar(ruta_excel, macro=MACRO_SUBMIT):
     """Flujo completo a partir del Excel que genera la extracción.
 
-    Devuelve cuántos códigos se enviaron (None si no se envió ninguno).
+    Devuelve (cuántos códigos se enviaron, entidades de cada uno en el orden
+    de columnas del XLS), o None si no se envió ninguno.
     """
-    codigos, omitidos = obtener_codigos(ruta_excel)
+    codigos, omitidos, entidades = obtener_codigos(ruta_excel)
 
     if omitidos:
         print(f"Códigos sin 8, 9 o 12 caracteres (no enviados): {omitidos}")
@@ -173,4 +172,4 @@ def procesar_y_enviar(ruta_excel, macro=MACRO_SUBMIT):
 
     enviar_a_bloombot(codigos, macro=macro)
     print(f"{len(codigos)} códigos enviados a {NOMBRE_LIBRO}.")
-    return len(codigos)
+    return len(codigos), entidades

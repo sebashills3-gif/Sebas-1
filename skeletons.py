@@ -29,6 +29,7 @@ CPN_TYP = 6
 CRNCY = 7
 MARKET_SECTOR_DES = 12
 SECURITY_DES = 15
+TYPE_OF_BOND = 10
 MATURITY_FILA = 19
 DAY_COUNT_FILA = 20
 ID_ISIN = 21
@@ -44,6 +45,7 @@ MNEMONICS_ESPERADOS = {
     CPN_TYP: "CPN_TYP",
     CRNCY: "CRNCY",
     MARKET_SECTOR_DES: "MARKET_SECTOR_DES",
+    TYPE_OF_BOND: "TYPE_OF_BOND",
     SECURITY_DES: "SECURITY_DES",
     MATURITY_FILA: "MATURITY",
     DAY_COUNT_FILA: "DAY_CNT_DES",
@@ -71,6 +73,7 @@ class Security:
     filas: dict                      # fila del XLS -> valor
     mnemonics: dict                  # fila del XLS -> mnemonic (columna A)
     skeleton: str = None
+    entidades: set = field(default_factory=set)   # columna Entity del TUR
     derivados: dict = field(default_factory=dict)
     advertencias: list = field(default_factory=list)
 
@@ -305,12 +308,18 @@ class Skeleton:
     nombre: str
     filtro: dict                     # fila del XLS -> valor esperado
     transformaciones: list
+    excluye: dict = field(default_factory=dict)  # fila -> valor que NO debe tener
 
     def coincide(self, sec):
-        return all(
+        cumple = all(
             sec.texto(fila).upper() == esperado.upper()
             for fila, esperado in self.filtro.items()
         )
+        no_excluido = all(
+            sec.texto(fila).upper() != prohibido.upper()
+            for fila, prohibido in self.excluye.items()
+        )
+        return cumple and no_excluido
 
 
 SKELETONS = [
@@ -323,6 +332,8 @@ SKELETONS = [
             MARKET_SECTOR_DES: "Corp",
             SINKABLE: "N",
         },
+        # Un Convertible no es 5/80 (cualquier otro valor, o vacío, sí).
+        excluye={TYPE_OF_BOND: "Convertible"},
         transformaciones=[
             cupon_fraccion_a_decimal,
             perpetuo_a_vencimiento,
@@ -401,6 +412,7 @@ def exportar_excel(securities, ruta):
         registro = {
             "Columna XLS": _letra(sec.columna),
             "Skeleton": sec.skeleton or "SIN SKELETON",
+            "Entidad": ", ".join(sorted(sec.entidades)),
             "ISIN": sec.filas.get(ID_ISIN),
             "CUSIP": sec.filas.get(ID_CUSIP),
             "DAY COUNT": sec.derivados.get("DAY COUNT"),
@@ -415,9 +427,13 @@ def exportar_excel(securities, ruta):
     pd.DataFrame(registros).to_excel(ruta, index=False)
 
 
-def procesar_matriz(matriz, carpeta_destino):
+def procesar_matriz(matriz, carpeta_destino, entidades=None):
     """Clasifica y limpia todos los securities del XLS y guarda un Excel de
-    revisión en `carpeta_destino`. Devuelve la lista de Security."""
+    revisión en `carpeta_destino`. Devuelve la lista de Security.
+
+    `entidades` (opcional) es la lista de entidades de cada security en el
+    orden de columnas del XLS; se guarda en `Security.entidades`.
+    """
     print()
     print("Clasificando securities por skeleton...")
 
@@ -426,11 +442,22 @@ def procesar_matriz(matriz, carpeta_destino):
 
     securities = [limpiar(sec) for sec in construir_securities(matriz)]
 
+    if entidades is not None:
+        if len(entidades) != len(securities):
+            print(
+                f"Aviso: {len(entidades)} códigos enviados a BLOOMBOT pero el "
+                f"XLS trae {len(securities)} securities; no se asignan entidades."
+            )
+        else:
+            for sec, entidad in zip(securities, entidades):
+                sec.entidades = set(entidad)
+
     for sec in securities:
         print(
             f"  Columna {_letra(sec.columna)}: "
             f"{sec.filas.get(ID_ISIN) or '(sin ISIN)'} -> "
             f"{sec.skeleton or 'SIN SKELETON'}"
+            + (f" [{', '.join(sorted(sec.entidades))}]" if sec.entidades else "")
         )
         for advertencia in sec.advertencias:
             print(f"      Aviso: {advertencia}")

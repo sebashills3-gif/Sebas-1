@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 PROGRAMA = ("NSEX", "HBSI", "")
+# Solo se CREAN los securities de estas entidades; los demás se corren en
+# todo el flujo previo pero no se dan de alta.
+ENTIDADES_ALTA = {"HBSI"}
 MERCADO = "5"
 INSTRUMENTO = "80"
 SKELETON = "5/80"
@@ -152,7 +155,7 @@ def campos_nsex02(d):
         "ici_securityName": d.security_des,
         "ici_description1": d.name,
         "ici_description4": d.isin,
-        "ici_iisinCode": d.isin,
+        "ici_iisnCode": d.isin,
         "ici_customerIPNumber": d.cusip,
         "ici_sortCouponStrikePrice": d.cpn,
         "ici_sortMaturity": d.maturity,
@@ -467,13 +470,21 @@ def procesar_securities_impact(page, securities):
     mano. Al final imprime qué securities se tomaron y cuáles no.
     """
     resultados = []   # (estado, etiqueta, detalle)
-    pendientes = [s for s in securities if s.skeleton == SKELETON]
+    pendientes = []
 
     for sec in securities:
         if sec.skeleton != SKELETON:
             resultados.append(
                 ("No tomado", _etiqueta(sec), f"no cumple el skeleton {SKELETON}")
             )
+        elif not sec.entidades & ENTIDADES_ALTA:
+            entidades = ", ".join(sorted(sec.entidades)) or "sin entidad"
+            resultados.append(
+                ("No tomado", _etiqueta(sec),
+                 f"entidad {entidades}: solo se crean {sorted(ENTIDADES_ALTA)}")
+            )
+        else:
+            pendientes.append(sec)
 
     terminar = False
     for i, sec in enumerate(pendientes, start=1):

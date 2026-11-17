@@ -655,15 +655,17 @@ def enviar_a_bloombot(archivo_filtrado, page):
     inicio = datetime.now()
 
     try:
-        cantidad = procesar_y_enviar(archivo_filtrado)
+        resultado = procesar_y_enviar(archivo_filtrado)
 
     except Exception as error:
         print()
         print(f"No se pudo enviar a BLOOMBOT: {error}")
         return
 
-    if not cantidad:
+    if not resultado:
         return
+
+    cantidad, entidades = resultado
 
     carpeta_evidencia = Path(archivo_filtrado).parent
 
@@ -684,7 +686,11 @@ def enviar_a_bloombot(archivo_filtrado, page):
 
     if matriz:
         try:
-            securities = procesar_matriz(matriz, carpeta_evidencia)
+            securities = procesar_matriz(
+                matriz,
+                carpeta_evidencia,
+                entidades,
+            )
 
         except Exception as error:
             print()
