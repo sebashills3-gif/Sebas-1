@@ -11,6 +11,7 @@ from prestaging import procesar_gimp
 from genie import hacer_click_sanction_check
 from sanctions import procesar_sanctions
 from skeletons import procesar_matriz
+from impact import procesar_securities_impact
 
 
 # ============================================================
@@ -641,12 +642,13 @@ def ejecutar_extraccion_con_reintentos(
     return None
 
 
-def enviar_a_bloombot(archivo_filtrado):
+def enviar_a_bloombot(archivo_filtrado, page):
     """
     Pasa los códigos del Excel filtrado a BLOOMBOT y, cuando la macro
     termina, mueve los archivos GIMP a la carpeta de evidencia, llena
-    el PreStaging File, pulsa "Perform Sanctions Check" en Genie y mueve
-    el PDF resultante a la carpeta de evidencia.
+    el PreStaging File, clasifica los securities, pulsa "Perform
+    Sanctions Check" en Genie, mueve el PDF resultante a la carpeta de
+    evidencia y prepara el alta de los securities en IMPACT.
     Un error aquí no interrumpe el programa.
     """
 
@@ -678,33 +680,50 @@ def enviar_a_bloombot(archivo_filtrado):
         return
 
     # Clasificación por skeleton y limpieza de datos (no detiene el flujo)
+    securities = None
+
     if matriz:
         try:
-            procesar_matriz(matriz, carpeta_evidencia)
+            securities = procesar_matriz(matriz, carpeta_evidencia)
 
         except Exception as error:
             print()
             print(f"No se pudo clasificar los securities: {error}")
 
     inicio_sanctions = datetime.now()
+    sanctions_ok = False
 
     try:
         hacer_click_sanction_check()
 
-    except Exception as error:
-        print()
-        print(f"No se pudo pulsar el botón en Genie: {error}")
-        return
-
-    try:
         procesar_sanctions(
             inicio_sanctions,
             carpeta_evidencia,
         )
+        sanctions_ok = True
 
     except Exception as error:
         print()
-        print(f"No se pudo mover el PDF del Sanctions Check: {error}")
+        print(f"El Sanctions Check no se completó: {error}")
+
+    if not securities:
+        return
+
+    if not sanctions_ok:
+        continuar = input(
+            "El Sanctions Check no se completó. "
+            "¿Continuar con IMPACT de todos modos? (s/n): "
+        ).strip().lower()
+
+        if continuar != "s":
+            return
+
+    try:
+        procesar_securities_impact(page, securities)
+
+    except Exception as error:
+        print()
+        print(f"No se pudo completar el trabajo en IMPACT: {error}")
 
 
 # ============================================================
@@ -765,7 +784,7 @@ def main():
             archivo_filtrado = ejecutar_extraccion_con_reintentos(page)
 
             if archivo_filtrado is not None:
-                enviar_a_bloombot(archivo_filtrado)
+                enviar_a_bloombot(archivo_filtrado, page)
 
             print()
             print("=" * 60)

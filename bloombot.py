@@ -10,6 +10,8 @@ import pandas as pd
 NOMBRE_LIBRO = "BLR00441 - GDS BLOOMBOT"
 HOJA_REQUEST_FILE = "Request File"
 HOJA_REQUEST_BUILDER = "Request Builder"
+# Solo se trabajan los securities de estas entidades (columna Entity del TUR).
+ENTIDADES_PERMITIDAS = {"HBSI"}
 MACRO_SUBMIT = "creates_req"
 
 
@@ -43,11 +45,23 @@ def etiquetar_codigo(codigo):
 def obtener_codigos(ruta_excel):
     """Lee el Excel de salida y devuelve (codigos_etiquetados, omitidos).
 
-    Toma la columna Name y, solo si la celda está vacía, la columna Cusip.
+    Solo considera las entidades de ENTIDADES_PERMITIDAS. Toma la columna
+    Name y, solo si la celda está vacía, la columna Cusip.
     """
     df = pd.read_excel(ruta_excel, dtype=str)
     col_name = _columna(df, "Name")
     col_cusip = _columna(df, "Cusip")
+    col_entity = _columna(df, "Entity")
+
+    permitidas = {e.upper() for e in ENTIDADES_PERMITIDAS}
+    entidades = df[col_entity].map(lambda e: _texto(e).upper())
+    omitidas = df[~entidades.isin(permitidas)]
+    if len(omitidas):
+        print(
+            f"Securities de otras entidades (no se trabajan): {len(omitidas)} "
+            f"({sorted(set(entidades[omitidas.index]))})"
+        )
+    df = df[entidades.isin(permitidas)]
 
     # Primero se obtienen los códigos y se quitan duplicados (conservando
     # el orden); la etiqueta |CUSIP| o |ISIN| se agrega después.
