@@ -74,6 +74,7 @@ class Security:
     mnemonics: dict                  # fila del XLS -> mnemonic (columna A)
     skeleton: str = None
     entidades: set = field(default_factory=set)   # columna Entity del TUR
+    bloqueo: str = None              # motivo por el que NO se debe crear
     derivados: dict = field(default_factory=dict)
     advertencias: list = field(default_factory=list)
 

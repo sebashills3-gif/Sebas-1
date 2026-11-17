@@ -75,7 +75,8 @@ def esperar_pdfs(desde, base=CARPETA_SANCTIONS, timeout_s=900, pausa_s=3):
 
 
 def procesar_sanctions(desde, carpeta_evidencia, base=CARPETA_SANCTIONS):
-    """Mueve el PDF del Sanctions Check a la carpeta de evidencia."""
+    """Mueve el PDF del Sanctions Check a la carpeta de evidencia y devuelve
+    sus nuevas rutas."""
     print()
     print(f"Esperando la carpeta de Sanctions Check en {base}...", flush=True)
     pdfs = esperar_pdfs(desde, base)
@@ -83,5 +84,8 @@ def procesar_sanctions(desde, carpeta_evidencia, base=CARPETA_SANCTIONS):
     if len(pdfs) > 1:
         print(f"Aviso: la carpeta trae {len(pdfs)} PDF; se mueven todos.")
 
-    for ruta in mover_archivos(pdfs, carpeta_evidencia):
+    movidos = mover_archivos(pdfs, carpeta_evidencia)
+    for ruta in movidos:
         print(f"PDF movido: {ruta}")
+
+    return movidos

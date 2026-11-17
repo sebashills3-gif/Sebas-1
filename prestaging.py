@@ -237,6 +237,15 @@ def leer_matriz_xls(ruta):
 # 3. PRESTAGING FILE
 # ============================================================
 
+def duenios_de_filas(securities):
+    """Para cada fila de construir_filas, el índice del security al que
+    pertenece."""
+    duenios = []
+    for i, security in enumerate(securities):
+        duenios.extend([i] * max(1, len(security["SEDOL"])))
+    return duenios
+
+
 def _para_excel(valor):
     """None limpia la celda; los códigos solo con dígitos se guardan como
     texto (apóstrofo) para no perder ceros a la izquierda."""

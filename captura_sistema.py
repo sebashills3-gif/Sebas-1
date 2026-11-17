@@ -10,6 +10,7 @@ from bloombot import procesar_y_enviar
 from prestaging import procesar_gimp
 from genie import hacer_click_sanction_check
 from sanctions import procesar_sanctions
+from sanctions_pdf import verificar_securities
 from skeletons import procesar_matriz
 from impact import procesar_securities_impact
 
@@ -697,16 +698,15 @@ def enviar_a_bloombot(archivo_filtrado, page):
             print(f"No se pudo clasificar los securities: {error}")
 
     inicio_sanctions = datetime.now()
-    sanctions_ok = False
+    pdfs = []
 
     try:
         hacer_click_sanction_check()
 
-        procesar_sanctions(
+        pdfs = procesar_sanctions(
             inicio_sanctions,
             carpeta_evidencia,
         )
-        sanctions_ok = True
 
     except Exception as error:
         print()
@@ -715,14 +715,16 @@ def enviar_a_bloombot(archivo_filtrado, page):
     if not securities:
         return
 
-    if not sanctions_ok:
-        continuar = input(
-            "El Sanctions Check no se completó. "
-            "¿Continuar con IMPACT de todos modos? (s/n): "
-        ).strip().lower()
+    # Revisión del PDF: solo los securities con PASS pueden crearse. Si no
+    # hay PDF o no se puede leer, no se crea ninguno.
+    try:
+        verificar_securities(pdfs, matriz, securities, carpeta_evidencia)
 
-        if continuar != "s":
-            return
+    except Exception as error:
+        print()
+        print(f"No se pudo revisar el Sanctions Check: {error}")
+        for sec in securities:
+            sec.bloqueo = f"no se pudo revisar el Sanctions Check: {error}"
 
     try:
         procesar_securities_impact(page, securities)

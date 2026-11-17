@@ -477,6 +477,8 @@ def procesar_securities_impact(page, securities):
             resultados.append(
                 ("No tomado", _etiqueta(sec), f"no cumple el skeleton {SKELETON}")
             )
+        elif sec.bloqueo:
+            resultados.append(("No tomado", _etiqueta(sec), sec.bloqueo))
         elif not sec.entidades & ENTIDADES_ALTA:
             entidades = ", ".join(sorted(sec.entidades)) or "sin entidad"
             resultados.append(
