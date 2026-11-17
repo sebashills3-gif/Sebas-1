@@ -207,8 +207,9 @@ def construir_filas(securities):
     return filas
 
 
-def leer_securities_xls(ruta):
-    """Abre el XLS en una instancia oculta de Excel y extrae los securities."""
+def leer_matriz_xls(ruta):
+    """Abre el XLS en una instancia oculta de Excel y devuelve sus celdas
+    (filas 1 a ULTIMA_FILA_XLS; la fila 1 es matriz[0])."""
     import xlwings as xw
 
     app = xw.App(visible=False, add_book=False)
@@ -229,7 +230,7 @@ def leer_securities_xls(ruta):
     for fila in FILAS_SEDOL:
         print(f"  SEDOL (fila {fila}): {matriz[fila - 1][0]}")
 
-    return extraer_securities(matriz)
+    return matriz
 
 
 # ============================================================
@@ -299,7 +300,11 @@ def pegar_en_prestaging(securities, hoja=None):
 
 def procesar_gimp(cantidad, desde, carpeta_evidencia, dump=CARPETA_DUMP,
                   hoja=None):
-    """Mueve los GIMP de DUMP a la evidencia y llena el PreStaging File."""
+    """Mueve los GIMP de DUMP a la evidencia y llena el PreStaging File.
+
+    Devuelve las celdas del XLS (para clasificar los securities), o None si
+    el XLS no trajo securities.
+    """
     print()
     print(f"Esperando archivos GIMP*_{cantidad} en {dump}...", flush=True)
     xls, xps = esperar_archivos(cantidad, desde, dump)
@@ -309,7 +314,8 @@ def procesar_gimp(cantidad, desde, carpeta_evidencia, dump=CARPETA_DUMP,
         print(f"Archivo movido: {ruta}")
 
     xls_movido = next(r for r in movidos if r.suffix.lower() == ".xls")
-    securities = leer_securities_xls(xls_movido)
+    matriz = leer_matriz_xls(xls_movido)
+    securities = extraer_securities(matriz)
 
     if len(securities) != cantidad:
         print(
@@ -318,6 +324,7 @@ def procesar_gimp(cantidad, desde, carpeta_evidencia, dump=CARPETA_DUMP,
         )
     if not securities:
         print("El XLS no trae securities; no se pega nada.")
-        return
+        return None
 
     pegar_en_prestaging(securities, hoja=hoja)
+    return matriz

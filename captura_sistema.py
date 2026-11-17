@@ -10,6 +10,7 @@ from bloombot import procesar_y_enviar
 from prestaging import procesar_gimp
 from genie import hacer_click_sanction_check
 from sanctions import procesar_sanctions
+from skeletons import procesar_matriz
 
 
 # ============================================================
@@ -662,17 +663,28 @@ def enviar_a_bloombot(archivo_filtrado):
     if not cantidad:
         return
 
+    carpeta_evidencia = Path(archivo_filtrado).parent
+
     try:
-        procesar_gimp(
+        matriz = procesar_gimp(
             cantidad,
             inicio,
-            Path(archivo_filtrado).parent,
+            carpeta_evidencia,
         )
 
     except Exception as error:
         print()
         print(f"No se pudo completar el PreStaging File: {error}")
         return
+
+    # Clasificación por skeleton y limpieza de datos (no detiene el flujo)
+    if matriz:
+        try:
+            procesar_matriz(matriz, carpeta_evidencia)
+
+        except Exception as error:
+            print()
+            print(f"No se pudo clasificar los securities: {error}")
 
     inicio_sanctions = datetime.now()
 
@@ -687,7 +699,7 @@ def enviar_a_bloombot(archivo_filtrado):
     try:
         procesar_sanctions(
             inicio_sanctions,
-            Path(archivo_filtrado).parent,
+            carpeta_evidencia,
         )
 
     except Exception as error:
