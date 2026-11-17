@@ -29,6 +29,7 @@ CPN_TYP = 6
 CRNCY = 7
 MARKET_SECTOR_DES = 12
 SECURITY_DES = 15
+MATURITY_FILA = 19
 DAY_COUNT_FILA = 20
 ID_ISIN = 21
 ID_CUSIP = 22
@@ -37,13 +38,15 @@ IS_PERPETUAL = 52
 SINKABLE = 56
 
 # Mnemonic esperado en la columna A de cada fila usada (para avisar si el
-# layout del XLS cambia). La fila 20 no se valida porque no se conoce el nombre.
+# layout del XLS cambia).
 MNEMONICS_ESPERADOS = {
     IS_UNIT_TRADED: "IS_UNIT_TRADED",
     CPN_TYP: "CPN_TYP",
     CRNCY: "CRNCY",
     MARKET_SECTOR_DES: "MARKET_SECTOR_DES",
     SECURITY_DES: "SECURITY_DES",
+    MATURITY_FILA: "MATURITY",
+    DAY_COUNT_FILA: "DAY_CNT_DES",
     ID_ISIN: "ID_ISIN",
     ID_CUSIP: "ID_CUSIP",
     FIRST_CPN_DT: "FIRST_CPN_DT",
@@ -234,10 +237,6 @@ def formatear_celdas(sec):
         elif valor is not None:
             sec.filas[fila] = _texto(valor)
 
-    vencimiento = sec.derivados.get("MATURITY")
-    if isinstance(vencimiento, date):
-        sec.derivados["MATURITY"] = formato_fecha_sin_diagonales(vencimiento)
-
 
 # ============================================================
 # SKELETON 5/80
@@ -278,8 +277,8 @@ def cupon_fraccion_a_decimal(sec):
 
 
 def perpetuo_a_vencimiento(sec):
-    """IS_PERPETUAL = Y: MATURITY = FIRST_CPN_DT + 30 años, y si SECURITY_DES
-    termina en PERP se cambia por la fecha en MM/DD/YYYY."""
+    """IS_PERPETUAL = Y: MATURITY (fila 19) = FIRST_CPN_DT + 30 años, y si
+    SECURITY_DES termina en PERP se cambia por la fecha en MM/DD/YYYY."""
     if sec.texto(IS_PERPETUAL).upper() != "Y":
         return
 
@@ -292,7 +291,7 @@ def perpetuo_a_vencimiento(sec):
         return
 
     vencimiento = sumar_anios(primer_cupon, ANIOS_PERPETUO)
-    sec.derivados["MATURITY"] = vencimiento
+    sec.filas[MATURITY_FILA] = vencimiento  # se formatea al final
 
     descripcion = sec.texto(SECURITY_DES)
     if re.search(r"(?i)(?<!\S)PERP$", descripcion):
@@ -406,7 +405,7 @@ def exportar_excel(securities, ruta):
             "CUSIP": sec.filas.get(ID_CUSIP),
             "DAY COUNT": sec.derivados.get("DAY COUNT"),
             "YEAR BASIS": sec.derivados.get("YEAR BASIS"),
-            "MATURITY": sec.derivados.get("MATURITY"),
+            "MATURITY": sec.filas.get(MATURITY_FILA),
             "Advertencias": " | ".join(sec.advertencias),
         }
         for fila, valor in sec.filas.items():
