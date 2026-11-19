@@ -347,12 +347,13 @@ SKELETONS = [
             MARKET_SECTOR_DES: "Corp",
             SINKABLE: "N",
         },
-        # Un Convertible no es 5/80 (cualquier otro valor, o vacío, sí).
-        excluye={TYPE_OF_BOND: "Convertible"},
-        # US DOMESTIC + CERT OF DEPOSIT juntos tampoco son 5/80.
-        excluye_combinaciones=[
-            {SECURITY_TYP: "US DOMESTIC", COLLAT_TYP: "CERT OF DEPOSIT"},
-        ],
+        # Con cualquiera de estos valores (aunque venga solo) no es 5/80:
+        # Convertible, US DOMESTIC o CERT OF DEPOSIT. Un valor vacío sí pasa.
+        excluye={
+            TYPE_OF_BOND: "Convertible",
+            SECURITY_TYP: "US DOMESTIC",
+            COLLAT_TYP: "CERT OF DEPOSIT",
+        },
         transformaciones=[
             cupon_fraccion_a_decimal,
             perpetuo_a_vencimiento,
