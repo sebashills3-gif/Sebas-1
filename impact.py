@@ -435,12 +435,24 @@ def avanzar(page, origen, destino, errores, datos, campo_ancla=None):
 # ALTA DE UN SECURITY
 # ============================================================
 
-def alta_5_80(page, sec):
+def _ya_en_seleccion(page, timeout_s=20):
+    """True si la pantalla de selección de mercado e instrumento ya está
+    abierta (después de guardar un security IMPACT vuelve a ella)."""
+    return _esperar_campo(page, "ici_selectMarket", timeout_s=timeout_s) is not None
+
+
+def alta_5_80(page, sec, ya_en_seleccion=False):
     """Llena NSEX02 a NSEX05 para un security 5/80 y deja la última pantalla
-    sin guardar. Devuelve los avisos de datos faltantes (lista)."""
+    sin guardar. Devuelve los avisos de datos faltantes (lista).
+
+    Con `ya_en_seleccion` se asume que la página ya está en la pantalla de
+    selección y se pasa directo a poner mercado e instrumento; si no lo
+    está, se navega con changeProgram.
+    """
     d = construir_datos(sec)
 
-    ir_a_seleccion(page)
+    if not (ya_en_seleccion and _ya_en_seleccion(page)):
+        ir_a_seleccion(page)
     poner_valor(page, "ici_selectMarket", MERCADO)
     poner_valor(page, "ici_selectInstrument", INSTRUMENTO)
     enter(page, "ici_selectInstrument")
@@ -497,6 +509,9 @@ def procesar_securities_impact(page, securities):
             pendientes.append(sec)
 
     terminar = False
+    # Tras guardar un security IMPACT regresa a la pantalla de selección, y
+    # desde ahí ya no hace falta (ni existe) changeProgram.
+    en_seleccion = False
     for i, sec in enumerate(pendientes, start=1):
         etiqueta = _etiqueta(sec)
 
@@ -510,11 +525,12 @@ def procesar_securities_impact(page, securities):
         print("=" * 60)
 
         try:
-            avisos = alta_5_80(page, sec)
+            avisos = alta_5_80(page, sec, ya_en_seleccion=en_seleccion)
 
         except Exception as error:
             print(f"No se pudo preparar el security: {error}")
             resultados.append(("Con error", etiqueta, str(error)))
+            en_seleccion = False
             continue
 
         for aviso in avisos:
@@ -527,6 +543,7 @@ def procesar_securities_impact(page, securities):
             "q = terminar: "
         ).strip().lower()
 
+        en_seleccion = False
         if respuesta == "q":
             resultados.append(("No tomado", etiqueta, "interrumpido por ti"))
             terminar = True
@@ -534,6 +551,7 @@ def procesar_securities_impact(page, securities):
             resultados.append(("Preparado, no guardado", etiqueta, ""))
         else:
             resultados.append(("Guardado (confirmado por ti)", etiqueta, ""))
+            en_seleccion = True
 
     print()
     print("=" * 60)
