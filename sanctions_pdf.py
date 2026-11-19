@@ -21,12 +21,17 @@ from prestaging import construir_filas, duenios_de_filas, extraer_securities
 
 IDENTIFICADORES = ("ISIN", "SEDOL", "CUSIP", "COMMON", "FIGI_ID")
 
-_TITULO = re.compile(r"^(ISIN|SEDOL|CUSIP|COMMON|FIGI)S?$", re.IGNORECASE)
-_TITULO_PEGADO = re.compile(r"^BY(ISIN|SEDOL|CUSIP|COMMON|FIGI)S?$", re.IGNORECASE)
+_TITULO = re.compile(
+    r"^(ISIN|SEDOL|CUSIP|COMMON|FIGI(?:_ID)?)S?$", re.IGNORECASE
+)
+_TITULO_PEGADO = re.compile(
+    r"^BY(ISIN|SEDOL|CUSIP|COMMON|FIGI(?:_ID)?)S?$", re.IGNORECASE
+)
 _CLAVE = {
     "ISIN": "ISIN", "SEDOL": "SEDOL", "CUSIP": "CUSIP",
-    "COMMON": "COMMON", "FIGI": "FIGI_ID",
+    "COMMON": "COMMON", "FIGI": "FIGI_ID", "FIGI_ID": "FIGI_ID",
 }
+_ENCABEZADOS = {"NO", "SANCTIONS", "CHECK", "STATUS", "COMMENTS", "ID"}
 _SIN_DATO = ("#N/A", "N.A.", "N/A")
 
 
@@ -102,7 +107,14 @@ def _bloque_de(w, titulos):
 
 
 def _geometria(palabras, titulos):
-    """Columnas de estado, columna No y borde inferior del encabezado."""
+    """Columnas de estado (con sus límites), columna No y borde inferior del
+    encabezado.
+
+    Los resultados quedan pegados al borde izquierdo de su celda (no
+    centrados como el encabezado), así que la columna de estado de cada
+    bloque se delimita desde justo antes de su encabezado "Sanctions" hasta
+    donde empieza el siguiente bloque.
+    """
     if not any(k in titulos for k in IDENTIFICADORES):
         raise PdfSanctionsError("no se encontraron los títulos 'By ...'.")
 
@@ -110,38 +122,68 @@ def _geometria(palabras, titulos):
     alto = fondo_titulos - min(t["top"] for t in titulos.values())
     limite = fondo_titulos + 3 * max(alto, 8) + 6
 
-    estado = {}
-    col_no = None
+    orden = sorted(titulos, key=lambda k: titulos[k]["centro"])
+    sub = {k: [] for k in titulos}
     fondo_encabezado = fondo_titulos
 
     for w in palabras:
-        if not (fondo_titulos - 0.5 <= w["top"] <= limite):
+        if fondo_titulos - 0.5 <= w["top"] <= limite:
+            sub[_bloque_de(w, titulos)].append(w)
+            texto = w["text"].strip().upper()
+            if texto in _ENCABEZADOS or _TITULO.match(texto):
+                fondo_encabezado = max(fondo_encabezado, w["bottom"])
+
+    izquierda, col_no, no_izq = {}, None, {}
+    combine = None
+
+    for bloque in orden:
+        palabras_b = sorted(sub[bloque], key=lambda w: w["x0"])
+
+        if bloque == "COMBINE":
+            estado = [w for w in palabras_b if w["text"].strip().upper() == "STATUS"
+                      and w["top"] > fondo_titulos - 0.5]
+            comentarios = [w for w in palabras_b
+                           if w["text"].strip().upper() == "COMMENTS"]
+            if estado:
+                sc = _cx(estado[0])
+                if comentarios:
+                    cc = _cx(comentarios[0])
+                    combine = (sc - (cc - sc) / 2, (sc + cc) / 2)
+                else:
+                    combine = (estado[0]["x0"] - 15, estado[0]["x1"] + 40)
             continue
-        bloque = _bloque_de(w, titulos)
-        texto = w["text"].strip().upper()
 
-        if texto == "NO" and col_no is None and bloque in IDENTIFICADORES:
-            col_no = (w["x0"] - 12, w["x1"] + 12)
-        elif texto == "SANCTIONS" and bloque in IDENTIFICADORES:
-            x0, x1 = estado.get(bloque, (w["x0"], w["x1"]))
-            estado[bloque] = (min(x0, w["x0"]), max(x1, w["x1"]))
-        elif texto == "CHECK" and bloque in IDENTIFICADORES and bloque in estado:
-            x0, x1 = estado[bloque]
-            estado[bloque] = (min(x0, w["x0"]), max(x1, w["x1"]))
-        elif texto == "STATUS" and bloque == "COMBINE" and w["top"] > fondo_titulos:
-            estado["COMBINE"] = (w["x0"], w["x1"])
-
-        if texto in ("NO", "SANCTIONS", "CHECK", "STATUS", "COMMENTS") or \
-                _TITULO.match(texto) or texto in ("ID", "FIGI"):
-            fondo_encabezado = max(fondo_encabezado, w["bottom"])
+        no = next((w for w in palabras_b if w["text"].strip().upper() == "NO"), None)
+        sanciones = [w for w in palabras_b
+                     if w["text"].strip().upper() in ("SANCTIONS", "CHECK")]
+        if no is not None:
+            no_izq[bloque] = no["x0"] - 12
+            if col_no is None:
+                col_no = (no["x0"] - 12, no["x1"] + 12)
+        if sanciones:
+            izquierda[bloque] = min(w["x0"] for w in sanciones) - 20
 
     if col_no is None:
         raise PdfSanctionsError("no se encontró la columna 'No'.")
-    if not any(k in estado for k in IDENTIFICADORES):
+    if not izquierda:
         raise PdfSanctionsError("no se encontraron las columnas 'Sanctions Check'.")
 
-    margen = 10
-    estado = {k: (x0 - margen, x1 + margen) for k, (x0, x1) in estado.items()}
+    estado = {}
+    for pos, bloque in enumerate(orden):
+        if bloque == "COMBINE" or bloque not in izquierda:
+            continue
+        siguiente = orden[pos + 1] if pos + 1 < len(orden) else None
+        if siguiente is None:
+            derecha = izquierda[bloque] + 120
+        elif siguiente == "COMBINE":
+            derecha = (combine[0] if combine else izquierda[bloque] + 120) - 1
+        else:
+            derecha = no_izq.get(siguiente, titulos[siguiente]["centro"] - 60) - 1
+        estado[bloque] = (izquierda[bloque], derecha)
+
+    if combine:
+        estado["COMBINE"] = combine
+
     return {"estado": estado, "no": col_no, "fondo": fondo_encabezado}
 
 
@@ -177,7 +219,7 @@ def leer_estados(ruta):
         anclas = [
             (int(w["text"]), _cy(w))
             for w in palabras
-            if w["text"].strip().isdigit() and w["top"] >= fondo
+            if w["text"].strip().isdigit() and w["top"] >= fondo - 1
             and x0 <= _cx(w) <= x1
         ]
         if not anclas:
@@ -196,7 +238,7 @@ def leer_estados(ruta):
             for bloque, (bx0, bx1) in geometria["estado"].items():
                 textos = [
                     w["text"] for w in palabras
-                    if w["top"] >= fondo and bx0 <= _cx(w) <= bx1
+                    if w["top"] >= fondo - 1 and bx0 <= _cx(w) <= bx1
                     and abs(_cy(w) - cy) <= tolerancia
                 ]
                 fila[bloque] = " ".join(textos).strip()

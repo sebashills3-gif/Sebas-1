@@ -29,6 +29,8 @@ CPN_TYP = 6
 CRNCY = 7
 MARKET_SECTOR_DES = 12
 SECURITY_DES = 15
+SECURITY_TYP = 8
+COLLAT_TYP = 9
 TYPE_OF_BOND = 10
 MATURITY_FILA = 19
 DAY_COUNT_FILA = 20
@@ -45,6 +47,8 @@ MNEMONICS_ESPERADOS = {
     CPN_TYP: "CPN_TYP",
     CRNCY: "CRNCY",
     MARKET_SECTOR_DES: "MARKET_SECTOR_DES",
+    SECURITY_TYP: "SECURITY_TYP",
+    COLLAT_TYP: "COLLAT_TYP",
     TYPE_OF_BOND: "TYPE_OF_BOND",
     SECURITY_DES: "SECURITY_DES",
     MATURITY_FILA: "MATURITY",
@@ -310,6 +314,9 @@ class Skeleton:
     filtro: dict                     # fila del XLS -> valor esperado
     transformaciones: list
     excluye: dict = field(default_factory=dict)  # fila -> valor que NO debe tener
+    # Combinaciones prohibidas: cada dict (fila -> valor) excluye el security
+    # solo si cumple TODAS sus condiciones a la vez.
+    excluye_combinaciones: list = field(default_factory=list)
 
     def coincide(self, sec):
         cumple = all(
@@ -320,7 +327,14 @@ class Skeleton:
             sec.texto(fila).upper() != prohibido.upper()
             for fila, prohibido in self.excluye.items()
         )
-        return cumple and no_excluido
+        sin_combinacion = not any(
+            all(
+                sec.texto(fila).upper() == valor.upper()
+                for fila, valor in combinacion.items()
+            )
+            for combinacion in self.excluye_combinaciones
+        )
+        return cumple and no_excluido and sin_combinacion
 
 
 SKELETONS = [
@@ -335,6 +349,10 @@ SKELETONS = [
         },
         # Un Convertible no es 5/80 (cualquier otro valor, o vacío, sí).
         excluye={TYPE_OF_BOND: "Convertible"},
+        # US DOMESTIC + CERT OF DEPOSIT juntos tampoco son 5/80.
+        excluye_combinaciones=[
+            {SECURITY_TYP: "US DOMESTIC", COLLAT_TYP: "CERT OF DEPOSIT"},
+        ],
         transformaciones=[
             cupon_fraccion_a_decimal,
             perpetuo_a_vencimiento,
