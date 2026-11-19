@@ -106,13 +106,13 @@ def construir_datos(sec):
         return None
 
     security_des = valor("SECURITY_DES")
-    cusip = valor("ID_CUSIP")
-    cusip_original = sec.derivados.get("CUSIP_ORIGINAL") or cusip
+    cusip = valor("ID_CUSIP")  # el final: si se derivó del ISIN, ese
 
     bb = valor(*ALIAS["ID_BB"])
     common = valor(*ALIAS["ID_COMMON"])
-    # ID_COMMON solo cuando ID_BB y el ID_CUSIP del XLS son iguales.
-    nickname = common if (bb is not None and bb == cusip_original) else bb
+    # ID_COMMON solo cuando ID_BB es igual al CUSIP que se va a capturar
+    # (el derivado del ISIN cuando aplica; si no, el ID_CUSIP del XLS).
+    nickname = common if (bb is not None and bb == cusip) else bb
 
     series = (valor("SERIES") or "").upper()
 
@@ -340,7 +340,15 @@ def _restar_meses(fecha, meses):
 # --- Errores conocidos: texto del error -> corrección -------------------
 
 def _corregir_sort_duplicado(page, d):
+    """Sort suffix = CUSIP sin los 2 primeros ni el último, y año de 4
+    dígitos en el nombre. La fecha con año de 2 dígitos puede estar en el
+    security name (ici_securityName) o en description1, así que se corrigen
+    ambos."""
     poner_valor(page, "ici_sortSuffix", (d.cusip or "")[2:-1])
+
+    d.security_des = _anio_cuatro_digitos(d.security_des)
+    poner_valor(page, "ici_securityName", d.security_des)
+
     d.name = _anio_cuatro_digitos(d.name)
     poner_valor(page, "ici_description1", d.name)
 
