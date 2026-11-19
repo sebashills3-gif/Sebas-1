@@ -13,6 +13,11 @@ from sanctions import procesar_sanctions
 from sanctions_pdf import verificar_securities
 from skeletons import procesar_matriz
 from impact import procesar_securities_impact
+from setup_securities import (
+    elegir_archivo,
+    nueva_carpeta_bloombot,
+    preparar_setup,
+)
 
 
 # ============================================================
@@ -643,13 +648,22 @@ def ejecutar_extraccion_con_reintentos(
     return None
 
 
-def enviar_a_bloombot(archivo_filtrado, page):
+def enviar_a_bloombot(
+    archivo_filtrado,
+    page,
+    carpeta_evidencia=None,
+    guardado_automatico=False,
+):
     """
     Pasa los códigos del Excel filtrado a BLOOMBOT y, cuando la macro
     termina, mueve los archivos GIMP a la carpeta de evidencia, llena
     el PreStaging File, clasifica los securities, pulsa "Perform
     Sanctions Check" en Genie, mueve el PDF resultante a la carpeta de
     evidencia y prepara el alta de los securities en IMPACT.
+
+    `carpeta_evidencia` es donde se guardan GIMP, Sanctions y revisiones
+    (por defecto, la carpeta del Excel filtrado). Con `guardado_automatico`
+    IMPACT guarda cada security sin esperar la revisión manual.
     Un error aquí no interrumpe el programa.
     """
 
@@ -668,7 +682,8 @@ def enviar_a_bloombot(archivo_filtrado, page):
 
     cantidad, entidades = resultado
 
-    carpeta_evidencia = Path(archivo_filtrado).parent
+    if carpeta_evidencia is None:
+        carpeta_evidencia = Path(archivo_filtrado).parent
 
     try:
         matriz = procesar_gimp(
@@ -727,11 +742,148 @@ def enviar_a_bloombot(archivo_filtrado, page):
             sec.bloqueo = f"no se pudo revisar el Sanctions Check: {error}"
 
     try:
-        procesar_securities_impact(page, securities)
+        procesar_securities_impact(
+            page,
+            securities,
+            guardado_automatico=guardado_automatico,
+        )
 
     except Exception as error:
         print()
         print(f"No se pudo completar el trabajo en IMPACT: {error}")
+
+
+# ============================================================
+# OPCIONES DEL MENÚ
+# ============================================================
+
+def preparar_tabla(page):
+    """Pide dejar Chrome en la primera página de la tabla y la comprueba.
+    Devuelve True si se puede empezar."""
+
+    print()
+    print("Deja Chrome en la primera página de la tabla.")
+    print("Cuando esté listo, vuelve aquí y pulsa Enter.")
+    input()
+
+    while not tabla_visible(page):
+        print()
+        print(
+            "No se detectó la tabla en la pestaña "
+            "controlada por Playwright."
+        )
+
+        volver = input(
+            "¿Quieres volver a comprobarla? (s/n): "
+        ).strip().lower()
+
+        if volver != "s":
+            print("No se inició el proceso.")
+            return False
+
+    return True
+
+
+def preguntar_guardado_automatico():
+    """True si IMPACT debe guardar cada security sin revisión manual."""
+
+    respuesta = input(
+        "¿Guardar automáticamente cada security en IMPACT? (s/N): "
+    ).strip().lower()
+
+    return respuesta == "s"
+
+
+def proceso_completo(page, guardado_automatico=False):
+    """Extracción, BLOOMBOT, Sanctions e IMPACT."""
+
+    archivo_filtrado = ejecutar_extraccion_con_reintentos(page)
+
+    if archivo_filtrado is not None:
+        enviar_a_bloombot(
+            archivo_filtrado,
+            page,
+            guardado_automatico=guardado_automatico,
+        )
+
+
+def solo_extraccion(page):
+    """Solo capturas de pantalla y Excel filtrados (antes de BLOOMBOT)."""
+
+    ejecutar_extraccion_con_reintentos(page)
+
+
+def desde_bloombot(page):
+    """BLOOMBOT, Sanctions e IMPACT a partir de un Excel filtrado ya
+    existente; todo se guarda en una carpeta nueva."""
+
+    excel = elegir_archivo(
+        "Elige el Excel filtrado (TUR_requests_filtrados.xlsx)"
+    )
+
+    if excel is None:
+        print("No se eligió ningún archivo.")
+        return
+
+    guardado_automatico = preguntar_guardado_automatico()
+    carpeta, copia = nueva_carpeta_bloombot(excel)
+
+    print()
+    print(f"Carpeta nueva: {carpeta}")
+
+    enviar_a_bloombot(
+        copia,
+        page,
+        carpeta_evidencia=carpeta,
+        guardado_automatico=guardado_automatico,
+    )
+
+
+def solo_setup(page):
+    """Solo el set up de securities en IMPACT, a partir de una carpeta de
+    evidencia ya existente."""
+
+    excel = elegir_archivo(
+        "Elige el Excel base (XLS de BLOOMBOT GIMP*.xls o el Excel filtrado)"
+    )
+
+    if excel is None:
+        print("No se eligió ningún archivo.")
+        return
+
+    guardado_automatico = preguntar_guardado_automatico()
+
+    try:
+        securities, _ = preparar_setup(excel)
+
+    except Exception as error:
+        print()
+        print(f"No se pudo preparar el set up: {error}")
+        return
+
+    try:
+        procesar_securities_impact(
+            page,
+            securities,
+            guardado_automatico=guardado_automatico,
+        )
+
+    except Exception as error:
+        print()
+        print(f"No se pudo completar el trabajo en IMPACT: {error}")
+
+
+def mostrar_menu():
+    print()
+    print("=" * 60)
+    print("¿QUÉ QUIERES HACER AHORA?")
+    print("=" * 60)
+    print("1 - Repetir todo el proceso")
+    print("2 - Todo el proceso sin chequeo manual (IMPACT guarda solo)")
+    print("3 - Solo extracción: capturas y Excel filtrados")
+    print("4 - Desde BLOOMBOT: Sanctions y creación (elige el Excel filtrado)")
+    print("5 - Solo set up de securities en IMPACT (elige el Excel base)")
+    print("6 - Cerrar el proceso")
 
 
 # ============================================================
@@ -788,76 +940,56 @@ def main():
                 context.close()
                 raise SystemExit(0)
 
+        # Primera corrida: todo el proceso, con chequeo manual en IMPACT
+        proceso_completo(page)
+
         while True:
-            archivo_filtrado = ejecutar_extraccion_con_reintentos(page)
+            mostrar_menu()
 
-            if archivo_filtrado is not None:
-                enviar_a_bloombot(archivo_filtrado, page)
-
-            print()
-            print("=" * 60)
-            print("¿QUÉ QUIERES HACER AHORA?")
-            print("=" * 60)
-            print("1 - Repetir la extracción")
-            print("2 - Dejar Chrome abierto y terminar")
-            print("3 - Cerrar Chrome y terminar")
-
-            opcion = input(
-                "Selecciona 1, 2 o 3: "
-            ).strip()
+            opcion = input("Selecciona una opción (1-6): ").strip()
 
             if opcion == "1":
-                print()
-                print(
-                    "Deja Chrome en la primera página de la tabla."
-                )
-                print(
-                    "Cuando esté listo, vuelve aquí y pulsa Enter."
-                )
-                input()
+                if preparar_tabla(page):
+                    proceso_completo(page)
 
-                if not tabla_visible(page):
+            elif opcion == "2":
+                if preparar_tabla(page):
+                    proceso_completo(page, guardado_automatico=True)
+
+            elif opcion == "3":
+                if preparar_tabla(page):
+                    solo_extraccion(page)
+
+            elif opcion == "4":
+                desde_bloombot(page)
+
+            elif opcion == "5":
+                solo_setup(page)
+
+            elif opcion == "6":
+                cerrar = input(
+                    "¿Cerrar también Chrome? (s/n): "
+                ).strip().lower()
+
+                if cerrar == "s":
+                    print()
+                    print("Cerrando Chrome...")
+                    context.close()
+
+                else:
                     print()
                     print(
-                        "No se detectó la tabla en la pestaña "
-                        "controlada por Playwright."
+                        "El script terminará y se intentará dejar "
+                        "Chrome abierto."
                     )
+                    # No se llama a context.close().
+                    # Esto evita cerrar Chrome explícitamente.
 
-                    continuar = input(
-                        "¿Quieres volver a comprobarla? (s/n): "
-                    ).strip().lower()
-
-                    if continuar != "s":
-                        print(
-                            "No se inició la nueva extracción."
-                        )
-                        continue
-
-                continue
-
-            if opcion == "2":
-                print()
-                print(
-                    "El script terminará y se intentará dejar "
-                    "Chrome abierto."
-                )
-                print(
-                    "La sesión y la ventana quedarán disponibles "
-                    "para continuar manualmente."
-                )
-
-                # No se llama a context.close().
-                # Esto evita cerrar Chrome explícitamente.
                 break
 
-            if opcion == "3":
+            else:
                 print()
-                print("Cerrando Chrome...")
-                context.close()
-                break
-
-            print()
-            print("Opción no válida. Selecciona 1, 2 o 3.")
+                print("Opción no válida. Selecciona un número del 1 al 6.")
 
 
 if __name__ == "__main__":

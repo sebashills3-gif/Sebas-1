@@ -273,13 +273,13 @@ def leer_texto(page):
 
 
 def pantalla_actual(page):
-    """NSEX02, NSEX03, NSEX05, SELECCION; NSEX04 solo si su nombre aparece
-    en el texto; None si no se reconoce."""
+    """NSEX02, NSEX03, NSEX05, SELECCION; NSEX04 y NSEX06 solo si su nombre
+    aparece en el texto; None si no se reconoce."""
     for nombre, campo in HUELLAS_PANTALLA:
         if _buscar_campo(page, campo) is not None:
             return nombre
 
-    coincide = re.search(r"NSEX0[1-5]", leer_texto(page).upper())
+    coincide = re.search(r"NSEX0[1-6]", leer_texto(page).upper())
     return coincide.group(0) if coincide else None
 
 
@@ -409,6 +409,8 @@ def avanzar(page, origen, destino, errores, datos, campo_ancla=None):
             return
         if destino == "NSEX04" and pantalla not in (origen, "NSEX05"):
             return  # NSEX04 no tiene campos propios con los que reconocerla
+        if destino == "NSEX06" and pantalla != origen:
+            return  # ni NSEX06; basta con que la pantalla ya no sea el origen
 
         mensajes = re.findall(r"ERROR:?\s*([^\n\r]+)", leer_texto(page).upper())
         if not mensajes:
@@ -441,9 +443,19 @@ def _ya_en_seleccion(page, timeout_s=20):
     return _esperar_campo(page, "ici_selectMarket", timeout_s=timeout_s) is not None
 
 
-def alta_5_80(page, sec, ya_en_seleccion=False):
+def guardar_automaticamente(page, d):
+    """Da Enter en NSEX05 (guarda), luego en NSEX06, y espera a que IMPACT
+    regrese a la pantalla de selección."""
+    avanzar(page, "NSEX05", "NSEX06", {}, d, campo_ancla="ici_trailerCode")
+
+    if pantalla_actual(page) != "SELECCION":
+        avanzar(page, "NSEX06", "SELECCION", {}, d)
+
+
+def alta_5_80(page, sec, ya_en_seleccion=False, guardado_automatico=False):
     """Llena NSEX02 a NSEX05 para un security 5/80 y deja la última pantalla
-    sin guardar. Devuelve los avisos de datos faltantes (lista).
+    sin guardar (o, con `guardado_automatico`, la guarda dando Enter en NSEX05
+    y NSEX06). Devuelve los avisos de datos faltantes (lista).
 
     Con `ya_en_seleccion` se asume que la página ya está en la pantalla de
     selección y se pasa directo a poner mercado e instrumento; si no lo
@@ -471,6 +483,9 @@ def alta_5_80(page, sec, ya_en_seleccion=False):
     esperar_pantalla(page, "NSEX05")
     llenar(page, campos_nsex05(d))
 
+    if guardado_automatico:
+        guardar_automaticamente(page, d)
+
     return d.avisos
 
 
@@ -483,11 +498,13 @@ def _etiqueta(sec):
     return str(isin) if isin else f"columna {sec.columna}"
 
 
-def procesar_securities_impact(page, securities):
-    """Da de alta (sin guardar) los securities 5/80 en IMPACT, uno por uno.
+def procesar_securities_impact(page, securities, guardado_automatico=False):
+    """Da de alta los securities 5/80 en IMPACT, uno por uno.
 
-    Tras dejar cada uno listo en NSEX05 espera a que la persona lo guarde a
-    mano. Al final imprime qué securities se tomaron y cuáles no.
+    Por defecto deja cada uno listo en NSEX05 y espera a que la persona lo
+    guarde a mano. Con `guardado_automatico` da Enter para guardarlo (NSEX05
+    y NSEX06) y sigue con el siguiente sin preguntar. Al final imprime qué
+    securities se tomaron y cuáles no.
     """
     resultados = []   # (estado, etiqueta, detalle)
     pendientes = []
@@ -525,7 +542,12 @@ def procesar_securities_impact(page, securities):
         print("=" * 60)
 
         try:
-            avisos = alta_5_80(page, sec, ya_en_seleccion=en_seleccion)
+            avisos = alta_5_80(
+                page,
+                sec,
+                ya_en_seleccion=en_seleccion,
+                guardado_automatico=guardado_automatico,
+            )
 
         except Exception as error:
             print(f"No se pudo preparar el security: {error}")
@@ -535,6 +557,12 @@ def procesar_securities_impact(page, securities):
 
         for aviso in avisos:
             print(f"Aviso: {aviso}")
+
+        if guardado_automatico:
+            print("Security guardado automáticamente.")
+            resultados.append(("Creado (guardado automático)", etiqueta, ""))
+            en_seleccion = True
+            continue
 
         print()
         print("Security listo en NSEX05. Revísalo y guárdalo a mano en IMPACT.")
@@ -558,6 +586,7 @@ def procesar_securities_impact(page, securities):
     print("RESUMEN IMPACT")
     print("=" * 60)
     for estado in (
+        "Creado (guardado automático)",
         "Guardado (confirmado por ti)",
         "Preparado, no guardado",
         "Con error",
