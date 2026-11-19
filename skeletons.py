@@ -313,7 +313,8 @@ class Skeleton:
     nombre: str
     filtro: dict                     # fila del XLS -> valor esperado
     transformaciones: list
-    excluye: dict = field(default_factory=dict)  # fila -> valor que NO debe tener
+    # fila -> valor (o lista de valores) que NO debe tener
+    excluye: dict = field(default_factory=dict)
     # Combinaciones prohibidas: cada dict (fila -> valor) excluye el security
     # solo si cumple TODAS sus condiciones a la vez.
     excluye_combinaciones: list = field(default_factory=list)
@@ -324,8 +325,11 @@ class Skeleton:
             for fila, esperado in self.filtro.items()
         )
         no_excluido = all(
-            sec.texto(fila).upper() != prohibido.upper()
-            for fila, prohibido in self.excluye.items()
+            sec.texto(fila).upper() not in {
+                v.upper() for v in ([prohibidos] if isinstance(prohibidos, str)
+                                    else prohibidos)
+            }
+            for fila, prohibidos in self.excluye.items()
         )
         sin_combinacion = not any(
             all(
@@ -347,12 +351,12 @@ SKELETONS = [
             MARKET_SECTOR_DES: "Corp",
             SINKABLE: "N",
         },
-        # Con cualquiera de estos valores (aunque venga solo) no es 5/80:
-        # Convertible, US DOMESTIC o CERT OF DEPOSIT. Un valor vacío sí pasa.
+        # Con cualquiera de estos valores (aunque venga solo) no es 5/80. Un
+        # valor vacío sí pasa.
         excluye={
-            TYPE_OF_BOND: "Convertible",
             SECURITY_TYP: "US DOMESTIC",
-            COLLAT_TYP: "CERT OF DEPOSIT",
+            COLLAT_TYP: ["CERT OF DEPOSIT", "COVERED"],
+            TYPE_OF_BOND: ["Convertible", "Covered"],
         },
         transformaciones=[
             cupon_fraccion_a_decimal,
