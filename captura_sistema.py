@@ -6,32 +6,35 @@ import time
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
-from bloombot import procesar_y_enviar
-from prestaging import procesar_gimp
-from genie import hacer_click_sanction_check
-from sanctions import procesar_sanctions
-from sanctions_pdf import verificar_securities
-from skeletons import procesar_matriz
-from impact import procesar_securities_impact
+from bloombot import process_and_send
+from prestaging import process_gimp
+from genie import click_sanction_check
+from sanctions import process_sanctions
+from sanctions_pdf import verify_securities
+from skeletons import process_matrix
+from impact import process_securities_in_impact
 from setup_securities import (
-    elegir_archivo,
-    nueva_carpeta_bloombot,
-    preparar_setup,
+    FILTERED_NAME,
+    choose_file,
+    new_bloombot_folder,
+    prepare_setup,
 )
 
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURATION
 # ============================================================
 
-URL_SISTEMA = (
+SYSTEM_URL = (
     "https://prd.impact.spsfi.broadridge.com/"
     "impact_hsbpro/controller"
 )
 
-PERFIL = (Path.cwd() / "perfil_chrome_sistema").resolve()
+# The folder name is kept in Spanish on purpose: it holds the saved Chrome
+# session, and renaming it would force a new login (and MFA).
+PROFILE = (Path.cwd() / "perfil_chrome_sistema").resolve()
 
-COLUMNAS = [
+COLUMNS = [
     "Entity",
     "External Trade ID",
     "Trader",
@@ -46,80 +49,80 @@ COLUMNAS = [
     "Cur",
 ]
 
-ERRORES_OBJETIVO = {
+TARGET_ERRORS = {
     "SECURITY NOT FOUND",
     "SECURITY DOES NOT EXIST IN MSD, BROADCAST SENT",
 }
 
-MENSAJE_FIN = "LAST QUALIFYING TRANSACTION ALREADY SHOWN"
+END_MESSAGE = "LAST QUALIFYING TRANSACTION ALREADY SHOWN"
 
-MAX_PAGINAS = 100
+MAX_PAGES = 100
 
-# Reintentos de detección y de extracción
-INTENTOS_DETECCION = 5
-PAUSA_DETECCION_S = 2
-INTENTOS_EXTRACCION = 3
+# Detection and extraction retries
+DETECTION_ATTEMPTS = 5
+DETECTION_PAUSE_S = 2
+EXTRACTION_ATTEMPTS = 3
 
 
 # ============================================================
-# FUNCIONES AUXILIARES
+# HELPER FUNCTIONS
 # ============================================================
 
-def limpiar_texto(texto):
-    return " ".join(texto.split()).strip()
+def clean_text(text):
+    return " ".join(text.split()).strip()
 
 
-def texto_visible(page):
+def visible_text(page):
     """
-    Texto del body de la página y de todos sus iframes.
+    Text of the page body and of all its iframes.
     """
 
-    partes = []
+    parts = []
 
     for frame in page.frames:
         try:
-            partes.append(
+            parts.append(
                 frame.locator("body").inner_text(timeout=30000)
             )
         except Exception:
             continue
 
-    return "\n".join(partes)
+    return "\n".join(parts)
 
 
-def esperar_pagina_lista(page, timeout_ms=15000):
+def wait_page_ready(page, timeout_ms=15000):
     """
-    Espera a que la página termine de cargar.
-    No falla si algún estado no se alcanza.
+    Wait for the page to finish loading.
+    It does not fail if some state is not reached.
     """
 
-    for estado in ("domcontentloaded", "load", "networkidle"):
+    for status in ("domcontentloaded", "load", "networkidle"):
         try:
-            page.wait_for_load_state(estado, timeout=timeout_ms)
+            page.wait_for_load_state(status, timeout=timeout_ms)
         except Exception:
             pass
 
 
-def obtener_tabla_objetivo(page):
+def get_target_table(page):
     """
-    Busca la tabla que contiene 'External Trade ID'
-    en la página y en todos sus iframes.
+    Look for the table that contains 'External Trade ID'
+    in the page and in all its iframes.
     """
 
-    for numero_frame, frame in enumerate(page.frames):
+    for frame_number, frame in enumerate(page.frames):
         try:
-            tablas = frame.locator("table")
-            total = tablas.count()
+            tables = frame.locator("table")
+            total = tables.count()
         except Exception:
             continue
 
         for i in range(total):
             try:
-                tabla = tablas.nth(i)
-                contenido = limpiar_texto(tabla.inner_text())
+                table = tables.nth(i)
+                content = clean_text(table.inner_text())
 
-                if "External Trade ID" in contenido:
-                    return tabla, f"{numero_frame}:{i}"
+                if "External Trade ID" in content:
+                    return table, f"{frame_number}:{i}"
 
             except Exception:
                 continue
@@ -127,139 +130,139 @@ def obtener_tabla_objetivo(page):
     return None, None
 
 
-def tabla_visible(
+def table_visible(
     page,
-    intentos=INTENTOS_DETECCION,
-    pausa_s=PAUSA_DETECCION_S,
+    attempts=DETECTION_ATTEMPTS,
+    pause_s=DETECTION_PAUSE_S,
 ):
     """
-    Comprueba si la tabla principal está visible.
+    Check whether the main table is visible.
 
-    Reintenta varias veces esperando la carga de la página,
-    porque la tabla puede tardar en pintarse.
+    It retries several times waiting for the page to load, because the
+    table may take a while to be drawn.
     """
 
-    for intento in range(1, intentos + 1):
-        esperar_pagina_lista(page)
+    for attempt in range(1, attempts + 1):
+        wait_page_ready(page)
 
-        tabla, _ = obtener_tabla_objetivo(page)
+        table, _ = get_target_table(page)
 
-        if tabla is not None:
+        if table is not None:
             return True
 
-        if intento < intentos:
+        if attempt < attempts:
             print(
-                f"Tabla no detectada "
-                f"(intento {intento}/{intentos}); reintentando...",
+                f"Table not detected "
+                f"(attempt {attempt}/{attempts}); retrying...",
                 flush=True,
             )
-            time.sleep(pausa_s)
+            time.sleep(pause_s)
 
     return False
 
 
-def extraer_pagina(page, numero_pagina):
+def extract_page(page, page_number):
     """
-    Extrae las filas de la tabla de la página actual.
+    Extract the rows of the table on the current page.
 
-    Devuelve:
-        registros: lista de diccionarios.
-        firma: texto que identifica el contenido de la página.
+    Returns:
+        records: list of dictionaries.
+        signature: text that identifies the content of the page.
     """
 
-    tabla, indice_tabla = obtener_tabla_objetivo(page)
+    table, table_index = get_target_table(page)
 
-    # Durante la carga de una página la tabla puede desaparecer
-    # un instante; se reintenta antes de darla por perdida.
-    if tabla is None and numero_pagina > 0:
+    # While a page is loading the table may disappear for a moment;
+    # retry before giving it up.
+    if table is None and page_number > 0:
         for _ in range(3):
             time.sleep(2)
-            tabla, indice_tabla = obtener_tabla_objetivo(page)
+            table, table_index = get_target_table(page)
 
-            if tabla is not None:
+            if table is not None:
                 break
 
-    if tabla is None:
-        if numero_pagina > 0:
+    if table is None:
+        if page_number > 0:
             print(
-                f"[Página {numero_pagina}] "
-                "No se encontró la tabla objetivo.",
+                f"[Page {page_number}] "
+                "The target table was not found.",
                 flush=True,
             )
         return [], ""
 
-    if numero_pagina > 0:
+    if page_number > 0:
         print(
-            f"[Página {numero_pagina}] "
-            f"Tabla objetivo encontrada en índice {indice_tabla}.",
+            f"[Page {page_number}] "
+            f"Target table found at index {table_index}.",
             flush=True,
         )
 
-    filas = tabla.locator("tr")
-    registros = []
+    rows = table.locator("tr")
+    records = []
 
-    for i in range(filas.count()):
-        fila = filas.nth(i)
-        celdas = fila.locator("th, td")
-        valores = []
+    for i in range(rows.count()):
+        row = rows.nth(i)
+        cells = row.locator("th, td")
+        values = []
 
-        for j in range(celdas.count()):
+        for j in range(cells.count()):
             try:
-                valor = limpiar_texto(celdas.nth(j).inner_text())
+                value = clean_text(cells.nth(j).inner_text())
             except Exception:
-                valor = ""
+                value = ""
 
-            valores.append(valor)
+            values.append(value)
 
-        # Ignorar encabezados y filas auxiliares
-        if len(valores) != len(COLUMNAS):
+        # Ignore headers and auxiliary rows
+        if len(values) != len(COLUMNS):
             continue
 
-        if valores[0] == "Entity":
+        if values[0] == "Entity":
             continue
 
-        registro = dict(zip(COLUMNAS, valores))
-        registro["Pagina"] = numero_pagina
-        registros.append(registro)
+        record = dict(zip(COLUMNS, values))
+        record["Page"] = page_number
+        records.append(record)
 
-    firma = "|".join(
-        f"{registro['External Trade ID']}::"
-        f"{registro['Status']}::"
-        f"{registro['Cusip']}"
-        for registro in registros
+    signature = "|".join(
+        f"{record['External Trade ID']}::"
+        f"{record['Status']}::"
+        f"{record['Cusip']}"
+        for record in records
     )
 
-    if numero_pagina > 0:
+    if page_number > 0:
         print(
-            f"[Página {numero_pagina}] "
-            f"Filas extraídas: {len(registros)}",
+            f"[Page {page_number}] "
+            f"Rows extracted: {len(records)}",
             flush=True,
         )
 
-    return registros, firma
+    return records, signature
 
 
-def obtener_enlace_next(page):
+def get_next_link(page):
     """
-    Busca el enlace cuyo texto visible sea Next
-    en la página y en todos sus iframes.
+    Look for the link whose visible text is Next
+    in the page and in all its iframes.
     """
 
     for frame in page.frames:
         try:
-            enlaces = frame.locator("a")
-            total = enlaces.count()
+            links = frame.locator("a")
+            total = links.count()
         except Exception:
             continue
 
         for i in range(total):
-            enlace = enlaces.nth(i)
+            link = links.nth(i)
 
             try:
-                texto = limpiar_texto(enlace.inner_text())
+                text = clean_text(link.inner_text())
 
-                if texto.upper() == "NEXT":
-                    return enlace
+                if text.upper() == "NEXT":
+                    return link
 
             except Exception:
                 continue
@@ -267,274 +270,274 @@ def obtener_enlace_next(page):
     return None
 
 
-def guardar_captura(page, carpeta, nombre_archivo):
+def save_screenshot(page, folder, file_name):
     """
-    Guarda una captura completa de la página.
+    Save a full screenshot of the page.
     """
 
-    ruta = carpeta / nombre_archivo
+    file_path = folder / file_name
 
     page.screenshot(
-        path=str(ruta),
+        path=str(file_path),
         full_page=True,
     )
 
     print(
-        f"Captura guardada: {ruta.name}",
+        f"Screenshot saved: {file_path.name}",
         flush=True,
     )
 
-    return ruta
+    return file_path
 
 
-def esperar_cambio_de_pagina(
+def wait_for_page_change(
     page,
-    firma_anterior,
-    segundos_maximos=30,
+    previous_signature,
+    max_seconds=30,
 ):
     """
-    Espera a que la tabla cambie después de pulsar Next.
+    Wait for the table to change after pressing Next.
 
-    Devuelve:
-        CAMBIO     si la tabla cambió.
-        FIN        si apareció el mensaje de última página.
-        SIN_CAMBIO si agotó el tiempo.
+    Returns:
+        CHANGED    if the table changed.
+        END        if the last-page message appeared.
+        NO_CHANGE  if the time ran out.
     """
 
-    inicio = time.time()
+    start_time = time.time()
 
-    while time.time() - inicio < segundos_maximos:
+    while time.time() - start_time < max_seconds:
         time.sleep(0.5)
 
         try:
-            texto_actual = texto_visible(page).upper()
+            current_text = visible_text(page).upper()
 
-            if MENSAJE_FIN in texto_actual:
-                return "FIN"
+            if END_MESSAGE in current_text:
+                return "END"
 
-            _, firma_actual = extraer_pagina(page, -1)
+            _, current_signature = extract_page(page, -1)
 
-            if firma_actual and firma_actual != firma_anterior:
-                return "CAMBIO"
+            if current_signature and current_signature != previous_signature:
+                return "CHANGED"
 
         except Exception:
             pass
 
-    return "SIN_CAMBIO"
+    return "NO_CHANGE"
 
 
-def deduplicar_registros(df):
+def deduplicate_records(df):
     """
-    Elimina duplicados cuando existe External Trade ID.
+    Remove duplicates when an External Trade ID exists.
 
-    Las filas sin External Trade ID se conservan.
+    Rows without an External Trade ID are kept.
     """
 
-    columna_id = "External Trade ID"
+    id_column = "External Trade ID"
 
-    con_id = df[
-        df[columna_id]
+    with_id = df[
+        df[id_column]
         .fillna("")
         .astype(str)
         .str.strip()
         != ""
     ].copy()
 
-    sin_id = df[
-        df[columna_id]
+    without_id = df[
+        df[id_column]
         .fillna("")
         .astype(str)
         .str.strip()
         == ""
     ].copy()
 
-    con_id = con_id.drop_duplicates(
-        subset=[columna_id],
+    with_id = with_id.drop_duplicates(
+        subset=[id_column],
         keep="first",
     )
 
     return pd.concat(
-        [con_id, sin_id],
+        [with_id, without_id],
         ignore_index=True,
     )
 
 
 # ============================================================
-# EXTRACCIÓN COMPLETA DE UNA EJECUCIÓN
+# FULL EXTRACTION OF ONE RUN
 # ============================================================
 
-def ejecutar_extraccion(page):
+def run_extraction(page):
     """
-    Procesa todas las páginas desde la posición actual
-    y genera una carpeta de evidencia independiente.
+    Process all the pages from the current position
+    and generate an independent evidence folder.
 
-    Devuelve la ruta del Excel filtrado, o None si no se
-    extrajo nada (en ese caso no deja carpeta vacía).
+    Returns the path of the filtered Excel, or None if nothing was
+    extracted (in that case no empty folder is left behind).
     """
 
-    fecha_ejecucion = datetime.now().strftime(
+    run_timestamp = datetime.now().strftime(
         "%Y-%m-%d_%H-%M-%S"
     )
 
-    evidencia = (
-        Path.cwd() / f"TUR Evidence_{fecha_ejecucion}"
+    evidence = (
+        Path.cwd() / f"TUR Evidence_{run_timestamp}"
     )
 
     print()
     print("=" * 60)
-    print("INICIANDO NUEVA EXTRACCIÓN")
+    print("STARTING NEW EXTRACTION")
     print("=" * 60)
-    print(f"Carpeta de evidencia: {evidencia}")
+    print(f"Evidence folder: {evidence}")
     print()
 
-    if not tabla_visible(page):
+    if not table_visible(page):
         print(
-            "No se detectó la tabla con 'External Trade ID'."
+            "The table with 'External Trade ID' was not detected."
         )
         print(
-            "Ve manualmente a la primera página de la tabla "
-            "y vuelve a intentarlo."
+            "Go manually to the first page of the table "
+            "and try again."
         )
         return None
 
-    evidencia.mkdir(
+    evidence.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    registros_totales = []
-    firmas_vistas = set()
-    paginas_procesadas = 0
+    all_records = []
+    seen_signatures = set()
+    pages_processed = 0
 
-    for numero_pagina in range(1, MAX_PAGINAS + 1):
+    for page_number in range(1, MAX_PAGES + 1):
         print()
         print("-" * 60)
-        print(f"Procesando página {numero_pagina}")
+        print(f"Processing page {page_number}")
         print("-" * 60)
 
-        # Tiempo para que termine de renderizarse la tabla
+        # Time for the table to finish rendering
         page.wait_for_timeout(2000)
 
-        registros, firma_actual = extraer_pagina(
+        records, current_signature = extract_page(
             page,
-            numero_pagina,
+            page_number,
         )
 
-        if not registros:
+        if not records:
             print(
-                "No se encontraron registros. "
-                "Se detiene esta extracción."
+                "No records found. "
+                "This extraction stops."
             )
             break
 
-        if firma_actual in firmas_vistas:
+        if current_signature in seen_signatures:
             print(
-                "La página ya se había procesado. "
-                "Se detiene para evitar duplicados."
+                "This page had already been processed. "
+                "Stopping to avoid duplicates."
             )
             break
 
-        firmas_vistas.add(firma_actual)
-        registros_totales.extend(registros)
-        paginas_procesadas = numero_pagina
+        seen_signatures.add(current_signature)
+        all_records.extend(records)
+        pages_processed = page_number
 
-        # Captura de la página actual
-        guardar_captura(
+        # Screenshot of the current page
+        save_screenshot(
             page,
-            evidencia,
-            f"TUR_page_{numero_pagina:03d}.png",
+            evidence,
+            f"TUR_page_{page_number:03d}.png",
         )
 
-        texto_actual = texto_visible(page).upper()
+        current_text = visible_text(page).upper()
 
-        # Si el aviso ya aparece, se captura y termina
-        if MENSAJE_FIN in texto_actual:
+        # If the notice is already showing, capture it and finish
+        if END_MESSAGE in current_text:
             print(
-                "Se detectó el aviso de última página."
+                "The last-page notice was detected."
             )
 
-            guardar_captura(
+            save_screenshot(
                 page,
-                evidencia,
-                f"TUR_last_page_notice_{numero_pagina:03d}.png",
+                evidence,
+                f"TUR_last_page_notice_{page_number:03d}.png",
             )
 
             break
 
-        enlace_next = obtener_enlace_next(page)
+        next_link = get_next_link(page)
 
-        if enlace_next is None:
+        if next_link is None:
             print(
-                "No se encontró el enlace Next. "
-                "Se detiene esta extracción."
+                "The Next link was not found. "
+                "This extraction stops."
             )
             break
 
-        firma_anterior = firma_actual
+        previous_signature = current_signature
 
-        print("Pulsando Next...", flush=True)
+        print("Pressing Next...", flush=True)
 
         try:
-            enlace_next.click(timeout=30000)
+            next_link.click(timeout=30000)
 
         except Exception as error:
             print(
-                f"No se pudo pulsar Next: {error}"
+                f"Could not press Next: {error}"
             )
             break
 
-        resultado = esperar_cambio_de_pagina(
+        result = wait_for_page_change(
             page,
-            firma_anterior,
-            segundos_maximos=30,
+            previous_signature,
+            max_seconds=30,
         )
 
-        if resultado == "FIN":
+        if result == "END":
             print(
-                "Se detectó: "
+                "Detected: "
                 "Last Qualifying Transaction Already Shown"
             )
 
-            guardar_captura(
+            save_screenshot(
                 page,
-                evidencia,
-                f"TUR_last_page_notice_{numero_pagina:03d}.png",
+                evidence,
+                f"TUR_last_page_notice_{page_number:03d}.png",
             )
 
             break
 
-        if resultado == "SIN_CAMBIO":
+        if result == "NO_CHANGE":
             print(
-                "La tabla no cambió después de pulsar Next. "
-                "Se detiene por seguridad."
+                "The table did not change after pressing Next. "
+                "Stopping for safety."
             )
             break
 
         print(
-            "La nueva página se cargó correctamente.",
+            "The new page loaded correctly.",
             flush=True,
         )
 
-    if not registros_totales:
+    if not all_records:
         print(
-            "No se extrajeron registros en esta ejecución."
+            "No records were extracted in this run."
         )
-        # No dejar una carpeta de evidencia vacía
-        shutil.rmtree(evidencia, ignore_errors=True)
+        # Do not leave an empty evidence folder behind
+        shutil.rmtree(evidence, ignore_errors=True)
         return None
 
     # ========================================================
-    # GENERAR EXCEL
+    # GENERATE EXCEL
     # ========================================================
 
     df = pd.DataFrame(
-        registros_totales,
-        columns=COLUMNAS + ["Pagina"],
+        all_records,
+        columns=COLUMNS + ["Page"],
     )
 
-    df = deduplicar_registros(df)
+    df = deduplicate_records(df)
 
-    df["Status_normalizado"] = (
+    df["Status_normalized"] = (
         df["Status"]
         .fillna("")
         .astype(str)
@@ -543,359 +546,359 @@ def ejecutar_extraccion(page):
         .str.strip()
     )
 
-    df_filtrado = df[
-        df["Status_normalizado"].isin(ERRORES_OBJETIVO)
+    df_filtered = df[
+        df["Status_normalized"].isin(TARGET_ERRORS)
     ].copy()
 
     df.drop(
-        columns=["Status_normalizado"],
+        columns=["Status_normalized"],
         inplace=True,
     )
 
-    df_filtrado.drop(
-        columns=["Status_normalizado"],
+    df_filtered.drop(
+        columns=["Status_normalized"],
         inplace=True,
     )
 
-    archivo_todos = (
-        evidencia / "TUR_requests_todas_paginas.xlsx"
+    all_pages_file = (
+        evidence / "TUR_requests_all_pages.xlsx"
     )
 
-    archivo_filtrado = (
-        evidencia / "TUR_requests_filtrados.xlsx"
+    filtered_file = (
+        evidence / FILTERED_NAME
     )
 
     df.to_excel(
-        archivo_todos,
+        all_pages_file,
         index=False,
     )
 
-    df_filtrado.to_excel(
-        archivo_filtrado,
+    df_filtered.to_excel(
+        filtered_file,
         index=False,
     )
 
     # ========================================================
-    # RESUMEN
+    # SUMMARY
     # ========================================================
 
     print()
     print("=" * 60)
-    print("EXTRACCIÓN TERMINADA")
+    print("EXTRACTION FINISHED")
     print("=" * 60)
-    print(f"Páginas procesadas: {paginas_procesadas}")
-    print(f"Filas totales: {len(df)}")
-    print(f"Filas filtradas: {len(df_filtrado)}")
+    print(f"Pages processed: {pages_processed}")
+    print(f"Total rows: {len(df)}")
+    print(f"Filtered rows: {len(df_filtered)}")
     print()
-    print(f"Carpeta de evidencia:")
-    print(evidencia)
+    print("Evidence folder:")
+    print(evidence)
     print()
-    print(f"Excel completo:")
-    print(archivo_todos)
+    print("Full Excel:")
+    print(all_pages_file)
     print()
-    print(f"Excel filtrado:")
-    print(archivo_filtrado)
+    print("Filtered Excel:")
+    print(filtered_file)
     print()
 
-    print("Estados encontrados en el Excel filtrado:")
+    print("Statuses found in the filtered Excel:")
 
-    if len(df_filtrado) > 0:
+    if len(df_filtered) > 0:
         print(
-            df_filtrado["Status"]
+            df_filtered["Status"]
             .value_counts()
             .to_string()
         )
     else:
-        print("Ninguno")
+        print("None")
 
-    return archivo_filtrado
+    return filtered_file
 
 
-def ejecutar_extraccion_con_reintentos(
+def run_extraction_with_retries(
     page,
-    intentos=INTENTOS_EXTRACCION,
+    attempts=EXTRACTION_ATTEMPTS,
 ):
     """
-    Corre la extracción y, si no obtiene nada, vuelve a
-    detectar la tabla y la repite.
+    Run the extraction and, if it gets nothing, detect the table
+    again and repeat it.
 
-    Solo se reintenta cuando no se extrajo ninguna fila, es
-    decir, cuando el navegador sigue en la primera página.
-    Devuelve la ruta del Excel filtrado, o None.
+    It only retries when no row was extracted, that is, when the
+    browser is still on the first page.
+    Returns the path of the filtered Excel, or None.
     """
 
-    for intento in range(1, intentos + 1):
-        archivo_filtrado = ejecutar_extraccion(page)
+    for attempt in range(1, attempts + 1):
+        filtered_file = run_extraction(page)
 
-        if archivo_filtrado is not None:
-            return archivo_filtrado
+        if filtered_file is not None:
+            return filtered_file
 
-        if intento < intentos:
+        if attempt < attempts:
             print()
             print(
-                f"Extracción sin resultados "
-                f"(intento {intento}/{intentos}). "
-                "Volviendo a detectar la tabla...",
+                f"Extraction without results "
+                f"(attempt {attempt}/{attempts}). "
+                "Detecting the table again...",
                 flush=True,
             )
             time.sleep(3)
 
     print()
     print(
-        "No se obtuvo ningún resultado tras "
-        f"{intentos} intentos."
+        "No results were obtained after "
+        f"{attempts} attempts."
     )
     return None
 
 
-def enviar_a_bloombot(
-    archivo_filtrado,
+def bloombot_to_impact(
+    filtered_file,
     page,
-    carpeta_evidencia=None,
-    guardado_automatico=False,
+    evidence_folder=None,
+    auto_save=False,
 ):
     """
-    Pasa los códigos del Excel filtrado a BLOOMBOT y, cuando la macro
-    termina, mueve los archivos GIMP a la carpeta de evidencia, llena
-    el PreStaging File, clasifica los securities, pulsa "Perform
-    Sanctions Check" en Genie, mueve el PDF resultante a la carpeta de
-    evidencia y prepara el alta de los securities en IMPACT.
+    Send the codes of the filtered Excel to BLOOMBOT and, when the macro
+    finishes, move the GIMP files to the evidence folder, fill the
+    PreStaging File, classify the securities, press "Perform Sanctions
+    Check" in Genie, move the resulting PDF to the evidence folder and
+    prepare the creation of the securities in IMPACT.
 
-    `carpeta_evidencia` es donde se guardan GIMP, Sanctions y revisiones
-    (por defecto, la carpeta del Excel filtrado). Con `guardado_automatico`
-    IMPACT guarda cada security sin esperar la revisión manual.
-    Un error aquí no interrumpe el programa.
+    `evidence_folder` is where the GIMP files, Sanctions and reviews are
+    saved (by default, the folder of the filtered Excel). With `auto_save`
+    IMPACT saves each security without waiting for the manual review.
+    An error here does not interrupt the program.
     """
 
-    inicio = datetime.now()
+    start_time = datetime.now()
 
     try:
-        resultado = procesar_y_enviar(archivo_filtrado)
+        result = process_and_send(filtered_file)
 
     except Exception as error:
         print()
-        print(f"No se pudo enviar a BLOOMBOT: {error}")
+        print(f"Could not send to BLOOMBOT: {error}")
         return
 
-    if not resultado:
+    if not result:
         return
 
-    cantidad, entidades = resultado
+    quantity, entities = result
 
-    if carpeta_evidencia is None:
-        carpeta_evidencia = Path(archivo_filtrado).parent
+    if evidence_folder is None:
+        evidence_folder = Path(filtered_file).parent
 
     try:
-        matriz = procesar_gimp(
-            cantidad,
-            inicio,
-            carpeta_evidencia,
+        matrix = process_gimp(
+            quantity,
+            start_time,
+            evidence_folder,
         )
 
     except Exception as error:
         print()
-        print(f"No se pudo completar el PreStaging File: {error}")
+        print(f"Could not complete the PreStaging File: {error}")
         return
 
-    # Clasificación por skeleton y limpieza de datos (no detiene el flujo)
+    # Classification by skeleton and data cleaning (does not stop the flow)
     securities = None
 
-    if matriz:
+    if matrix:
         try:
-            securities = procesar_matriz(
-                matriz,
-                carpeta_evidencia,
-                entidades,
+            securities = process_matrix(
+                matrix,
+                evidence_folder,
+                entities,
             )
 
         except Exception as error:
             print()
-            print(f"No se pudo clasificar los securities: {error}")
+            print(f"Could not classify the securities: {error}")
 
-    inicio_sanctions = datetime.now()
+    sanctions_start = datetime.now()
     pdfs = []
 
     try:
-        hacer_click_sanction_check()
+        click_sanction_check()
 
-        pdfs = procesar_sanctions(
-            inicio_sanctions,
-            carpeta_evidencia,
+        pdfs = process_sanctions(
+            sanctions_start,
+            evidence_folder,
         )
 
     except Exception as error:
         print()
-        print(f"El Sanctions Check no se completó: {error}")
+        print(f"The Sanctions Check did not complete: {error}")
 
     if not securities:
         return
 
-    # Revisión del PDF: solo los securities con PASS pueden crearse. Si no
-    # hay PDF o no se puede leer, no se crea ninguno.
+    # PDF review: only securities with PASS can be created. If there is no
+    # PDF or it cannot be read, none is created.
     try:
-        verificar_securities(pdfs, matriz, securities, carpeta_evidencia)
+        verify_securities(pdfs, matrix, securities, evidence_folder)
 
     except Exception as error:
         print()
-        print(f"No se pudo revisar el Sanctions Check: {error}")
+        print(f"Could not review the Sanctions Check: {error}")
         for sec in securities:
-            sec.bloqueo = f"no se pudo revisar el Sanctions Check: {error}"
+            sec.block_reason = f"the Sanctions Check could not be reviewed: {error}"
 
     try:
-        procesar_securities_impact(
+        process_securities_in_impact(
             page,
             securities,
-            guardado_automatico=guardado_automatico,
+            auto_save=auto_save,
         )
 
     except Exception as error:
         print()
-        print(f"No se pudo completar el trabajo en IMPACT: {error}")
+        print(f"Could not complete the work in IMPACT: {error}")
 
 
 # ============================================================
-# OPCIONES DEL MENÚ
+# MENU OPTIONS
 # ============================================================
 
-def preparar_tabla(page):
-    """Pide dejar Chrome en la primera página de la tabla y la comprueba.
-    Devuelve True si se puede empezar."""
+def prepare_table(page):
+    """Ask to leave Chrome on the first page of the table and check it.
+    Returns True if it is possible to start."""
 
     print()
-    print("Deja Chrome en la primera página de la tabla.")
-    print("Cuando esté listo, vuelve aquí y pulsa Enter.")
+    print("Leave Chrome on the first page of the table.")
+    print("When it is ready, come back here and press Enter.")
     input()
 
-    while not tabla_visible(page):
+    while not table_visible(page):
         print()
         print(
-            "No se detectó la tabla en la pestaña "
-            "controlada por Playwright."
+            "The table was not detected in the tab "
+            "controlled by Playwright."
         )
 
-        volver = input(
-            "¿Quieres volver a comprobarla? (s/n): "
+        check_again = input(
+            "Do you want to check it again? (y/n): "
         ).strip().lower()
 
-        if volver != "s":
-            print("No se inició el proceso.")
+        if check_again != "y":
+            print("The process was not started.")
             return False
 
     return True
 
 
-def preguntar_guardado_automatico():
-    """True si IMPACT debe guardar cada security sin revisión manual."""
+def ask_auto_save():
+    """True if IMPACT should save each security without a manual review."""
 
-    respuesta = input(
-        "¿Guardar automáticamente cada security en IMPACT? (s/N): "
+    answer = input(
+        "Save each security in IMPACT automatically? (y/N): "
     ).strip().lower()
 
-    return respuesta == "s"
+    return answer == "y"
 
 
-def proceso_completo(page, guardado_automatico=False):
-    """Extracción, BLOOMBOT, Sanctions e IMPACT."""
+def full_process(page, auto_save=False):
+    """Extraction, BLOOMBOT, Sanctions and IMPACT."""
 
-    archivo_filtrado = ejecutar_extraccion_con_reintentos(page)
+    filtered_file = run_extraction_with_retries(page)
 
-    if archivo_filtrado is not None:
-        enviar_a_bloombot(
-            archivo_filtrado,
+    if filtered_file is not None:
+        bloombot_to_impact(
+            filtered_file,
             page,
-            guardado_automatico=guardado_automatico,
+            auto_save=auto_save,
         )
 
 
-def solo_extraccion(page):
-    """Solo capturas de pantalla y Excel filtrados (antes de BLOOMBOT)."""
+def extraction_only(page):
+    """Only screenshots and filtered Excel files (before BLOOMBOT)."""
 
-    ejecutar_extraccion_con_reintentos(page)
+    run_extraction_with_retries(page)
 
 
-def desde_bloombot(page):
-    """BLOOMBOT, Sanctions e IMPACT a partir de un Excel filtrado ya
-    existente; todo se guarda en una carpeta nueva."""
+def from_bloombot(page):
+    """BLOOMBOT, Sanctions and IMPACT starting from an existing filtered
+    Excel; everything is saved in a new folder."""
 
-    excel = elegir_archivo(
-        "Elige el Excel filtrado (TUR_requests_filtrados.xlsx)"
+    excel_file = choose_file(
+        f"Choose the filtered Excel ({FILTERED_NAME})"
     )
 
-    if excel is None:
-        print("No se eligió ningún archivo.")
+    if excel_file is None:
+        print("No file was chosen.")
         return
 
-    guardado_automatico = preguntar_guardado_automatico()
-    carpeta, copia = nueva_carpeta_bloombot(excel)
+    auto_save = ask_auto_save()
+    folder, copy_path = new_bloombot_folder(excel_file)
 
     print()
-    print(f"Carpeta nueva: {carpeta}")
+    print(f"New folder: {folder}")
 
-    enviar_a_bloombot(
-        copia,
+    bloombot_to_impact(
+        copy_path,
         page,
-        carpeta_evidencia=carpeta,
-        guardado_automatico=guardado_automatico,
+        evidence_folder=folder,
+        auto_save=auto_save,
     )
 
 
-def solo_setup(page):
-    """Solo el set up de securities en IMPACT, a partir de una carpeta de
-    evidencia ya existente."""
+def setup_only(page):
+    """Only the securities set up in IMPACT, starting from an existing
+    evidence folder."""
 
-    excel = elegir_archivo(
-        "Elige el Excel base (XLS de BLOOMBOT GIMP*.xls o el Excel filtrado)"
+    excel_file = choose_file(
+        "Choose the base Excel (BLOOMBOT XLS GIMP*.xls or the filtered Excel)"
     )
 
-    if excel is None:
-        print("No se eligió ningún archivo.")
+    if excel_file is None:
+        print("No file was chosen.")
         return
 
-    guardado_automatico = preguntar_guardado_automatico()
+    auto_save = ask_auto_save()
 
     try:
-        securities, _ = preparar_setup(excel)
+        securities, _ = prepare_setup(excel_file)
 
     except Exception as error:
         print()
-        print(f"No se pudo preparar el set up: {error}")
+        print(f"Could not prepare the set up: {error}")
         return
 
     try:
-        procesar_securities_impact(
+        process_securities_in_impact(
             page,
             securities,
-            guardado_automatico=guardado_automatico,
+            auto_save=auto_save,
         )
 
     except Exception as error:
         print()
-        print(f"No se pudo completar el trabajo en IMPACT: {error}")
+        print(f"Could not complete the work in IMPACT: {error}")
 
 
-def mostrar_menu():
+def show_menu():
     print()
     print("=" * 60)
-    print("¿QUÉ QUIERES HACER?")
+    print("WHAT DO YOU WANT TO DO?")
     print("=" * 60)
-    print("1 - Todo el proceso")
-    print("2 - Todo el proceso sin chequeo manual (IMPACT guarda solo)")
-    print("3 - Solo extracción: capturas y Excel filtrados")
-    print("4 - Desde BLOOMBOT: Sanctions y creación (elige el Excel filtrado)")
-    print("5 - Solo set up de securities en IMPACT (elige el Excel base)")
-    print("6 - Cerrar el proceso")
+    print("1 - Full process")
+    print("2 - Full process without manual check (IMPACT saves by itself)")
+    print("3 - Extraction only: screenshots and filtered Excel files")
+    print("4 - From BLOOMBOT: Sanctions and creation (choose the filtered Excel)")
+    print("5 - Securities set up in IMPACT only (choose the base Excel)")
+    print("6 - Close the process")
 
 
 # ============================================================
-# PROGRAMA PRINCIPAL
+# MAIN PROGRAM
 # ============================================================
 
 def main():
     with sync_playwright() as p:
-        print("Abriendo Chrome y el sistema...", flush=True)
+        print("Opening Chrome and the system...", flush=True)
 
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PERFIL),
+            user_data_dir=str(PROFILE),
             channel="chrome",
             headless=False,
             timeout=30000,
@@ -908,64 +911,64 @@ def main():
         )
 
         page.goto(
-            URL_SISTEMA,
+            SYSTEM_URL,
             wait_until="commit",
             timeout=60000,
         )
 
         print()
-        print("1. Introduce tus credenciales manualmente en Chrome.")
-        print("2. Completa MFA si el sistema lo solicita.")
-        print("3. Regresa a esta consola y pulsa Enter para ver el menú.")
+        print("1. Enter your credentials manually in Chrome.")
+        print("2. Complete MFA if the system asks for it.")
+        print("3. Come back to this console and press Enter to see the menu.")
         input()
 
         while True:
-            mostrar_menu()
+            show_menu()
 
-            opcion = input("Selecciona una opción (1-6): ").strip()
+            option = input("Choose an option (1-6): ").strip()
 
-            if opcion == "1":
-                if preparar_tabla(page):
-                    proceso_completo(page)
+            if option == "1":
+                if prepare_table(page):
+                    full_process(page)
 
-            elif opcion == "2":
-                if preparar_tabla(page):
-                    proceso_completo(page, guardado_automatico=True)
+            elif option == "2":
+                if prepare_table(page):
+                    full_process(page, auto_save=True)
 
-            elif opcion == "3":
-                if preparar_tabla(page):
-                    solo_extraccion(page)
+            elif option == "3":
+                if prepare_table(page):
+                    extraction_only(page)
 
-            elif opcion == "4":
-                desde_bloombot(page)
+            elif option == "4":
+                from_bloombot(page)
 
-            elif opcion == "5":
-                solo_setup(page)
+            elif option == "5":
+                setup_only(page)
 
-            elif opcion == "6":
-                cerrar = input(
-                    "¿Cerrar también Chrome? (s/n): "
+            elif option == "6":
+                close_chrome = input(
+                    "Close Chrome as well? (y/n): "
                 ).strip().lower()
 
-                if cerrar == "s":
+                if close_chrome == "y":
                     print()
-                    print("Cerrando Chrome...")
+                    print("Closing Chrome...")
                     context.close()
 
                 else:
                     print()
                     print(
-                        "El script terminará y se intentará dejar "
-                        "Chrome abierto."
+                        "The script will end and Chrome will be "
+                        "left open."
                     )
-                    # No se llama a context.close().
-                    # Esto evita cerrar Chrome explícitamente.
+                    # context.close() is not called, so Chrome is not
+                    # closed explicitly.
 
                 break
 
             else:
                 print()
-                print("Opción no válida. Selecciona un número del 1 al 6.")
+                print("Invalid option. Choose a number from 1 to 6.")
 
 
 if __name__ == "__main__":

@@ -1,159 +1,171 @@
-"""Apoyo para las opciones 4 y 5 del menú:
+"""Support for options 4 and 5 of the menu:
 
-* Elegir con un seleccionador de archivos el Excel base.
-* Crear la carpeta de la corrida que arranca en BLOOMBOT.
-* Reconstruir, a partir de una carpeta de evidencia ya existente, todo lo
-  necesario para el set up de securities en IMPACT (XLS de BLOOMBOT, Excel
-  filtrado con las entidades y PDF del Sanctions Check).
+* Choose the base Excel with a file picker.
+* Create the folder for the run that starts at BLOOMBOT.
+* Rebuild, from an existing evidence folder, everything needed for the
+  securities set up in IMPACT (BLOOMBOT XLS, filtered Excel with the
+  entities and Sanctions Check PDF).
 """
 
 import shutil
 from datetime import datetime
 from pathlib import Path
 
-from bloombot import obtener_codigos
-from prestaging import leer_matriz_xls
-from sanctions_pdf import verificar_securities
-from skeletons import procesar_matriz
+from bloombot import get_codes
+from prestaging import read_xls_matrix
+from sanctions_pdf import verify_securities
+from skeletons import process_matrix
 
-NOMBRE_FILTRADO = "TUR_requests_filtrados.xlsx"
+FILTERED_NAME = "TUR_requests_filtered.xlsx"
+# Name used by earlier versions; still accepted when reading old folders.
+LEGACY_FILTERED_NAME = "TUR_requests_filtrados.xlsx"
 
 
 # ============================================================
-# SELECCIONADOR DE ARCHIVOS
+# FILE PICKER
 # ============================================================
 
-def carpeta_evidencia_reciente(base=None):
-    """La carpeta 'TUR Evidence_*' más reciente (por nombre), o `base`."""
+def latest_evidence_folder(base=None):
+    """The most recent 'TUR Evidence_*' folder (by name), or `base`."""
     base = Path(base or Path.cwd())
-    carpetas = sorted(
+    folders = sorted(
         (p for p in base.glob("TUR Evidence_*") if p.is_dir()),
         key=lambda p: p.name,
     )
-    return carpetas[-1] if carpetas else base
+    return folders[-1] if folders else base
 
 
-def elegir_archivo(titulo, carpeta_inicial=None):
-    """Abre el seleccionador de archivos de Windows. Si no está disponible,
-    pide la ruta por consola. Devuelve un Path o None si se cancela."""
-    inicial = Path(carpeta_inicial or carpeta_evidencia_reciente())
-    tipos = [("Excel", "*.xlsx *.xls"), ("Todos los archivos", "*.*")]
+def choose_file(title_text, initial_folder=None):
+    """Open the Windows file picker. If it is not available, ask for the
+    path on the console. Returns a Path, or None if cancelled."""
+    initial = Path(initial_folder or latest_evidence_folder())
+    file_types = [("Excel", "*.xlsx *.xls"), ("All files", "*.*")]
 
     try:
         import tkinter as tk
         from tkinter import filedialog
 
-        raiz = tk.Tk()
-        raiz.withdraw()
-        raiz.attributes("-topmost", True)
-        ruta = filedialog.askopenfilename(
-            title=titulo,
-            initialdir=str(inicial),
-            filetypes=tipos,
-            parent=raiz,
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        file_path = filedialog.askopenfilename(
+            title=title_text,
+            initialdir=str(initial),
+            filetypes=file_types,
+            parent=root,
         )
-        raiz.destroy()
+        root.destroy()
 
     except Exception:
-        ruta = input(f"{titulo}\nEscribe la ruta del archivo: ").strip().strip('"')
+        file_path = input(
+            f"{title_text}\nType the file path: "
+        ).strip().strip('"')
 
-    return Path(ruta) if ruta else None
+    return Path(file_path) if file_path else None
 
 
 # ============================================================
-# OPCIÓN 4: carpeta nueva para la corrida desde BLOOMBOT
+# OPTION 4: new folder for the run from BLOOMBOT
 # ============================================================
 
-def nueva_carpeta_bloombot(excel_filtrado, base=None):
-    """Crea 'TUR Evidence_<fecha>_BLOOMBOT' y copia ahí el Excel filtrado
-    (así la opción 5 podrá usar esa carpeta después). Devuelve (carpeta,
-    ruta de la copia)."""
+def new_bloombot_folder(filtered_excel, base=None):
+    """Create 'TUR Evidence_<date>_BLOOMBOT' and copy the filtered Excel
+    there (so option 5 can use that folder later). Returns (folder,
+    path of the copy)."""
     base = Path(base or Path.cwd())
-    fecha = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    carpeta = base / f"TUR Evidence_{fecha}_BLOOMBOT"
-    carpeta.mkdir(parents=True, exist_ok=True)
+    dt = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    folder = base / f"TUR Evidence_{dt}_BLOOMBOT"
+    folder.mkdir(parents=True, exist_ok=True)
 
-    copia = carpeta / NOMBRE_FILTRADO
-    shutil.copy2(excel_filtrado, copia)
-    return carpeta, copia
+    copy_path = folder / FILTERED_NAME
+    shutil.copy2(filtered_excel, copy_path)
+    return folder, copy_path
 
 
 # ============================================================
-# OPCIÓN 5: set up desde una carpeta existente
+# OPTION 5: set up from an existing folder
 # ============================================================
 
-def _mas_reciente(rutas):
-    rutas = list(rutas)
-    return max(rutas, key=lambda p: p.stat().st_mtime) if rutas else None
+def _most_recent(paths):
+    paths = list(paths)
+    return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
 
 
-def localizar_archivos(ruta):
-    """A partir del archivo elegido, busca en su carpeta lo que hace falta.
+def _find_filtered(folder):
+    """The filtered Excel of a folder (current or legacy name), or None."""
+    for name in (FILTERED_NAME, LEGACY_FILTERED_NAME):
+        candidate = folder / name
+        if candidate.exists():
+            return candidate
+    return None
 
-    Se puede elegir el XLS de BLOOMBOT (GIMP*.xls) o el Excel filtrado del
-    TUR. Devuelve {"carpeta", "xls", "filtrado", "pdfs"}; los que no se
-    encuentran quedan en None (o lista vacía).
+
+def locate_files(file_path):
+    """From the chosen file, look in its folder for what is needed.
+
+    You can choose the BLOOMBOT XLS (GIMP*.xls) or the TUR filtered Excel.
+    Returns {"folder", "xls", "filtered", "pdfs"}; whatever is not found is
+    None (or an empty list).
     """
-    ruta = Path(ruta)
-    carpeta = ruta.parent
+    file_path = Path(file_path)
+    folder = file_path.parent
 
-    if ruta.suffix.lower() == ".xls":
-        xls = ruta
-        filtrado = carpeta / NOMBRE_FILTRADO
-        filtrado = filtrado if filtrado.exists() else None
+    if file_path.suffix.lower() == ".xls":
+        xls = file_path
+        filtered = _find_filtered(folder)
     else:
-        filtrado = ruta
-        xls = _mas_reciente(
-            p for p in carpeta.iterdir()
+        filtered = file_path
+        xls = _most_recent(
+            p for p in folder.iterdir()
             if p.suffix.lower() == ".xls" and p.name.upper().startswith("GIMP")
         )
 
-    pdf = _mas_reciente(
-        p for p in carpeta.iterdir() if p.suffix.lower() == ".pdf"
+    pdf = _most_recent(
+        p for p in folder.iterdir() if p.suffix.lower() == ".pdf"
     )
 
     return {
-        "carpeta": carpeta,
+        "folder": folder,
         "xls": xls,
-        "filtrado": filtrado,
+        "filtered": filtered,
         "pdfs": [pdf] if pdf else [],
     }
 
 
-def preparar_setup(ruta):
-    """Reconstruye los securities listos para IMPACT desde una carpeta de
-    evidencia: lee el XLS de BLOOMBOT, clasifica, asigna entidades con el
-    Excel filtrado y revisa el PDF del Sanctions Check.
+def prepare_setup(file_path):
+    """Rebuild the securities ready for IMPACT from an evidence folder: read
+    the BLOOMBOT XLS, classify, assign entities with the filtered Excel and
+    check the Sanctions Check PDF.
 
-    Devuelve (securities, carpeta). Lanza RuntimeError si falta algo
-    imprescindible.
+    Returns (securities, folder). Raises RuntimeError if something essential
+    is missing.
     """
-    archivos = localizar_archivos(ruta)
-    carpeta = archivos["carpeta"]
+    files = locate_files(file_path)
+    folder = files["folder"]
 
-    if archivos["xls"] is None:
+    if files["xls"] is None:
         raise RuntimeError(
-            f"No encontré el XLS de BLOOMBOT (GIMP*.xls) en {carpeta}."
+            f"Could not find the BLOOMBOT XLS (GIMP*.xls) in {folder}."
         )
-    if archivos["filtrado"] is None:
+    if files["filtered"] is None:
         raise RuntimeError(
-            f"No encontré {NOMBRE_FILTRADO} en {carpeta}; hace falta para "
-            "saber la entidad de cada security."
+            f"Could not find {FILTERED_NAME} in {folder}; it is needed to "
+            "know the entity of each security."
         )
 
     print()
-    print(f"Carpeta base: {carpeta}")
-    print(f"XLS de BLOOMBOT: {archivos['xls'].name}")
-    print(f"Excel filtrado: {archivos['filtrado'].name}")
+    print(f"Base folder: {folder}")
+    print(f"BLOOMBOT XLS: {files['xls'].name}")
+    print(f"Filtered Excel: {files['filtered'].name}")
     print(
-        "PDF de Sanctions: "
-        + (archivos["pdfs"][0].name if archivos["pdfs"] else "(ninguno)")
+        "Sanctions PDF: "
+        + (files["pdfs"][0].name if files["pdfs"] else "(none)")
     )
 
-    matriz = leer_matriz_xls(archivos["xls"])
-    _, _, entidades = obtener_codigos(archivos["filtrado"])
+    matrix = read_xls_matrix(files["xls"])
+    _, _, entities = get_codes(files["filtered"])
 
-    securities = procesar_matriz(matriz, carpeta, entidades)
-    verificar_securities(archivos["pdfs"], matriz, securities, carpeta)
+    securities = process_matrix(matrix, folder, entities)
+    verify_securities(files["pdfs"], matrix, securities, folder)
 
-    return securities, carpeta
+    return securities, folder

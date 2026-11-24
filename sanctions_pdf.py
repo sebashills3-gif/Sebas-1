@@ -1,38 +1,38 @@
-"""Revisa el PDF del Sanctions Check antes de crear securities en IMPACT.
+"""Check the Sanctions Check PDF before creating securities in IMPACT.
 
-El PDF tiene la estructura del PreStaging File: un bloque por identificador
-(By ISIN, By SEDOL, By CUSIP, By COMMON, By FIGI ID), cada uno con las
-columnas No / identificador / Sanctions Check, y un bloque "Combine Status".
-La fila "No" k del PDF corresponde a la k-ésima fila pegada en el PreStaging
-File (la fila 5 del Excel es la No 1).
+The PDF has the structure of the PreStaging File: one block per identifier
+(By ISIN, By SEDOL, By CUSIP, By COMMON, By FIGI ID), each with the columns
+No / identifier / Sanctions Check, plus a "Combine Status" block.
+Row "No" k of the PDF corresponds to the k-th row pasted into the
+PreStaging File (Excel row 5 is No 1).
 
-Un security solo pasa si TODAS sus filas dicen PASS. Ante cualquier duda
-(PDF ilegible, fila que no aparece, resultado distinto de PASS) el security
-se bloquea: la regla es no tocar nada que no se haya podido comprobar.
+A security only passes if ALL of its rows say PASS. At any doubt (unreadable
+PDF, missing row, result other than PASS) the security is blocked: the rule
+is not to touch anything that could not be verified.
 
-Requiere: pip install pdfplumber
+Requires: pip install pdfplumber
 """
 
 import re
 import statistics
 from pathlib import Path
 
-from prestaging import construir_filas, duenios_de_filas, extraer_securities
+from prestaging import build_rows, row_owners, extract_securities
 
-IDENTIFICADORES = ("ISIN", "SEDOL", "CUSIP", "COMMON", "FIGI_ID")
+IDENTIFIERS = ("ISIN", "SEDOL", "CUSIP", "COMMON", "FIGI_ID")
 
-_TITULO = re.compile(
+_TITLE = re.compile(
     r"^(ISIN|SEDOL|CUSIP|COMMON|FIGI(?:_ID)?)S?$", re.IGNORECASE
 )
-_TITULO_PEGADO = re.compile(
+_GLUED_TITLE = re.compile(
     r"^BY(ISIN|SEDOL|CUSIP|COMMON|FIGI(?:_ID)?)S?$", re.IGNORECASE
 )
-_CLAVE = {
+_KEY = {
     "ISIN": "ISIN", "SEDOL": "SEDOL", "CUSIP": "CUSIP",
     "COMMON": "COMMON", "FIGI": "FIGI_ID", "FIGI_ID": "FIGI_ID",
 }
-_ENCABEZADOS = {"NO", "SANCTIONS", "CHECK", "STATUS", "COMMENTS", "ID"}
-_SIN_DATO = ("#N/A", "N.A.", "N/A")
+_HEADERS = {"NO", "SANCTIONS", "CHECK", "STATUS", "COMMENTS", "ID"}
+_NO_DATA = ("#N/A", "N.A.", "N/A")
 
 
 class PdfSanctionsError(Exception):
@@ -40,18 +40,20 @@ class PdfSanctionsError(Exception):
 
 
 # ============================================================
-# LECTURA DEL PDF
+# READING THE PDF
 # ============================================================
 
-def _palabras_por_pagina(ruta):
+def _words_by_page(file_path):
     import pdfplumber
 
-    paginas = []
-    with pdfplumber.open(str(ruta)) as pdf:
-        for pagina in pdf.pages:
-            palabras = pagina.extract_words(use_text_flow=False)
-            paginas.append(sorted(palabras, key=lambda w: (round(w["top"]), w["x0"])))
-    return paginas
+    pdf_pages = []
+    with pdfplumber.open(str(file_path)) as pdf:
+        for pdf_page in pdf.pages:
+            words = pdf_page.extract_words(use_text_flow=False)
+            pdf_pages.append(
+                sorted(words, key=lambda w: (round(w["top"]), w["x0"]))
+            )
+    return pdf_pages
 
 
 def _cx(w):
@@ -62,326 +64,332 @@ def _cy(w):
     return (w["top"] + w["bottom"]) / 2
 
 
-def _titulos(palabras):
-    """Títulos de bloque de la página: {clave: {centro, top, bottom}}."""
-    titulos = {}
+def _titles(words):
+    """Block titles of the page: {key: {center, top, bottom}}."""
+    titles = {}
 
-    for i, w in enumerate(palabras):
-        texto = w["text"].strip()
+    for i, w in enumerate(words):
+        text = w["text"].strip()
 
-        pegado = _TITULO_PEGADO.match(texto.upper())
-        if pegado:
-            clave = _CLAVE[pegado.group(1).upper()]
-            titulos[clave] = {"centro": _cx(w), "top": w["top"], "bottom": w["bottom"]}
+        glued = _GLUED_TITLE.match(text.upper())
+        if glued:
+            key = _KEY[glued.group(1).upper()]
+            titles[key] = {"center": _cx(w), "top": w["top"], "bottom": w["bottom"]}
             continue
 
-        if texto.upper() == "BY":
-            for sig in palabras[i + 1:]:
-                if abs(sig["top"] - w["top"]) <= 3 and sig["x0"] >= w["x1"] - 1:
-                    coincide = _TITULO.match(sig["text"].strip())
-                    if coincide:
-                        clave = _CLAVE[coincide.group(1).upper()]
-                        titulos[clave] = {
-                            "centro": (w["x0"] + sig["x1"]) / 2,
+        if text.upper() == "BY":
+            for nxt in words[i + 1:]:
+                if abs(nxt["top"] - w["top"]) <= 3 and nxt["x0"] >= w["x1"] - 1:
+                    matched = _TITLE.match(nxt["text"].strip())
+                    if matched:
+                        key = _KEY[matched.group(1).upper()]
+                        titles[key] = {
+                            "center": (w["x0"] + nxt["x1"]) / 2,
                             "top": w["top"],
                             "bottom": w["bottom"],
                         }
                     break
 
-        if texto.upper() == "COMBINE":
-            for sig in palabras[i + 1:]:
-                if abs(sig["top"] - w["top"]) <= 3 and sig["x0"] >= w["x1"] - 1:
-                    if sig["text"].strip().upper() == "STATUS":
-                        titulos["COMBINE"] = {
-                            "centro": (w["x0"] + sig["x1"]) / 2,
+        if text.upper() == "COMBINE":
+            for nxt in words[i + 1:]:
+                if abs(nxt["top"] - w["top"]) <= 3 and nxt["x0"] >= w["x1"] - 1:
+                    if nxt["text"].strip().upper() == "STATUS":
+                        titles["COMBINE"] = {
+                            "center": (w["x0"] + nxt["x1"]) / 2,
                             "top": w["top"],
                             "bottom": w["bottom"],
                         }
                     break
 
-    return titulos
+    return titles
 
 
-def _bloque_de(w, titulos):
-    return min(titulos, key=lambda k: abs(_cx(w) - titulos[k]["centro"]))
+def _block_of(w, titles):
+    return min(titles, key=lambda k: abs(_cx(w) - titles[k]["center"]))
 
 
-def _geometria(palabras, titulos):
-    """Columnas de estado (con sus límites), columna No y borde inferior del
-    encabezado.
+def _geometry(words, titles):
+    """Status columns (with their limits), the No column and the bottom edge
+    of the header.
 
-    Los resultados quedan pegados al borde izquierdo de su celda (no
-    centrados como el encabezado), así que la columna de estado de cada
-    bloque se delimita desde justo antes de su encabezado "Sanctions" hasta
-    donde empieza el siguiente bloque.
+    Results sit against the left edge of their cell (they are not centered
+    like the header), so the status column of each block is delimited from
+    just before its "Sanctions" header up to where the next block starts.
     """
-    if not any(k in titulos for k in IDENTIFICADORES):
-        raise PdfSanctionsError("no se encontraron los títulos 'By ...'.")
+    if not any(k in titles for k in IDENTIFIERS):
+        raise PdfSanctionsError("the 'By ...' titles were not found.")
 
-    fondo_titulos = max(t["bottom"] for t in titulos.values())
-    alto = fondo_titulos - min(t["top"] for t in titulos.values())
-    limite = fondo_titulos + 3 * max(alto, 8) + 6
+    titles_bottom = max(t["bottom"] for t in titles.values())
+    height = titles_bottom - min(t["top"] for t in titles.values())
+    limit = titles_bottom + 3 * max(height, 8) + 6
 
-    orden = sorted(titulos, key=lambda k: titulos[k]["centro"])
-    sub = {k: [] for k in titulos}
-    fondo_encabezado = fondo_titulos
+    order = sorted(titles, key=lambda k: titles[k]["center"])
+    sub = {k: [] for k in titles}
+    header_bottom = titles_bottom
 
-    for w in palabras:
-        if fondo_titulos - 0.5 <= w["top"] <= limite:
-            sub[_bloque_de(w, titulos)].append(w)
-            texto = w["text"].strip().upper()
-            if texto in _ENCABEZADOS or _TITULO.match(texto):
-                fondo_encabezado = max(fondo_encabezado, w["bottom"])
+    for w in words:
+        if titles_bottom - 0.5 <= w["top"] <= limit:
+            sub[_block_of(w, titles)].append(w)
+            text = w["text"].strip().upper()
+            if text in _HEADERS or _TITLE.match(text):
+                header_bottom = max(header_bottom, w["bottom"])
 
-    izquierda, col_no, no_izq = {}, None, {}
+    left, no_col, no_left = {}, None, {}
     combine = None
 
-    for bloque in orden:
-        palabras_b = sorted(sub[bloque], key=lambda w: w["x0"])
+    for block in order:
+        block_words = sorted(sub[block], key=lambda w: w["x0"])
 
-        if bloque == "COMBINE":
-            estado = [w for w in palabras_b if w["text"].strip().upper() == "STATUS"
-                      and w["top"] > fondo_titulos - 0.5]
-            comentarios = [w for w in palabras_b
-                           if w["text"].strip().upper() == "COMMENTS"]
-            if estado:
-                sc = _cx(estado[0])
-                if comentarios:
-                    cc = _cx(comentarios[0])
+        if block == "COMBINE":
+            status_words = [
+                w for w in block_words
+                if w["text"].strip().upper() == "STATUS"
+                and w["top"] > titles_bottom - 0.5
+            ]
+            comment_words = [
+                w for w in block_words
+                if w["text"].strip().upper() == "COMMENTS"
+            ]
+            if status_words:
+                sc = _cx(status_words[0])
+                if comment_words:
+                    cc = _cx(comment_words[0])
                     combine = (sc - (cc - sc) / 2, (sc + cc) / 2)
                 else:
-                    combine = (estado[0]["x0"] - 15, estado[0]["x1"] + 40)
+                    combine = (status_words[0]["x0"] - 15, status_words[0]["x1"] + 40)
             continue
 
-        no = next((w for w in palabras_b if w["text"].strip().upper() == "NO"), None)
-        sanciones = [w for w in palabras_b
-                     if w["text"].strip().upper() in ("SANCTIONS", "CHECK")]
+        no = next((w for w in block_words if w["text"].strip().upper() == "NO"), None)
+        sanction_words = [
+            w for w in block_words
+            if w["text"].strip().upper() in ("SANCTIONS", "CHECK")
+        ]
         if no is not None:
-            no_izq[bloque] = no["x0"] - 12
-            if col_no is None:
-                col_no = (no["x0"] - 12, no["x1"] + 12)
-        if sanciones:
-            izquierda[bloque] = min(w["x0"] for w in sanciones) - 20
+            no_left[block] = no["x0"] - 12
+            if no_col is None:
+                no_col = (no["x0"] - 12, no["x1"] + 12)
+        if sanction_words:
+            left[block] = min(w["x0"] for w in sanction_words) - 20
 
-    if col_no is None:
-        raise PdfSanctionsError("no se encontró la columna 'No'.")
-    if not izquierda:
-        raise PdfSanctionsError("no se encontraron las columnas 'Sanctions Check'.")
+    if no_col is None:
+        raise PdfSanctionsError("the 'No' column was not found.")
+    if not left:
+        raise PdfSanctionsError("the 'Sanctions Check' columns were not found.")
 
-    estado = {}
-    for pos, bloque in enumerate(orden):
-        if bloque == "COMBINE" or bloque not in izquierda:
+    status_cols = {}
+    for pos, block in enumerate(order):
+        if block == "COMBINE" or block not in left:
             continue
-        siguiente = orden[pos + 1] if pos + 1 < len(orden) else None
-        if siguiente is None:
-            derecha = izquierda[bloque] + 120
-        elif siguiente == "COMBINE":
-            derecha = (combine[0] if combine else izquierda[bloque] + 120) - 1
+        following = order[pos + 1] if pos + 1 < len(order) else None
+        if following is None:
+            right = left[block] + 120
+        elif following == "COMBINE":
+            right = (combine[0] if combine else left[block] + 120) - 1
         else:
-            derecha = no_izq.get(siguiente, titulos[siguiente]["centro"] - 60) - 1
-        estado[bloque] = (izquierda[bloque], derecha)
+            right = no_left.get(following, titles[following]["center"] - 60) - 1
+        status_cols[block] = (left[block], right)
 
     if combine:
-        estado["COMBINE"] = combine
+        status_cols["COMBINE"] = combine
 
-    return {"estado": estado, "no": col_no, "fondo": fondo_encabezado}
+    return {"status": status_cols, "no": no_col, "bottom": header_bottom}
 
 
-def leer_estados(ruta):
-    """Lee el PDF y devuelve (estados, hay_combine).
+def read_statuses(file_path):
+    """Read the PDF and return (statuses, has_combine).
 
-    estados: {numero_de_fila: {"ISIN": "PASS", ..., "COMBINE": "PASS"}}
+    statuses: {row_number: {"ISIN": "PASS", ..., "COMBINE": "PASS"}}
     """
-    paginas = _palabras_por_pagina(ruta)
-    if not any(paginas):
-        raise PdfSanctionsError("el PDF no tiene texto (¿es una imagen?).")
+    pdf_pages = _words_by_page(file_path)
+    if not any(pdf_pages):
+        raise PdfSanctionsError("the PDF has no text (is it an image?).")
 
-    estados = {}
-    hay_combine = False
-    geometria = None
+    statuses = {}
+    has_combine = False
+    geometry = None
 
-    for palabras in paginas:
-        titulos = _titulos(palabras)
-        if titulos:
+    for words in pdf_pages:
+        titles = _titles(words)
+        if titles:
             try:
-                geometria = _geometria(palabras, titulos)
-                fondo = geometria["fondo"]
+                geometry = _geometry(words, titles)
+                bottom = geometry["bottom"]
             except PdfSanctionsError:
-                if geometria is None:
+                if geometry is None:
                     continue
-                fondo = 0
-        elif geometria is not None:
-            fondo = 0  # página de continuación, sin encabezado
+                bottom = 0
+        elif geometry is not None:
+            bottom = 0  # continuation page, without a header
         else:
             continue
 
-        x0, x1 = geometria["no"]
-        anclas = [
+        x0, x1 = geometry["no"]
+        anchors = [
             (int(w["text"]), _cy(w))
-            for w in palabras
-            if w["text"].strip().isdigit() and w["top"] >= fondo - 1
+            for w in words
+            if w["text"].strip().isdigit() and w["top"] >= bottom - 1
             and x0 <= _cx(w) <= x1
         ]
-        if not anclas:
+        if not anchors:
             continue
 
-        pasos = [b[1] - a[1] for a, b in zip(anclas, anclas[1:]) if b[1] > a[1]]
-        paso = statistics.median(pasos) if pasos else 12
-        tolerancia = paso * 0.45
+        pitches = [b[1] - a[1] for a, b in zip(anchors, anchors[1:]) if b[1] > a[1]]
+        pitch = statistics.median(pitches) if pitches else 12
+        tolerance = pitch * 0.45
 
-        hay_combine = hay_combine or "COMBINE" in geometria["estado"]
+        has_combine = has_combine or "COMBINE" in geometry["status"]
 
-        for numero, cy in anclas:
-            if numero in estados:
+        for number, cy in anchors:
+            if number in statuses:
                 continue
-            fila = {}
-            for bloque, (bx0, bx1) in geometria["estado"].items():
-                textos = [
-                    w["text"] for w in palabras
-                    if w["top"] >= fondo - 1 and bx0 <= _cx(w) <= bx1
-                    and abs(_cy(w) - cy) <= tolerancia
+            row = {}
+            for block, (bx0, bx1) in geometry["status"].items():
+                texts = [
+                    w["text"] for w in words
+                    if w["top"] >= bottom - 1 and bx0 <= _cx(w) <= bx1
+                    and abs(_cy(w) - cy) <= tolerance
                 ]
-                fila[bloque] = " ".join(textos).strip()
-            estados[numero] = fila
+                row[block] = " ".join(texts).strip()
+            statuses[number] = row
 
-    if not estados:
-        raise PdfSanctionsError("no se pudieron leer filas de resultados.")
+    if not statuses:
+        raise PdfSanctionsError("no result rows could be read.")
 
-    return estados, hay_combine
+    return statuses, has_combine
 
 
-def _volcar_diagnostico(ruta, carpeta):
-    """Guarda las palabras del PDF con sus coordenadas para poder revisarlas."""
-    destino = Path(carpeta) / "sanctions_diagnostico.txt"
-    lineas = []
+def _dump_diagnostic(file_path, folder):
+    """Save the PDF words with their coordinates so they can be reviewed."""
+    destination = Path(folder) / "sanctions_diagnostic.txt"
+    lines = []
     try:
-        for n, palabras in enumerate(_palabras_por_pagina(ruta), start=1):
-            lineas.append(f"--- página {n}: {len(palabras)} palabras")
-            for w in palabras[:400]:
-                lineas.append(
+        for n, words in enumerate(_words_by_page(file_path), start=1):
+            lines.append(f"--- page {n}: {len(words)} words")
+            for w in words[:400]:
+                lines.append(
                     f"{w['text']!r} x0={w['x0']:.0f} x1={w['x1']:.0f} "
                     f"top={w['top']:.0f}"
                 )
     except Exception as error:
-        lineas.append(f"(no se pudo leer el PDF: {error})")
-    destino.write_text("\n".join(lineas), encoding="utf-8")
-    return destino
+        lines.append(f"(could not read the PDF: {error})")
+    destination.write_text("\n".join(lines), encoding="utf-8")
+    return destination
 
 
 # ============================================================
-# VERIFICACIÓN
+# VERIFICATION
 # ============================================================
 
-def _tiene_dato(valor):
-    return valor is not None and not str(valor).strip().upper().startswith(_SIN_DATO)
+def _has_data(value):
+    return value is not None and not str(value).strip().upper().startswith(_NO_DATA)
 
 
-def verificar_filas(estados, hay_combine, filas, duenios, cantidad):
-    """Motivos de bloqueo por security: {indice: [motivos]} (lista vacía = pasa)."""
-    motivos = {i: [] for i in range(cantidad)}
+def verify_rows(statuses, has_combine, rows, owners, quantity):
+    """Blocking reasons per security: {index: [reasons]} (empty list = passes)."""
+    reasons = {i: [] for i in range(quantity)}
 
-    for numero, (fila, dueno) in enumerate(zip(filas, duenios), start=1):
-        estado = estados.get(numero)
-        if estado is None:
-            motivos[dueno].append(f"fila {numero}: no aparece en el PDF")
+    for number, (row, owner) in enumerate(zip(rows, owners), start=1):
+        status = statuses.get(number)
+        if status is None:
+            reasons[owner].append(f"row {number}: not in the PDF")
             continue
 
-        for clave in IDENTIFICADORES:
-            resultado = estado.get(clave, "").strip().upper()
-            valor = fila.get(clave)
+        for key in IDENTIFIERS:
+            result = status.get(key, "").strip().upper()
+            value = row.get(key)
 
-            if _tiene_dato(valor):
-                if resultado != "PASS":
-                    motivos[dueno].append(
-                        f"fila {numero} {clave} {valor}: "
-                        f"{resultado or 'sin resultado'}"
+            if _has_data(value):
+                if result != "PASS":
+                    reasons[owner].append(
+                        f"row {number} {key} {value}: "
+                        f"{result or 'no result'}"
                     )
-            elif resultado and resultado != "PASS":
-                motivos[dueno].append(
-                    f"fila {numero} {clave} (vacío en el PreStaging): {resultado}"
+            elif result and result != "PASS":
+                reasons[owner].append(
+                    f"row {number} {key} (empty in the PreStaging): {result}"
                 )
 
-        if hay_combine:
-            combinado = estado.get("COMBINE", "").strip().upper()
-            if combinado != "PASS":
-                motivos[dueno].append(
-                    f"fila {numero} Combine Status: {combinado or 'sin resultado'}"
+        if has_combine:
+            combined = status.get("COMBINE", "").strip().upper()
+            if combined != "PASS":
+                reasons[owner].append(
+                    f"row {number} Combine Status: {combined or 'no result'}"
                 )
 
-    return motivos
+    return reasons
 
 
-def _alerta(lineas):
-    barra = "!" * 70
+def _alert(lines):
+    bar = "!" * 70
     print()
-    print(barra)
-    for linea in lineas:
-        print(f"!!  {linea}")
-    print(barra)
+    print(bar)
+    for line in lines:
+        print(f"!!  {line}")
+    print(bar)
 
 
-def verificar_securities(pdfs, matriz, securities, carpeta):
-    """Revisa el PDF y marca `Security.bloqueo` en los que no pasan.
+def verify_securities(pdfs, matrix, securities, folder):
+    """Check the PDF and set `Security.block_reason` on those that do not pass.
 
-    Si el PDF no se puede leer o interpretar, se bloquean TODOS. Devuelve
-    cuántos securities quedaron bloqueados.
+    If the PDF cannot be read or interpreted, ALL securities are blocked.
+    Returns how many securities ended up blocked.
     """
-    def bloquear_todos(motivo):
+    def block_all(reason):
         for sec in securities:
-            sec.bloqueo = motivo
-        _alerta([
-            "NO SE PUDO VERIFICAR EL SANCTIONS CHECK",
-            motivo,
-            "NINGÚN SECURITY SE CREARÁ EN IMPACT.",
+            sec.block_reason = reason
+        _alert([
+            "THE SANCTIONS CHECK COULD NOT BE VERIFIED",
+            reason,
+            "NO SECURITY WILL BE CREATED IN IMPACT.",
         ])
         return len(securities)
 
     if not pdfs:
-        return bloquear_todos("no hay PDF de Sanctions Check que revisar")
+        return block_all("there is no Sanctions Check PDF to review")
 
-    base = extraer_securities(matriz)
+    base = extract_securities(matrix)
     if len(base) != len(securities):
-        return bloquear_todos(
-            f"el PreStaging tiene {len(base)} securities y la clasificación "
-            f"{len(securities)}; no se puede relacionar el PDF"
+        return block_all(
+            f"the PreStaging has {len(base)} securities and the "
+            f"classification has {len(securities)}; the PDF cannot be matched"
         )
 
-    filas = construir_filas(base)
-    duenios = duenios_de_filas(base)
-    motivos = {i: [] for i in range(len(securities))}
+    rows = build_rows(base)
+    owners = row_owners(base)
+    reasons = {i: [] for i in range(len(securities))}
 
     for pdf in pdfs:
         try:
-            estados, hay_combine = leer_estados(pdf)
+            statuses, has_combine = read_statuses(pdf)
         except Exception as error:
-            diag = _volcar_diagnostico(pdf, carpeta)
-            return bloquear_todos(
-                f"no se pudo interpretar '{Path(pdf).name}': {error} "
-                f"(diagnóstico en {diag})"
+            diag_path = _dump_diagnostic(pdf, folder)
+            return block_all(
+                f"could not interpret '{Path(pdf).name}': {error} "
+                f"(diagnostic in {diag_path})"
             )
 
         if len(pdfs) > 1:
-            print(f"Revisando {Path(pdf).name}...")
-        for i, lista in verificar_filas(
-            estados, hay_combine, filas, duenios, len(securities)
+            print(f"Reviewing {Path(pdf).name}...")
+        for i, pdf_reasons in verify_rows(
+            statuses, has_combine, rows, owners, len(securities)
         ).items():
-            motivos[i].extend(lista)
+            reasons[i].extend(pdf_reasons)
 
-    bloqueados = 0
+    blocked = 0
     for i, sec in enumerate(securities):
-        if motivos[i]:
-            sec.bloqueo = "Sanctions Check NO PASS: " + "; ".join(motivos[i])
-            bloqueados += 1
+        if reasons[i]:
+            sec.block_reason = "Sanctions Check NO PASS: " + "; ".join(reasons[i])
+            blocked += 1
 
-    if bloqueados:
-        lineas = [f"SANCTIONS CHECK: {bloqueados} SECURITY(S) SIN PASS - NO SE TOCAN"]
+    if blocked:
+        lines = [f"SANCTIONS CHECK: {blocked} SECURITY(IES) WITHOUT PASS - NOT TOUCHED"]
         for i, sec in enumerate(securities):
-            if sec.bloqueo and motivos[i]:
-                lineas.append(f"- {sec.filas.get(21) or 'columna ' + str(sec.columna)}")
-                lineas.extend(f"    {m}" for m in motivos[i])
-        _alerta(lineas)
+            if sec.block_reason and reasons[i]:
+                lines.append(f"- {sec.rows.get(21) or 'column ' + str(sec.column)}")
+                lines.extend(f"    {m}" for m in reasons[i])
+        _alert(lines)
     else:
         print()
-        print(f"Sanctions Check: los {len(securities)} securities dicen PASS.")
+        print(f"Sanctions Check: all {len(securities)} securities say PASS.")
 
-    return bloqueados
+    return blocked

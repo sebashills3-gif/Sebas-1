@@ -1,175 +1,174 @@
-"""Etiqueta los códigos (CUSIP/ISIN) del Excel de salida y los envía al
-archivo BLR00441 - GDS BLOOMBOT (hoja "Request File") para lanzar la macro
-desde la hoja "Request Builder".
+"""Label the codes (CUSIP/ISIN) of the output Excel and send them to the
+BLR00441 - GDS BLOOMBOT workbook ("Request File" sheet), then launch the
+macro from the "Request Builder" sheet.
 
-Requiere Windows con Excel instalado y: pip install pandas openpyxl xlwings
+Requires Windows with Excel installed and: pip install pandas openpyxl xlwings
 """
 
 import pandas as pd
 
-NOMBRE_LIBRO = "BLR00441 - GDS BLOOMBOT"
-HOJA_REQUEST_FILE = "Request File"
-HOJA_REQUEST_BUILDER = "Request Builder"
+WORKBOOK_NAME = "BLR00441 - GDS BLOOMBOT"
+REQUEST_FILE_SHEET = "Request File"
+REQUEST_BUILDER_SHEET = "Request Builder"
 MACRO_SUBMIT = "creates_req"
 
 
-def _texto(valor):
-    """Devuelve el valor como texto limpio, o '' si está vacío."""
-    if pd.isna(valor):
+def _text(value):
+    """Return the value as clean text, or '' if it is empty."""
+    if pd.isna(value):
         return ""
-    return str(valor).strip()
+    return str(value).strip()
 
 
-def _columna(df, nombre):
-    """Busca una columna sin distinguir mayúsculas ni espacios."""
+def _column(df, name):
+    """Find a column ignoring case and surrounding spaces."""
     for col in df.columns:
-        if str(col).strip().lower() == nombre.lower():
+        if str(col).strip().lower() == name.lower():
             return col
-    raise KeyError(f"No se encontró la columna '{nombre}' en el Excel.")
+    raise KeyError(f"Column '{name}' was not found in the Excel file.")
 
 
-def etiquetar_codigo(codigo):
-    """8 o 9 caracteres -> 'X |CUSIP|'; 12 caracteres -> 'X |ISIN|'.
+def label_code(code):
+    """8 or 9 characters -> 'X |CUSIP|'; 12 characters -> 'X |ISIN|'.
 
-    Cualquier otra longitud devuelve None (no se puede identificar).
+    Any other length returns None (the code cannot be identified).
     """
-    if len(codigo) in (8, 9):
-        return f"{codigo} |CUSIP|"
-    if len(codigo) == 12:
-        return f"{codigo} |ISIN|"
+    if len(code) in (8, 9):
+        return f"{code} |CUSIP|"
+    if len(code) == 12:
+        return f"{code} |ISIN|"
     return None
 
 
-def obtener_codigos(ruta_excel):
-    """Lee el Excel de salida y devuelve (codigos_etiquetados, omitidos,
-    entidades).
+def get_codes(excel_path):
+    """Read the output Excel and return (labeled_codes, skipped, entities).
 
-    Toma la columna Name y, solo si la celda está vacía, la columna Cusip.
-    `entidades` va alineada con `codigos_etiquetados` (misma posición = misma
-    columna del XLS de BLOOMBOT): cada elemento es el conjunto de entidades
-    (columna Entity) de las que viene ese código.
+    It takes the Name column and, only when that cell is empty, the Cusip
+    column. `entities` is aligned with `labeled_codes` (same position = same
+    column of the BLOOMBOT XLS): each element is the set of entities (Entity
+    column) that code comes from.
     """
-    df = pd.read_excel(ruta_excel, dtype=str)
-    col_name = _columna(df, "Name")
-    col_cusip = _columna(df, "Cusip")
-    col_entity = _columna(df, "Entity")
+    df = pd.read_excel(excel_path, dtype=str)
+    col_name = _column(df, "Name")
+    col_cusip = _column(df, "Cusip")
+    col_entity = _column(df, "Entity")
 
-    # Primero se obtienen los códigos y se quitan duplicados (conservando
-    # el orden); la etiqueta |CUSIP| o |ISIN| se agrega después.
-    codigos = []
-    entidades_de = {}
-    for nombre, cusip, entidad in zip(
+    # First get the codes and remove duplicates (keeping the order); the
+    # |CUSIP| or |ISIN| label is added afterwards.
+    codes = []
+    entities_by_code = {}
+    for name, cusip, entity in zip(
         df[col_name], df[col_cusip], df[col_entity]
     ):
-        codigo = _texto(nombre) or _texto(cusip)
-        if codigo:
-            codigos.append(codigo)
-            entidades_de.setdefault(codigo.upper(), set()).add(
-                _texto(entidad).upper()
+        code = _text(name) or _text(cusip)
+        if code:
+            codes.append(code)
+            entities_by_code.setdefault(code.upper(), set()).add(
+                _text(entity).upper()
             )
 
-    unicos = list(dict.fromkeys(c.upper() for c in codigos))
-    if len(unicos) < len(codigos):
-        print(f"Duplicados eliminados: {len(codigos) - len(unicos)}")
+    unique = list(dict.fromkeys(c.upper() for c in codes))
+    if len(unique) < len(codes):
+        print(f"Duplicates removed: {len(codes) - len(unique)}")
 
-    etiquetados, omitidos, entidades = [], [], []
-    for codigo in unicos:
-        etiquetado = etiquetar_codigo(codigo)
-        if etiquetado is None:
-            omitidos.append(codigo)
+    labeled_codes, skipped, entities = [], [], []
+    for code in unique:
+        labeled = label_code(code)
+        if labeled is None:
+            skipped.append(code)
         else:
-            etiquetados.append(etiquetado)
-            entidades.append(entidades_de[codigo])
-    return etiquetados, omitidos, entidades
+            labeled_codes.append(labeled)
+            entities.append(entities_by_code[code])
+    return labeled_codes, skipped, entities
 
 
-def _buscar_hoja(libro, nombre, indice):
-    """Hoja por nombre; si no existe, por posición (1 = primera)."""
-    for hoja in libro.sheets:
-        if hoja.name.strip().lower() == nombre.lower():
-            return hoja
-    return libro.sheets[indice - 1]
+def _find_sheet(workbook, name, idx):
+    """Sheet by name; if it does not exist, by position (1 = first)."""
+    for sheet in workbook.sheets:
+        if sheet.name.strip().lower() == name.lower():
+            return sheet
+    return workbook.sheets[idx - 1]
 
 
-def _hacer_click_submit(hoja, macro=MACRO_SUBMIT):
-    """Ejecuta la macro del botón Submit (por defecto creates_req).
+def _click_submit(sheet, macro=MACRO_SUBMIT):
+    """Run the Submit button macro (creates_req by default).
 
-    Se llama con Application.Run calificando el libro, para que funcione
-    aunque haya otros libros abiertos. Si falla, se busca el botón Submit de
-    la hoja y se ejecuta la macro que tiene asignada.
+    It is called through Application.Run qualifying the workbook, so it
+    works even with other workbooks open. If that fails, the sheet's Submit
+    button is looked up and the macro assigned to it is run.
     """
-    libro = hoja.book
-    app = libro.app.api
-    errores = []
+    workbook = sheet.book
+    app = workbook.app.api
+    errors = []
 
     if macro:
-        for nombre in (f"'{libro.name}'!{macro}", macro):
+        for name in (f"'{workbook.name}'!{macro}", macro):
             try:
-                app.Run(nombre)
+                app.Run(name)
                 return
             except Exception as error:
-                errores.append(f"{nombre}: {error}")
+                errors.append(f"{name}: {error}")
 
-    for forma in hoja.api.Shapes:
+    for shape in sheet.api.Shapes:
         try:
-            texto = forma.TextFrame2.TextRange.Text
+            text = shape.TextFrame2.TextRange.Text
         except Exception:
             continue
-        if "submit" in texto.lower() and forma.OnAction:
-            app.Run(forma.OnAction.strip("'"))
+        if "submit" in text.lower() and shape.OnAction:
+            app.Run(shape.OnAction.strip("'"))
             return
 
     raise RuntimeError(
-        "No se pudo ejecutar la macro de Submit:\n" + "\n".join(errores)
+        "Could not run the Submit macro:\n" + "\n".join(errors)
     )
 
 
-def enviar_a_bloombot(codigos, macro=MACRO_SUBMIT, limpiar=True):
-    """Pega los códigos en Request File!A y pulsa Submit en Request Builder.
+def paste_and_submit(codes, macro=MACRO_SUBMIT, clear_first=True):
+    """Paste the codes into Request File!A and press Submit in Request Builder.
 
-    El libro BLR00441 - GDS BLOOMBOT debe estar ya abierto en Excel.
+    The BLR00441 - GDS BLOOMBOT workbook must already be open in Excel.
     """
     import xlwings as xw
 
-    libro = None
+    workbook = None
     for app in xw.apps:
-        for candidato in app.books:
-            if candidato.name.lower().startswith(NOMBRE_LIBRO.lower()):
-                libro = candidato
+        for candidate in app.books:
+            if candidate.name.lower().startswith(WORKBOOK_NAME.lower()):
+                workbook = candidate
                 break
-        if libro:
+        if workbook:
             break
-    if libro is None:
-        raise RuntimeError(f"El archivo '{NOMBRE_LIBRO}' no está abierto.")
+    if workbook is None:
+        raise RuntimeError(f"The file '{WORKBOOK_NAME}' is not open.")
 
-    request_file = _buscar_hoja(libro, HOJA_REQUEST_FILE, 3)
-    request_builder = _buscar_hoja(libro, HOJA_REQUEST_BUILDER, 1)
+    request_file = _find_sheet(workbook, REQUEST_FILE_SHEET, 3)
+    request_builder = _find_sheet(workbook, REQUEST_BUILDER_SHEET, 1)
 
-    if limpiar:
+    if clear_first:
         request_file.range("A:A").clear_contents()
 
-    rango = request_file.range(f"A1:A{len(codigos)}")
-    rango.number_format = "@"  # texto, para que Excel no altere los códigos
-    rango.value = [[codigo] for codigo in codigos]
+    cell_range = request_file.range(f"A1:A{len(codes)}")
+    cell_range.number_format = "@"  # text, so Excel does not alter the codes
+    cell_range.value = [[code] for code in codes]
 
     request_builder.activate()
-    _hacer_click_submit(request_builder, macro)
+    _click_submit(request_builder, macro)
 
 
-def procesar_y_enviar(ruta_excel, macro=MACRO_SUBMIT):
-    """Flujo completo a partir del Excel que genera la extracción.
+def process_and_send(excel_path, macro=MACRO_SUBMIT):
+    """Full flow starting from the Excel produced by the extraction.
 
-    Devuelve (cuántos códigos se enviaron, entidades de cada uno en el orden
-    de columnas del XLS), o None si no se envió ninguno.
+    Returns (how many codes were sent, entities of each one in the XLS
+    column order), or None if nothing was sent.
     """
-    codigos, omitidos, entidades = obtener_codigos(ruta_excel)
+    codes, skipped, entities = get_codes(excel_path)
 
-    if omitidos:
-        print(f"Códigos sin 8, 9 o 12 caracteres (no enviados): {omitidos}")
-    if not codigos:
-        print("No hay códigos válidos que enviar.")
+    if skipped:
+        print(f"Codes without 8, 9 or 12 characters (not sent): {skipped}")
+    if not codes:
+        print("There are no valid codes to send.")
         return
 
-    enviar_a_bloombot(codigos, macro=macro)
-    print(f"{len(codigos)} códigos enviados a {NOMBRE_LIBRO}.")
-    return len(codigos), entidades
+    paste_and_submit(codes, macro=macro)
+    print(f"{len(codes)} codes sent to {WORKBOOK_NAME}.")
+    return len(codes), entities

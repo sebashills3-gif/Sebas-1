@@ -1,11 +1,11 @@
-"""Después de correr la macro de BLOOMBOT:
+"""After running the BLOOMBOT macro:
 
-1. Espera los archivos GIMP*.xls y GIMP*.xps que se generan en la carpeta
-   DUMP y los mueve a la carpeta de evidencia.
-2. Lee del XLS los identificadores de cada security.
-3. Los pega en el libro abierto "PreStaging File" y lo guarda.
+1. Wait for the GIMP*.xls and GIMP*.xps files generated in the DUMP folder
+   and move them to the evidence folder.
+2. Read the identifiers of each security from the XLS.
+3. Paste them into the open "PreStaging File" workbook and save it.
 
-Requiere Windows con Excel y: pip install xlwings
+Requires Windows with Excel and: pip install xlwings
 """
 
 import re
@@ -14,166 +14,171 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-CARPETA_DUMP = Path(r"C:\Users\45502358\Desktop\DUMP")
+DUMP_FOLDER = Path(r"C:\Users\45502358\Desktop\DUMP")
 
-# Fila del XLS (1 = primera) donde está cada identificador. La columna A
-# trae los mnemonics y de la B en adelante hay un security por columna.
-FILAS_XLS = {
+# XLS row (1 = first) where each identifier is. Column A holds the
+# mnemonics and from column B onward there is one security per column.
+XLS_ROWS = {
     "ISIN": 21,
     "CUSIP": 22,
     "COMMON": 23,
     "FIGI_ID": 91,
 }
-# El SEDOL puede aparecer en cualquiera de estas filas (puede haber varios).
-FILAS_SEDOL = range(82, 87)
-# Valores que Bloomberg devuelve cuando no hay dato; no cuentan como SEDOL.
-SIN_DATO = ("#N/A", "N.A.", "N/A", "#NAME", "#VALUE", "#REF")
-ULTIMA_FILA_XLS = 102
+# The SEDOL can appear in any of these rows (there can be several).
+SEDOL_ROWS = range(82, 87)
+# Values Bloomberg returns when there is no data; they do not count as SEDOL.
+NO_DATA = ("#N/A", "N.A.", "N/A", "#NAME", "#VALUE", "#REF")
+LAST_XLS_ROW = 102
 
-# Columna del PreStaging File donde se pega cada identificador.
-COLUMNAS_PRESTAGING = {
+# PreStaging File column where each identifier is pasted.
+PRESTAGING_COLUMNS = {
     "ISIN": "C",
     "SEDOL": "G",
     "CUSIP": "K",
     "COMMON": "O",
     "FIGI_ID": "S",
 }
-FILA_INICIAL_PRESTAGING = 5
-NOMBRE_PRESTAGING = "PreStaging File"
+PRESTAGING_FIRST_ROW = 5
+PRESTAGING_NAME = "PreStaging File"
 
 
 # ============================================================
-# 1. ARCHIVOS DE DUMP
+# 1. DUMP FILES
 # ============================================================
 
-def buscar_archivos(cantidad, desde, dump=CARPETA_DUMP):
-    """Busca GIMPddmmyyhhmmss_<cantidad>.xls/.xps creados desde `desde`.
+def find_files(quantity, since, dump_folder=DUMP_FOLDER):
+    """Look for GIMPddmmyyhhmmss_<quantity>.xls/.xps created since `since`.
 
-    Devuelve {extensión: ruta} del grupo más reciente que tenga XLS.
+    Returns {extension: path} of the most recent group that has an XLS.
     """
-    patron = re.compile(rf"^GIMP(\d{{12}})_{cantidad}$", re.IGNORECASE)
-    grupos = {}
+    pattern = re.compile(rf"^GIMP(\d{{12}})_{quantity}$", re.IGNORECASE)
+    bundles = {}
 
-    if not Path(dump).exists():
+    if not Path(dump_folder).exists():
         return {}
 
-    for ruta in Path(dump).iterdir():
-        ext = ruta.suffix.lower()
-        coincide = patron.match(ruta.stem)
-        if ext not in (".xls", ".xps") or not coincide:
+    for file_path in Path(dump_folder).iterdir():
+        extension = file_path.suffix.lower()
+        matched = pattern.match(file_path.stem)
+        if extension not in (".xls", ".xps") or not matched:
             continue
         try:
-            marca = datetime.strptime(coincide.group(1), "%d%m%y%H%M%S")
+            stamp = datetime.strptime(matched.group(1), "%d%m%y%H%M%S")
         except ValueError:
             continue
-        if marca >= desde - timedelta(seconds=2):
-            grupos.setdefault((marca, ruta.stem), {})[ext] = ruta
+        if stamp >= since - timedelta(seconds=2):
+            bundles.setdefault((stamp, file_path.stem), {})[extension] = file_path
 
-    con_xls = [clave for clave, grupo in grupos.items() if ".xls" in grupo]
-    if not con_xls:
+    with_xls = [key for key, bundle in bundles.items() if ".xls" in bundle]
+    if not with_xls:
         return {}
-    return grupos[max(con_xls)]
+    return bundles[max(with_xls)]
 
 
-def _tamanos(archivos):
-    return {ext: ruta.stat().st_size for ext, ruta in archivos.items()}
+def _sizes(files):
+    return {
+        extension: file_path.stat().st_size
+        for extension, file_path in files.items()
+    }
 
 
-def esperar_archivos(cantidad, desde, dump=CARPETA_DUMP,
-                     timeout_s=300, gracia_xps_s=30, pausa_s=2):
-    """Espera a que aparezcan (y dejen de crecer) el XLS y el XPS.
+def wait_for_files(quantity, since, dump_folder=DUMP_FOLDER,
+                   timeout_s=300, xps_grace_s=30, pause_s=2):
+    """Wait for the XLS and the XPS to appear (and stop growing).
 
-    Si el XLS aparece pero el XPS no llega tras `gracia_xps_s`, sigue solo
-    con el XLS. Devuelve (xls, xps_o_None).
+    If the XLS appears but the XPS does not arrive after `xps_grace_s`, it
+    continues with the XLS only. Returns (xls, xps_or_None).
     """
-    inicio = time.time()
-    visto_xls = None
-    tamanos_previos = None
+    start_time = time.time()
+    xls_seen_at = None
+    previous_sizes = None
 
-    while time.time() - inicio < timeout_s:
-        archivos = buscar_archivos(cantidad, desde, dump)
+    while time.time() - start_time < timeout_s:
+        files = find_files(quantity, since, dump_folder)
 
-        if ".xls" in archivos:
-            if visto_xls is None:
-                visto_xls = time.time()
+        if ".xls" in files:
+            if xls_seen_at is None:
+                xls_seen_at = time.time()
 
-            tamanos = _tamanos(archivos)
-            estables = tamanos == tamanos_previos
-            tamanos_previos = tamanos
+            sizes = _sizes(files)
+            stable = sizes == previous_sizes
+            previous_sizes = sizes
 
-            if ".xps" in archivos and estables:
-                return archivos[".xls"], archivos[".xps"]
+            if ".xps" in files and stable:
+                return files[".xls"], files[".xps"]
 
-            if ".xps" not in archivos and estables \
-                    and time.time() - visto_xls > gracia_xps_s:
-                print("Aviso: no apareció el archivo XPS.")
-                return archivos[".xls"], None
+            if ".xps" not in files and stable \
+                    and time.time() - xls_seen_at > xps_grace_s:
+                print("Warning: the XPS file did not appear.")
+                return files[".xls"], None
 
-        time.sleep(pausa_s)
+        time.sleep(pause_s)
 
     raise TimeoutError(
-        f"No aparecieron los archivos GIMP*_{cantidad} en {dump} "
-        f"tras {timeout_s} segundos."
+        f"The GIMP*_{quantity} files did not appear in {dump_folder} "
+        f"after {timeout_s} seconds."
     )
 
 
-def mover_archivos(rutas, destino, intentos=10, pausa_s=2):
-    """Mueve los archivos a `destino`, reintentando si siguen en uso."""
-    destino = Path(destino)
-    destino.mkdir(parents=True, exist_ok=True)
-    nuevas = []
+def move_files(paths, destination, attempts=10, pause_s=2):
+    """Move the files to `destination`, retrying if they are still in use."""
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    new_paths = []
 
-    for ruta in rutas:
-        if ruta is None:
+    for file_path in paths:
+        if file_path is None:
             continue
-        for intento in range(1, intentos + 1):
+        for attempt in range(1, attempts + 1):
             try:
-                nuevas.append(Path(shutil.move(str(ruta), str(destino / ruta.name))))
+                new_paths.append(
+                    Path(shutil.move(str(file_path), str(destination / file_path.name)))
+                )
                 break
             except OSError:
-                if intento == intentos:
+                if attempt == attempts:
                     raise
-                time.sleep(pausa_s)
+                time.sleep(pause_s)
 
-    return nuevas
+    return new_paths
 
 
 # ============================================================
-# 2. LECTURA DEL XLS
+# 2. READING THE XLS
 # ============================================================
 
-def _a_texto(valor):
-    """Valor de celda como texto limpio, o None si está vacío."""
-    if valor is None:
+def _to_text(value):
+    """Cell value as clean text, or None if it is empty."""
+    if value is None:
         return None
-    if isinstance(valor, float) and valor.is_integer():
-        valor = int(valor)
-    texto = str(valor).strip()
-    return texto or None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip()
+    return text or None
 
 
-def _es_sedol(valor):
-    return valor is not None and not valor.upper().startswith(SIN_DATO)
+def _is_sedol(value):
+    return value is not None and not value.upper().startswith(NO_DATA)
 
 
-def extraer_securities(matriz):
-    """De la matriz de celdas (fila 1 = matriz[0]) saca un dict por security.
+def extract_securities(matrix):
+    """From the cell matrix (row 1 = matrix[0]) build one dict per security.
 
-    Cada columna desde la B es un security. "SEDOL" es una lista con los
-    SEDOL distintos de las filas 82 a 86, en el orden en que aparecen. Las
-    columnas vacías al final se descartan; las vacías intermedias se
-    conservan para no desalinear filas.
+    Each column from B onward is a security. "SEDOL" is a list with the
+    distinct SEDOLs of rows 82 to 86, in the order they appear. Empty
+    columns at the end are dropped; empty ones in the middle are kept so
+    rows do not get misaligned.
     """
-    columnas = len(matriz[0]) if matriz else 0
+    columns = len(matrix[0]) if matrix else 0
     securities = []
 
-    for col in range(1, columnas):
+    for col in range(1, columns):
         security = {
-            clave: _a_texto(matriz[fila - 1][col])
-            for clave, fila in FILAS_XLS.items()
+            key: _to_text(matrix[row - 1][col])
+            for key, row in XLS_ROWS.items()
         }
-        sedols = [_a_texto(matriz[fila - 1][col]) for fila in FILAS_SEDOL]
-        security["SEDOL"] = list(dict.fromkeys(v for v in sedols if _es_sedol(v)))
+        sedols = [_to_text(matrix[row - 1][col]) for row in SEDOL_ROWS]
+        security["SEDOL"] = list(dict.fromkeys(v for v in sedols if _is_sedol(v)))
         securities.append(security)
 
     while securities and not any(securities[-1].values()):
@@ -182,21 +187,21 @@ def extraer_securities(matriz):
     return securities
 
 
-def construir_filas(securities):
-    """Convierte los securities en las filas del PreStaging File.
+def build_rows(securities):
+    """Turn the securities into PreStaging File rows.
 
-    Primera fila de cada security: todos los identificadores y el primer
-    SEDOL. Por cada SEDOL adicional, una fila con el mismo ISIN, ese SEDOL
-    y el resto vacío.
+    First row of each security: all the identifiers and the first SEDOL.
+    For each additional SEDOL, a row with the same ISIN, that SEDOL and the
+    rest empty.
     """
-    filas = []
+    rows = []
 
     for security in securities:
         sedols = security["SEDOL"]
-        filas.append({**security, "SEDOL": sedols[0] if sedols else None})
+        rows.append({**security, "SEDOL": sedols[0] if sedols else None})
 
         for sedol in sedols[1:]:
-            filas.append({
+            rows.append({
                 "ISIN": security["ISIN"],
                 "SEDOL": sedol,
                 "CUSIP": None,
@@ -204,136 +209,136 @@ def construir_filas(securities):
                 "FIGI_ID": None,
             })
 
-    return filas
+    return rows
 
 
-def leer_matriz_xls(ruta):
-    """Abre el XLS en una instancia oculta de Excel y devuelve sus celdas
-    (filas 1 a ULTIMA_FILA_XLS; la fila 1 es matriz[0])."""
+def read_xls_matrix(file_path):
+    """Open the XLS in a hidden Excel instance and return its cells
+    (rows 1 to LAST_XLS_ROW; row 1 is matrix[0])."""
     import xlwings as xw
 
     app = xw.App(visible=False, add_book=False)
     try:
         app.display_alerts = False
-        libro = app.books.open(str(ruta), read_only=True, update_links=False)
-        hoja = libro.sheets[0]
-        ultima_col = max(hoja.used_range.last_cell.column, 2)
-        matriz = hoja.range((1, 1), (ULTIMA_FILA_XLS, ultima_col)) \
+        workbook = app.books.open(str(file_path), read_only=True, update_links=False)
+        sheet = workbook.sheets[0]
+        last_col = max(sheet.used_range.last_cell.column, 2)
+        matrix = sheet.range((1, 1), (LAST_XLS_ROW, last_col)) \
             .options(ndim=2).value
-        libro.close()
+        workbook.close()
     finally:
         app.quit()
 
-    print("Mnemonics leídos del XLS:")
-    for clave, fila in FILAS_XLS.items():
-        print(f"  {clave} (fila {fila}): {matriz[fila - 1][0]}")
-    for fila in FILAS_SEDOL:
-        print(f"  SEDOL (fila {fila}): {matriz[fila - 1][0]}")
+    print("Mnemonics read from the XLS:")
+    for key, row in XLS_ROWS.items():
+        print(f"  {key} (row {row}): {matrix[row - 1][0]}")
+    for row in SEDOL_ROWS:
+        print(f"  SEDOL (row {row}): {matrix[row - 1][0]}")
 
-    return matriz
+    return matrix
 
 
 # ============================================================
 # 3. PRESTAGING FILE
 # ============================================================
 
-def duenios_de_filas(securities):
-    """Para cada fila de construir_filas, el índice del security al que
-    pertenece."""
-    duenios = []
+def row_owners(securities):
+    """For each row of build_rows, the index of the security it belongs to."""
+    owners = []
     for i, security in enumerate(securities):
-        duenios.extend([i] * max(1, len(security["SEDOL"])))
-    return duenios
+        owners.extend([i] * max(1, len(security["SEDOL"])))
+    return owners
 
 
-def _para_excel(valor):
-    """None limpia la celda; los códigos solo con dígitos se guardan como
-    texto (apóstrofo) para no perder ceros a la izquierda."""
-    if valor is None:
+def _for_excel(value):
+    """None clears the cell; codes made only of digits are stored as text
+    (apostrophe) so leading zeros are not lost."""
+    if value is None:
         return None
-    return "'" + valor if valor.isdigit() else valor
+    return "'" + value if value.isdigit() else value
 
 
-def pegar_en_prestaging(securities, hoja=None):
-    """Pega los identificadores desde la fila 5 y guarda el libro.
+def paste_into_prestaging(securities, sheet=None):
+    """Paste the identifiers starting at row 5 and save the workbook.
 
-    Un security con varios SEDOL ocupa varias filas (ver construir_filas).
+    A security with several SEDOLs takes several rows (see build_rows).
 
-    Sobrescribe las celdas destino (si el valor viene vacío, la celda queda
-    vacía) y borra el contenido que hubiera más abajo en esas mismas
-    columnas, de corridas anteriores. `hoja` es el nombre de la hoja; por
-    defecto, la hoja activa.
+    It overwrites the destination cells (if the value is empty, the cell is
+    left empty) and clears any content further down in those same columns
+    left from previous runs. `sheet` is the sheet name; by default, the
+    active sheet.
     """
     import xlwings as xw
 
-    libro = None
+    workbook = None
     for app in xw.apps:
-        for candidato in app.books:
-            if NOMBRE_PRESTAGING.lower() in candidato.name.lower():
-                libro = candidato
+        for candidate in app.books:
+            if PRESTAGING_NAME.lower() in candidate.name.lower():
+                workbook = candidate
                 break
-        if libro:
+        if workbook:
             break
-    if libro is None:
-        raise RuntimeError(f"El archivo '{NOMBRE_PRESTAGING}' no está abierto.")
+    if workbook is None:
+        raise RuntimeError(f"The file '{PRESTAGING_NAME}' is not open.")
 
-    destino = libro.sheets[hoja] if hoja else libro.sheets.active
+    destination = workbook.sheets[sheet] if sheet else workbook.sheets.active
 
-    filas = construir_filas(securities)
+    rows = build_rows(securities)
 
-    for i, valores in enumerate(filas):
-        fila = FILA_INICIAL_PRESTAGING + i
-        for clave, columna in COLUMNAS_PRESTAGING.items():
-            destino.range(f"{columna}{fila}").value = _para_excel(valores[clave])
+    for i, values in enumerate(rows):
+        row = PRESTAGING_FIRST_ROW + i
+        for key, column in PRESTAGING_COLUMNS.items():
+            destination.range(f"{column}{row}").value = _for_excel(values[key])
 
-    # Limpia los restos de corridas anteriores (solo las 5 columnas de
-    # identificadores, y solo el contenido, no el formato).
-    primera_sobrante = FILA_INICIAL_PRESTAGING + len(filas)
-    ultima_fila = destino.used_range.last_cell.row
-    if ultima_fila >= primera_sobrante:
-        for columna in COLUMNAS_PRESTAGING.values():
-            destino.range(
-                f"{columna}{primera_sobrante}:{columna}{ultima_fila}"
+    # Clear leftovers from previous runs (only the 5 identifier columns, and
+    # only the content, not the formatting).
+    first_leftover_row = PRESTAGING_FIRST_ROW + len(rows)
+    last_row = destination.used_range.last_cell.row
+    if last_row >= first_leftover_row:
+        for column in PRESTAGING_COLUMNS.values():
+            destination.range(
+                f"{column}{first_leftover_row}:{column}{last_row}"
             ).clear_contents()
 
-    libro.save()
+    workbook.save()
     print(
-        f"{len(securities)} securities ({len(filas)} filas) pegados en "
-        f"'{libro.name}' (hoja '{destino.name}') y archivo guardado."
+        f"{len(securities)} securities ({len(rows)} rows) pasted into "
+        f"'{workbook.name}' (sheet '{destination.name}') and file saved."
     )
 
 
 # ============================================================
-# FLUJO COMPLETO
+# FULL FLOW
 # ============================================================
 
-def procesar_gimp(cantidad, desde, carpeta_evidencia, dump=CARPETA_DUMP,
-                  hoja=None):
-    """Mueve los GIMP de DUMP a la evidencia y llena el PreStaging File.
+def process_gimp(quantity, since, evidence_folder, dump_folder=DUMP_FOLDER,
+                 sheet=None):
+    """Move the GIMP files from DUMP to the evidence folder and fill the
+    PreStaging File.
 
-    Devuelve las celdas del XLS (para clasificar los securities), o None si
-    el XLS no trajo securities.
+    Returns the XLS cells (to classify the securities), or None if the XLS
+    had no securities.
     """
     print()
-    print(f"Esperando archivos GIMP*_{cantidad} en {dump}...", flush=True)
-    xls, xps = esperar_archivos(cantidad, desde, dump)
+    print(f"Waiting for GIMP*_{quantity} files in {dump_folder}...", flush=True)
+    xls, xps = wait_for_files(quantity, since, dump_folder)
 
-    movidos = mover_archivos([xls, xps], carpeta_evidencia)
-    for ruta in movidos:
-        print(f"Archivo movido: {ruta}")
+    moved = move_files([xls, xps], evidence_folder)
+    for file_path in moved:
+        print(f"File moved: {file_path}")
 
-    xls_movido = next(r for r in movidos if r.suffix.lower() == ".xls")
-    matriz = leer_matriz_xls(xls_movido)
-    securities = extraer_securities(matriz)
+    moved_xls = next(r for r in moved if r.suffix.lower() == ".xls")
+    matrix = read_xls_matrix(moved_xls)
+    securities = extract_securities(matrix)
 
-    if len(securities) != cantidad:
+    if len(securities) != quantity:
         print(
-            f"Aviso: se enviaron {cantidad} securities a BLOOMBOT pero el "
-            f"XLS trae {len(securities)} columnas con datos."
+            f"Warning: {quantity} securities were sent to BLOOMBOT but the "
+            f"XLS has {len(securities)} columns with data."
         )
     if not securities:
-        print("El XLS no trae securities; no se pega nada.")
+        print("The XLS has no securities; nothing is pasted.")
         return None
 
-    pegar_en_prestaging(securities, hoja=hoja)
-    return matriz
+    paste_into_prestaging(securities, sheet=sheet)
+    return matrix

@@ -1,9 +1,11 @@
-"""Alta de securities del skeleton 5/80 en IMPACT (pantallas NSEX02 a NSEX05).
+"""Creation of securities in IMPACT (screens NSEX02 to NSEX05) for the
+skeletons listed in IMPACT_CONFIG (5/80 and EUR 3/01).
 
-Para cada security: se navega con changeProgram, se elige mercado 5 e
-instrumento 80, se llenan las pantallas con los datos ya limpios (ver
-skeletons.py), se resuelven los warnings y errores conocidos y se deja la
-pantalla NSEX05 lista. El guardado lo hace la persona a mano.
+For each security: navigate with changeProgram (the first time), choose the
+market and instrument of its skeleton, fill the screens with the already
+cleaned data (see skeletons.py), resolve the known warnings and errors and
+leave the NSEX05 screen ready. Saving is done by the person by hand, unless
+auto-save is requested.
 """
 
 import calendar
@@ -12,50 +14,58 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime
 
-PROGRAMA = ("NSEX", "HBSI", "")
-# Solo se CREAN los securities de estas entidades; los demás se corren en
-# todo el flujo previo pero no se dan de alta.
-ENTIDADES_ALTA = {"HBSI"}
+PROGRAM = ("NSEX", "HBSI", "")
+# Only the securities of these entities are CREATED; the others go through
+# the whole previous flow but are not created.
+ENTITIES_TO_CREATE = {"HBSI"}
 
 
 @dataclass(frozen=True)
-class ConfigImpact:
-    """Cómo se da de alta en IMPACT cada skeleton."""
-    mercado: str
-    instrumento: str
-    moneda: str = None          # casilla ici_selectCurrency; None = no se toca
-    llena_nsex05: bool = True   # False: en NSEX05 no se captura nada
+class ImpactConfig:
+    """How each skeleton is created in IMPACT."""
+    market: str
+    instrument: str
+    currency: str = None        # ici_selectCurrency box; None = not touched
+    fills_nsex05: bool = True   # False: nothing is entered in NSEX05
 
 
-# Skeletons que sabe crear IMPACT (el nombre es el de skeletons.SKELETONS).
-CONFIG_IMPACT = {
-    "5/80": ConfigImpact(mercado="5", instrumento="80"),
-    "EUR 3/01": ConfigImpact(
-        mercado="3", instrumento="01", moneda="EUR", llena_nsex05=False
+# Skeletons IMPACT knows how to create (the key is the name used in
+# skeletons.SKELETONS).
+IMPACT_CONFIG = {
+    "5/80": ImpactConfig(market="5", instrument="80"),
+    "EUR 3/01": ImpactConfig(
+        market="3", instrument="01", currency="EUR", fills_nsex05=False
     ),
 }
 
-PAUSA_TRAS_ENTER_S = 1.5
-MAX_ENTER_POR_PANTALLA = 12
-MAX_REINTENTOS_POR_ERROR = 2
+PAUSE_AFTER_ENTER_S = 1.5
+MAX_ENTERS_PER_SCREEN = 12
+MAX_RETRIES_PER_ERROR = 2
 
-# Campo que identifica cada pantalla.
-HUELLAS_PANTALLA = (
+# Field that identifies each screen.
+SCREEN_FINGERPRINTS = (
     ("NSEX05", "ici_trailerCode"),
     ("NSEX03", "ici_informationCommonStrikePrice"),
     ("NSEX02", "ici_securityName"),
-    ("SELECCION", "ici_selectMarket"),
+    ("SELECTION", "ici_selectMarket"),
 )
 
-FRECUENCIAS = {1: "A", 2: "S", 4: "Q", 12: "M"}
-MESES_POR_FRECUENCIA = {"A": 12, "S": 6, "Q": 3, "M": 1}
+FREQUENCIES = {1: "A", 2: "S", 4: "Q", 12: "M"}
+MONTHS_BY_FREQUENCY = {"A": 12, "S": 6, "Q": 3, "M": 1}
 
-# Alias de mnemonic en la columna A del XLS.
+# Mnemonic aliases in column A of the XLS.
 ALIAS = {
     "NAME": ("NAME",),
     "ID_BB": ("ID_BB", "ID_BB_UNIQUE"),
     "ID_COMMON": ("ID_COMMON", "COMMON"),
 }
+
+# Result labels shown in the final summary.
+AUTO_SAVED = "Created (auto-saved)"
+CONFIRMED_SAVED = "Saved (confirmed by you)"
+PREPARED = "Prepared, not saved"
+FAILED = "Error"
+NOT_TAKEN = "Not taken"
 
 
 class ImpactError(Exception):
@@ -63,19 +73,19 @@ class ImpactError(Exception):
 
 
 # ============================================================
-# DATOS DEL SECURITY
+# SECURITY DATA
 # ============================================================
 
-def _es_na(valor):
-    """Valor que Bloomberg devuelve cuando no hay dato."""
-    if valor is None:
+def _is_na(value):
+    """Value Bloomberg returns when there is no data."""
+    if value is None:
         return True
-    return str(valor).strip().upper().startswith(("#N/A", "N.A.", "N/A"))
+    return str(value).strip().upper().startswith(("#N/A", "N.A.", "N/A"))
 
 
 @dataclass
-class Datos:
-    """Valores ya limpios de un security, tal como se capturan en IMPACT."""
+class ImpactData:
+    """Already cleaned values of a security, as they are entered in IMPACT."""
     security_des: str = None
     name: str = None
     isin: str = None
@@ -93,79 +103,79 @@ class Datos:
     first_cpn: str = None
     call_dt: str = None
     call_px: str = None
-    frecuencia: str = None
+    frequency: str = None
     crncy: str = None
-    avisos: list = None
+    notices: list = None
 
 
-def construir_datos(sec):
-    """Datos de IMPACT a partir de un Security ya limpiado (skeletons.py)."""
-    fila_de = {}
-    for fila, mnemonic in sec.mnemonics.items():
-        fila_de.setdefault(mnemonic.strip().upper(), fila)
+def build_data(sec):
+    """IMPACT data from an already cleaned Security (skeletons.py)."""
+    row_of = {}
+    for row, mnemonic in sec.mnemonics.items():
+        row_of.setdefault(mnemonic.strip().upper(), row)
 
-    avisos = []
+    notices = []
 
-    def valor(*nombres, conservar_na=False):
-        for nombre in nombres:
-            fila = fila_de.get(nombre)
-            if fila is not None:
-                v = sec.filas.get(fila)
+    def value(*names, keep_na=False):
+        for name in names:
+            row = row_of.get(name)
+            if row is not None:
+                v = sec.rows.get(row)
                 if v is None:
                     return None
                 v = str(v).strip()
-                if not v or (_es_na(v) and not conservar_na):
+                if not v or (_is_na(v) and not keep_na):
                     return None
                 return v
-        avisos.append(f"No se encontró el mnemonic {nombres[0]} en el XLS.")
+        notices.append(f"The mnemonic {names[0]} was not found in the XLS.")
         return None
 
-    security_des = valor("SECURITY_DES")
-    cusip = valor("ID_CUSIP")  # el final: si se derivó del ISIN, ese
+    security_des = value("SECURITY_DES")
+    cusip = value("ID_CUSIP")  # the final one: the ISIN-derived one if applicable
 
-    bb = valor(*ALIAS["ID_BB"])
-    common = valor(*ALIAS["ID_COMMON"])
-    # ID_COMMON solo cuando ID_BB es igual al CUSIP que se va a capturar
-    # (el derivado del ISIN cuando aplica; si no, el ID_CUSIP del XLS).
+    bb = value(*ALIAS["ID_BB"])
+    common = value(*ALIAS["ID_COMMON"])
+    # ID_COMMON only when ID_BB equals the CUSIP that will be entered (the
+    # ISIN-derived one when applicable; otherwise the XLS ID_CUSIP).
     nickname = common if (bb is not None and bb == cusip) else bb
 
-    series = (valor("SERIES") or "").upper()
+    series = (value("SERIES") or "").upper()
 
-    frecuencia = None
-    cpn_freq = valor("CPN_FREQ")
+    frequency = None
+    cpn_freq = value("CPN_FREQ")
     if cpn_freq is not None:
         try:
-            frecuencia = FRECUENCIAS.get(int(float(cpn_freq)))
+            frequency = FREQUENCIES.get(int(float(cpn_freq)))
         except ValueError:
             pass
-        if frecuencia is None:
-            avisos.append(f"CPN_FREQ '{cpn_freq}' no es 1, 2, 4 ni 12.")
+        if frequency is None:
+            notices.append(f"CPN_FREQ '{cpn_freq}' is not 1, 2, 4 or 12.")
 
-    return Datos(
+    return ImpactData(
         security_des=security_des,
-        name=valor(*ALIAS["NAME"]),
-        isin=valor("ID_ISIN"),
+        name=value(*ALIAS["NAME"]),
+        isin=value("ID_ISIN"),
         cusip=cusip,
-        cpn=valor("CPN", conservar_na=True),
-        maturity=valor("MATURITY"),
-        day_count=sec.derivados.get("DAY COUNT"),
-        year_basis=sec.derivados.get("YEAR BASIS"),
+        cpn=value("CPN", keep_na=True),
+        maturity=value("MATURITY"),
+        day_count=sec.derived.get("DAY COUNT"),
+        year_basis=sec.derived.get("YEAR BASIS"),
         commodity=(security_des or "")[:4] or None,
         nickname=nickname,
         series=series,
-        country=valor("CNTRY_OF_INCORPORATION"),
-        int_acc=valor("INT_ACC_DT"),
-        issue_dt=valor("ISSUE_DT"),
-        first_cpn=valor("FIRST_CPN_DT"),
-        call_dt=valor("NXT_CALL_DT"),
-        call_px=valor("NXT_CALL_PX"),
-        frecuencia=frecuencia,
-        crncy=(valor("CRNCY") or "").upper(),
-        avisos=avisos,
+        country=value("CNTRY_OF_INCORPORATION"),
+        int_acc=value("INT_ACC_DT"),
+        issue_dt=value("ISSUE_DT"),
+        first_cpn=value("FIRST_CPN_DT"),
+        call_dt=value("NXT_CALL_DT"),
+        call_px=value("NXT_CALL_PX"),
+        frequency=frequency,
+        crncy=(value("CRNCY") or "").upper(),
+        notices=notices,
     )
 
 
-def campos_nsex02(d):
+def nsex02_fields(d):
     return {
         "ici_securityName": d.security_des,
         "ici_description1": d.name,
@@ -182,7 +192,7 @@ def campos_nsex02(d):
     }
 
 
-def campos_nsex03(d):
+def nsex03_fields(d):
     return {
         "ici_informationCommonStrikePrice": d.cpn,
         "ici_informationMaturity": d.maturity,
@@ -195,430 +205,425 @@ def campos_nsex03(d):
         "ici_informationIssueCommodityCode": d.commodity,
         "ici_elig144a": "Y" if d.series == "144A" else None,
         "ici_RegS": "Y" if d.series == "REGS" else None,
-        "ici_paymentFrequencyCode": d.frecuencia,
+        "ici_paymentFrequencyCode": d.frequency,
     }
 
 
-def campos_nsex05(d):
-    """Solo los campos que aplican; los demás no se tocan."""
-    campos = {}
+def nsex05_fields(d):
+    """Only the fields that apply; the others are not touched."""
+    fields = {}
     if "HSBC" in (d.security_des or "").upper():
-        campos["ici_trailerCode"] = "REP"
+        fields["ici_trailerCode"] = "REP"
     if d.crncy == "USD" and (d.isin or "").upper().startswith("XS"):
-        campos["ici_depositoryAccountPointer"] = "FORG"
-    return campos
+        fields["ici_depositoryAccountPointer"] = "FORG"
+    return fields
 
 
 # ============================================================
-# ACCESO A LA PÁGINA
+# PAGE ACCESS
 # ============================================================
 
-def _selector(nombre):
-    return f'[name="{nombre}"], [id="{nombre}"]'
+def _selector(name):
+    return f'[name="{name}"], [id="{name}"]'
 
 
-def _buscar_campo(page, nombre):
-    """Campo por name o id, en la página y en todos sus iframes."""
+def _find_field(page, name):
+    """Field by name or id, in the page and in all its iframes."""
     for frame in page.frames:
         try:
-            localizador = frame.locator(_selector(nombre))
-            if localizador.count():
-                return localizador.first
+            matches = frame.locator(_selector(name))
+            if matches.count():
+                return matches.first
         except Exception:
             continue
     return None
 
 
-def _esperar_campo(page, nombre, timeout_s=15):
-    inicio = time.time()
+def _wait_for_field(page, name, timeout_s=15):
+    start_time = time.time()
     while True:
-        campo = _buscar_campo(page, nombre)
-        if campo is not None:
-            return campo
-        if time.time() - inicio >= timeout_s:
+        input_field = _find_field(page, name)
+        if input_field is not None:
+            return input_field
+        if time.time() - start_time >= timeout_s:
             return None
         time.sleep(0.5)
 
 
-def poner_valor(page, nombre, valor):
-    """Escribe el valor en el campo (None lo deja vacío)."""
-    campo = _esperar_campo(page, nombre)
-    if campo is None:
-        raise ImpactError(f"No se encontró el campo {nombre} en la página.")
+def set_value(page, name, value):
+    """Write the value into the field (None leaves it empty)."""
+    input_field = _wait_for_field(page, name)
+    if input_field is None:
+        raise ImpactError(f"The field {name} was not found on the page.")
 
-    texto = "" if valor is None else str(valor)
-    if campo.evaluate("e => e.tagName") == "SELECT":
-        campo.select_option(texto)
+    text = "" if value is None else str(value)
+    if input_field.evaluate("e => e.tagName") == "SELECT":
+        input_field.select_option(text)
     else:
-        campo.fill(texto)
+        input_field.fill(text)
 
 
-def llenar(page, campos):
-    for nombre, valor in campos.items():
-        poner_valor(page, nombre, valor)
+def fill_fields(page, fields):
+    for name, value in fields.items():
+        set_value(page, name, value)
 
 
-def _esperar_pagina_lista(page, timeout_ms=15000):
-    for estado in ("domcontentloaded", "load"):
+def _wait_page_ready(page, timeout_ms=15000):
+    for state in ("domcontentloaded", "load"):
         try:
-            page.wait_for_load_state(estado, timeout=timeout_ms)
+            page.wait_for_load_state(state, timeout=timeout_ms)
         except Exception:
             pass
 
 
-def enter(page, campo_ancla=None):
-    """Da Enter (desde un campo de la pantalla, si se indica) y espera."""
-    campo = _buscar_campo(page, campo_ancla) if campo_ancla else None
-    if campo is not None:
-        campo.press("Enter")
+def enter(page, anchor_field=None):
+    """Press Enter (from a field of the screen, if given) and wait."""
+    input_field = _find_field(page, anchor_field) if anchor_field else None
+    if input_field is not None:
+        input_field.press("Enter")
     else:
         page.keyboard.press("Enter")
-    time.sleep(PAUSA_TRAS_ENTER_S)
-    _esperar_pagina_lista(page)
+    time.sleep(PAUSE_AFTER_ENTER_S)
+    _wait_page_ready(page)
 
 
-def leer_texto(page):
-    partes = []
+def read_text(page):
+    parts = []
     for frame in page.frames:
         try:
-            partes.append(frame.locator("body").inner_text(timeout=5000))
+            parts.append(frame.locator("body").inner_text(timeout=5000))
         except Exception:
             continue
-    return "\n".join(partes)
+    return "\n".join(parts)
 
 
-def pantalla_actual(page):
-    """NSEX02, NSEX03, NSEX05, SELECCION; NSEX04 y NSEX06 solo si su nombre
-    aparece en el texto; None si no se reconoce."""
-    for nombre, campo in HUELLAS_PANTALLA:
-        if _buscar_campo(page, campo) is not None:
-            return nombre
+def current_screen(page):
+    """NSEX02, NSEX03, NSEX05, SELECTION; NSEX04 and NSEX06 only if their
+    name appears in the text; None if not recognized."""
+    for name, input_field in SCREEN_FINGERPRINTS:
+        if _find_field(page, input_field) is not None:
+            return name
 
-    coincide = re.search(r"NSEX0[1-6]", leer_texto(page).upper())
-    return coincide.group(0) if coincide else None
+    matched = re.search(r"NSEX0[1-6]", read_text(page).upper())
+    return matched.group(0) if matched else None
 
 
-def esperar_pantalla(page, nombre, timeout_s=30):
-    inicio = time.time()
-    while time.time() - inicio < timeout_s:
-        if pantalla_actual(page) == nombre:
+def wait_for_screen(page, name, timeout_s=30):
+    start_time = time.time()
+    while time.time() - start_time < timeout_s:
+        if current_screen(page) == name:
             return
         time.sleep(0.5)
     raise ImpactError(
-        f"No se llegó a la pantalla {nombre} "
-        f"(pantalla actual: {pantalla_actual(page)})."
+        f"The screen {name} was not reached "
+        f"(current screen: {current_screen(page)})."
     )
 
 
 # ============================================================
-# NAVEGACIÓN
+# NAVIGATION
 # ============================================================
 
-def ir_a_seleccion(page):
-    """Ejecuta changeProgram en el frame que lo define y espera la pantalla
-    de selección de mercado e instrumento."""
+def go_to_selection(page):
+    """Run changeProgram in the frame that defines it and wait for the
+    market and instrument selection screen."""
     for frame in page.frames:
         try:
-            definido = frame.evaluate("typeof changeProgram") == "function"
+            defined = frame.evaluate("typeof changeProgram") == "function"
         except Exception:
             continue
-        if definido:
+        if defined:
             try:
                 frame.evaluate(
-                    "([a, b, c]) => changeProgram(a, b, c)", list(PROGRAMA)
+                    "([a, b, c]) => changeProgram(a, b, c)", list(PROGRAM)
                 )
-            except Exception as error:  # la página puede navegar al llamarlo
+            except Exception as error:  # the page may navigate when calling it
                 if "context was destroyed" not in str(error).lower() \
                         and "navigation" not in str(error).lower():
                     raise
             break
     else:
-        raise ImpactError("No se encontró changeProgram en la página de IMPACT.")
+        raise ImpactError("changeProgram was not found on the IMPACT page.")
 
-    if _esperar_campo(page, "ici_selectMarket", timeout_s=30) is None:
-        raise ImpactError("No apareció la pantalla de selección de mercado.")
+    if _wait_for_field(page, "ici_selectMarket", timeout_s=30) is None:
+        raise ImpactError("The market selection screen did not appear.")
 
 
-def _anio_cuatro_digitos(texto):
+def _four_digit_year(text):
     """ISSUER 5.0 12/03/26 -> ISSUER 5.0 12/03/2026."""
-    return re.sub(r"(\d{1,2}/\d{1,2}/)(\d{2})(?!\d)", r"\g<1>20\2", texto or "")
+    return re.sub(r"(\d{1,2}/\d{1,2}/)(\d{2})(?!\d)", r"\g<1>20\2", text or "")
 
 
-def _restar_meses(fecha, meses):
-    indice = fecha.year * 12 + (fecha.month - 1) - meses
-    anio, mes = divmod(indice, 12)
-    mes += 1
-    dia = min(fecha.day, calendar.monthrange(anio, mes)[1])
-    return date(anio, mes, dia)
+def _subtract_months(dt, months):
+    idx = dt.year * 12 + (dt.month - 1) - months
+    year_value, month_value = divmod(idx, 12)
+    month_value += 1
+    day_value = min(dt.day, calendar.monthrange(year_value, month_value)[1])
+    return date(year_value, month_value, day_value)
 
 
-# --- Errores conocidos: texto del error -> corrección -------------------
+# --- Known errors: error text -> fix ------------------------------------
 
-def _corregir_sort_duplicado(page, d):
-    """Sort suffix = CUSIP sin los 2 primeros ni el último, y año de 4
-    dígitos en el nombre. La fecha con año de 2 dígitos puede estar en el
-    security name (ici_securityName) o en description1, así que se corrigen
-    ambos."""
-    poner_valor(page, "ici_sortSuffix", (d.cusip or "")[2:-1])
+def _fix_duplicate_sort(page, d):
+    """Sort suffix = CUSIP without its first 2 and last characters, and a
+    4-digit year in the name. The date with a 2-digit year may be in the
+    security name (ici_securityName) or in description1, so both are
+    fixed."""
+    set_value(page, "ici_sortSuffix", (d.cusip or "")[2:-1])
 
-    d.security_des = _anio_cuatro_digitos(d.security_des)
-    poner_valor(page, "ici_securityName", d.security_des)
+    d.security_des = _four_digit_year(d.security_des)
+    set_value(page, "ici_securityName", d.security_des)
 
-    d.name = _anio_cuatro_digitos(d.name)
-    poner_valor(page, "ici_description1", d.name)
+    d.name = _four_digit_year(d.name)
+    set_value(page, "ici_description1", d.name)
 
 
-def _corregir_commodity(page, d):
+def _fix_commodity(page, d):
     d.commodity = (d.name or "")[:4]
-    poner_valor(page, "ici_sortIssueCommodityCodePart1", d.commodity)
+    set_value(page, "ici_sortIssueCommodityCodePart1", d.commodity)
 
 
-def _corregir_nickname(page, d):
+def _fix_nickname(page, d):
     d.nickname = None
-    poner_valor(page, "ici_nickname", None)
+    set_value(page, "ici_nickname", None)
 
 
-def _corregir_cupon(page, d):
+def _fix_coupon(page, d):
     d.cpn = "0"
-    poner_valor(page, "ici_sortCouponStrikePrice", "0")
+    set_value(page, "ici_sortCouponStrikePrice", "0")
 
 
-def _corregir_penultimo_cupon(page, d):
-    meses = MESES_POR_FRECUENCIA.get(d.frecuencia)
-    if meses is None or not d.maturity:
+def _fix_next_to_last_coupon(page, d):
+    months = MONTHS_BY_FREQUENCY.get(d.frequency)
+    if months is None or not d.maturity:
         raise ImpactError(
-            "No se puede calcular NEXT TO LAST COUPON DATE "
-            "(falta MATURITY o CPN_FREQ válido)."
+            "NEXT TO LAST COUPON DATE cannot be calculated "
+            "(MATURITY or a valid CPN_FREQ is missing)."
         )
-    vencimiento = datetime.strptime(d.maturity, "%m%d%Y").date()
-    poner_valor(
+    maturity_date = datetime.strptime(d.maturity, "%m%d%Y").date()
+    set_value(
         page,
         "ici_nextToLastCouponDate",
-        _restar_meses(vencimiento, meses).strftime("%m%d%Y"),
+        _subtract_months(maturity_date, months).strftime("%m%d%Y"),
     )
 
 
-ERRORES_NSEX02 = {
-    "DUPLICATE SORT SEQUENCE NOT ALLOWED": _corregir_sort_duplicado,
-    "INVALID ISSUE/COMMODITY CODE ENTRY": _corregir_commodity,
-    "DUPLICATE NICKNAME NOT ALLOWED": _corregir_nickname,
-    "INVALID COUPON/STRIKE PRICE": _corregir_cupon,
+NSEX02_ERRORS = {
+    "DUPLICATE SORT SEQUENCE NOT ALLOWED": _fix_duplicate_sort,
+    "INVALID ISSUE/COMMODITY CODE ENTRY": _fix_commodity,
+    "DUPLICATE NICKNAME NOT ALLOWED": _fix_nickname,
+    "INVALID COUPON/STRIKE PRICE": _fix_coupon,
 }
 
-ERRORES_NSEX03 = {
-    "NEXT TO LAST COUPON DATE ENTRY REQUIRED": _corregir_penultimo_cupon,
+NSEX03_ERRORS = {
+    "NEXT TO LAST COUPON DATE ENTRY REQUIRED": _fix_next_to_last_coupon,
 }
 
 
-def avanzar(page, origen, destino, errores, datos, campo_ancla=None):
-    """Da Enter hasta llegar a `destino`: repite ante warnings y corrige los
-    errores conocidos. Un error desconocido (o que no se corrige) detiene
-    el security con ImpactError."""
-    repeticiones = {}
+def advance(page, origin, destination, errors, data, anchor_field=None):
+    """Press Enter until `destination` is reached: repeat on warnings and fix
+    the known errors. An unknown error (or one that does not get fixed)
+    stops the security with ImpactError."""
+    repetitions = {}
 
-    for _ in range(MAX_ENTER_POR_PANTALLA):
-        enter(page, campo_ancla)
-        pantalla = pantalla_actual(page)
+    for _ in range(MAX_ENTERS_PER_SCREEN):
+        enter(page, anchor_field)
+        screen = current_screen(page)
 
-        if pantalla == destino:
+        if screen == destination:
             return
-        if destino == "NSEX04" and pantalla not in (origen, "NSEX05"):
-            return  # NSEX04 no tiene campos propios con los que reconocerla
-        if destino == "NSEX06" and pantalla != origen:
-            return  # ni NSEX06; basta con que la pantalla ya no sea el origen
+        if destination == "NSEX04" and screen not in (origin, "NSEX05"):
+            return  # NSEX04 has no fields of its own to recognize it by
+        if destination == "NSEX06" and screen != origin:
+            return  # neither does NSEX06; it is enough that the screen changed
 
-        mensajes = re.findall(r"ERROR:?\s*([^\n\r]+)", leer_texto(page).upper())
-        if not mensajes:
-            continue  # warning: se vuelve a dar Enter
+        messages = re.findall(r"ERROR:?\s*([^\n\r]+)", read_text(page).upper())
+        if not messages:
+            continue  # warning: press Enter again
 
-        for mensaje in mensajes:
-            for patron, corregir in errores.items():
-                if patron in mensaje:
-                    repeticiones[patron] = repeticiones.get(patron, 0) + 1
-                    if repeticiones[patron] > MAX_REINTENTOS_POR_ERROR:
+        for message in messages:
+            for pattern, fix in errors.items():
+                if pattern in message:
+                    repetitions[pattern] = repetitions.get(pattern, 0) + 1
+                    if repetitions[pattern] > MAX_RETRIES_PER_ERROR:
                         raise ImpactError(
-                            f"El error '{patron}' sigue apareciendo tras "
-                            "corregirlo."
+                            f"The error '{pattern}' keeps appearing after "
+                            "fixing it."
                         )
-                    corregir(page, datos)
+                    fix(page, data)
                     break
             else:
-                raise ImpactError(f"Error no manejado en {origen}: {mensaje}")
+                raise ImpactError(f"Unhandled error in {origin}: {message}")
 
-    raise ImpactError(f"No se pudo avanzar de {origen} a {destino}.")
+    raise ImpactError(f"Could not advance from {origin} to {destination}.")
 
 
 # ============================================================
-# ALTA DE UN SECURITY
+# CREATING ONE SECURITY
 # ============================================================
 
-def _ya_en_seleccion(page, timeout_s=20):
-    """True si la pantalla de selección de mercado e instrumento ya está
-    abierta (después de guardar un security IMPACT vuelve a ella)."""
-    return _esperar_campo(page, "ici_selectMarket", timeout_s=timeout_s) is not None
+def _already_on_selection(page, timeout_s=20):
+    """True if the market and instrument selection screen is already open
+    (after saving a security IMPACT goes back to it)."""
+    return _wait_for_field(page, "ici_selectMarket", timeout_s=timeout_s) is not None
 
 
-def guardar_automaticamente(page, d):
-    """Da Enter en NSEX05 (guarda), luego en NSEX06, y espera a que IMPACT
-    regrese a la pantalla de selección."""
-    avanzar(page, "NSEX05", "NSEX06", {}, d, campo_ancla="ici_trailerCode")
+def save_automatically(page, d):
+    """Press Enter on NSEX05 (saves), then on NSEX06, and wait for IMPACT to
+    go back to the selection screen."""
+    advance(page, "NSEX05", "NSEX06", {}, d, anchor_field="ici_trailerCode")
 
-    if pantalla_actual(page) != "SELECCION":
-        avanzar(page, "NSEX06", "SELECCION", {}, d)
+    if current_screen(page) != "SELECTION":
+        advance(page, "NSEX06", "SELECTION", {}, d)
 
 
-def alta_security(page, sec, ya_en_seleccion=False, guardado_automatico=False):
-    """Llena NSEX02 a NSEX05 para un security de un skeleton de CONFIG_IMPACT
-    y deja la última pantalla sin guardar (o, con `guardado_automatico`, la guarda dando Enter en NSEX05
-    y NSEX06). Devuelve los avisos de datos faltantes (lista).
+def create_security(page, sec, already_on_selection=False, auto_save=False):
+    """Fill NSEX02 to NSEX05 for a security of a skeleton in IMPACT_CONFIG
+    and leave the last screen unsaved (or, with `auto_save`, save it by
+    pressing Enter on NSEX05 and NSEX06). Returns the notices about missing
+    data (list).
 
-    Con `ya_en_seleccion` se asume que la página ya está en la pantalla de
-    selección y se pasa directo a poner mercado e instrumento; si no lo
-    está, se navega con changeProgram.
+    With `already_on_selection` the page is assumed to already be on the
+    selection screen and it goes straight to entering the currency, market
+    and instrument; otherwise it navigates with changeProgram.
     """
-    config = CONFIG_IMPACT[sec.skeleton]
-    d = construir_datos(sec)
+    config = IMPACT_CONFIG[sec.skeleton]
+    d = build_data(sec)
 
-    if not (ya_en_seleccion and _ya_en_seleccion(page)):
-        ir_a_seleccion(page)
-    if config.moneda:
-        poner_valor(page, "ici_selectCurrency", config.moneda)
-    poner_valor(page, "ici_selectMarket", config.mercado)
-    poner_valor(page, "ici_selectInstrument", config.instrumento)
+    if not (already_on_selection and _already_on_selection(page)):
+        go_to_selection(page)
+    if config.currency:
+        set_value(page, "ici_selectCurrency", config.currency)
+    set_value(page, "ici_selectMarket", config.market)
+    set_value(page, "ici_selectInstrument", config.instrument)
     enter(page, "ici_selectInstrument")
-    esperar_pantalla(page, "NSEX02")
+    wait_for_screen(page, "NSEX02")
 
-    llenar(page, campos_nsex02(d))
-    avanzar(page, "NSEX02", "NSEX03", ERRORES_NSEX02, d,
-            campo_ancla="ici_securityName")
+    fill_fields(page, nsex02_fields(d))
+    advance(page, "NSEX02", "NSEX03", NSEX02_ERRORS, d,
+            anchor_field="ici_securityName")
 
-    llenar(page, campos_nsex03(d))
-    avanzar(page, "NSEX03", "NSEX04", ERRORES_NSEX03, d,
-            campo_ancla="ici_informationCommonStrikePrice")
+    fill_fields(page, nsex03_fields(d))
+    advance(page, "NSEX03", "NSEX04", NSEX03_ERRORS, d,
+            anchor_field="ici_informationCommonStrikePrice")
 
-    avanzar(page, "NSEX04", "NSEX05", {}, d)
+    advance(page, "NSEX04", "NSEX05", {}, d)
 
-    esperar_pantalla(page, "NSEX05")
-    if config.llena_nsex05:
-        llenar(page, campos_nsex05(d))
+    wait_for_screen(page, "NSEX05")
+    if config.fills_nsex05:
+        fill_fields(page, nsex05_fields(d))
 
-    if guardado_automatico:
-        guardar_automaticamente(page, d)
+    if auto_save:
+        save_automatically(page, d)
 
-    return d.avisos
+    return d.notices
 
 
 # ============================================================
-# FLUJO
+# FLOW
 # ============================================================
 
-def _etiqueta(sec):
-    isin = sec.filas.get(21)
-    return str(isin) if isin else f"columna {sec.columna}"
+def _label(sec):
+    isin = sec.rows.get(21)
+    return str(isin) if isin else f"column {sec.column}"
 
 
-def procesar_securities_impact(page, securities, guardado_automatico=False):
-    """Da de alta en IMPACT los securities de los skeletons de CONFIG_IMPACT
-    (5/80 y EUR 3/01), uno por uno.
+def process_securities_in_impact(page, securities, auto_save=False):
+    """Create in IMPACT the securities of the skeletons in IMPACT_CONFIG
+    (5/80 and EUR 3/01), one by one.
 
-    Por defecto deja cada uno listo en NSEX05 y espera a que la persona lo
-    guarde a mano. Con `guardado_automatico` da Enter para guardarlo (NSEX05
-    y NSEX06) y sigue con el siguiente sin preguntar. Al final imprime qué
-    securities se tomaron y cuáles no.
+    By default it leaves each one ready on NSEX05 and waits for the person
+    to save it by hand. With `auto_save` it presses Enter to save it (NSEX05
+    and NSEX06) and moves on to the next one without asking. At the end it
+    prints which securities were taken and which were not.
     """
-    resultados = []   # (estado, etiqueta, detalle)
-    pendientes = []
+    results = []   # (status, label, detail)
+    pending = []
 
     for sec in securities:
-        if sec.skeleton not in CONFIG_IMPACT:
-            resultados.append(
-                ("No tomado", _etiqueta(sec),
-                 f"no cumple ningún skeleton ({', '.join(CONFIG_IMPACT)})")
+        if sec.skeleton not in IMPACT_CONFIG:
+            results.append(
+                (NOT_TAKEN, _label(sec),
+                 f"does not meet any skeleton ({', '.join(IMPACT_CONFIG)})")
             )
-        elif sec.bloqueo:
-            resultados.append(("No tomado", _etiqueta(sec), sec.bloqueo))
-        elif not sec.entidades & ENTIDADES_ALTA:
-            entidades = ", ".join(sorted(sec.entidades)) or "sin entidad"
-            resultados.append(
-                ("No tomado", _etiqueta(sec),
-                 f"entidad {entidades}: solo se crean {sorted(ENTIDADES_ALTA)}")
+        elif sec.block_reason:
+            results.append((NOT_TAKEN, _label(sec), sec.block_reason))
+        elif not sec.entities & ENTITIES_TO_CREATE:
+            entities = ", ".join(sorted(sec.entities)) or "no entity"
+            results.append(
+                (NOT_TAKEN, _label(sec),
+                 f"entity {entities}: only {sorted(ENTITIES_TO_CREATE)} are created")
             )
         else:
-            pendientes.append(sec)
+            pending.append(sec)
 
-    terminar = False
-    # Tras guardar un security IMPACT regresa a la pantalla de selección, y
-    # desde ahí ya no hace falta (ni existe) changeProgram.
-    en_seleccion = False
-    for i, sec in enumerate(pendientes, start=1):
-        etiqueta = _etiqueta(sec)
+    stop = False
+    # After saving a security IMPACT goes back to the selection screen, and
+    # from there changeProgram is no longer needed (nor available).
+    on_selection = False
+    for i, sec in enumerate(pending, start=1):
+        label = _label(sec)
 
-        if terminar:
-            resultados.append(("No tomado", etiqueta, "proceso interrumpido"))
+        if stop:
+            results.append((NOT_TAKEN, label, "process interrupted"))
             continue
 
         print()
         print("=" * 60)
-        print(f"IMPACT: security {i} de {len(pendientes)} - {etiqueta} "
+        print(f"IMPACT: security {i} of {len(pending)} - {label} "
               f"[{sec.skeleton}]")
         print("=" * 60)
 
         try:
-            avisos = alta_security(
+            notices = create_security(
                 page,
                 sec,
-                ya_en_seleccion=en_seleccion,
-                guardado_automatico=guardado_automatico,
+                already_on_selection=on_selection,
+                auto_save=auto_save,
             )
 
         except Exception as error:
-            print(f"No se pudo preparar el security: {error}")
-            resultados.append(("Con error", etiqueta, str(error)))
-            en_seleccion = False
+            print(f"The security could not be prepared: {error}")
+            results.append((FAILED, label, str(error)))
+            on_selection = False
             continue
 
-        for aviso in avisos:
-            print(f"Aviso: {aviso}")
+        for notice in notices:
+            print(f"Warning: {notice}")
 
-        if guardado_automatico:
-            print("Security guardado automáticamente.")
-            resultados.append(("Creado (guardado automático)", etiqueta, ""))
-            en_seleccion = True
+        if auto_save:
+            print("Security saved automatically.")
+            results.append((AUTO_SAVED, label, ""))
+            on_selection = True
             continue
 
         print()
-        print("Security listo en NSEX05. Revísalo y guárdalo a mano en IMPACT.")
-        respuesta = input(
-            "Enter = ya lo guardé | o = no lo guardé (omitir) | "
-            "q = terminar: "
+        print("Security ready on NSEX05. Review it and save it by hand in IMPACT.")
+        answer = input(
+            "Enter = I saved it | n = I did not save it (skip) | "
+            "q = quit: "
         ).strip().lower()
 
-        en_seleccion = False
-        if respuesta == "q":
-            resultados.append(("No tomado", etiqueta, "interrumpido por ti"))
-            terminar = True
-        elif respuesta == "o":
-            resultados.append(("Preparado, no guardado", etiqueta, ""))
+        on_selection = False
+        if answer == "q":
+            results.append((NOT_TAKEN, label, "interrupted by you"))
+            stop = True
+        elif answer == "n":
+            results.append((PREPARED, label, ""))
         else:
-            resultados.append(("Guardado (confirmado por ti)", etiqueta, ""))
-            en_seleccion = True
+            results.append((CONFIRMED_SAVED, label, ""))
+            on_selection = True
 
     print()
     print("=" * 60)
-    print("RESUMEN IMPACT")
+    print("IMPACT SUMMARY")
     print("=" * 60)
-    for estado in (
-        "Creado (guardado automático)",
-        "Guardado (confirmado por ti)",
-        "Preparado, no guardado",
-        "Con error",
-        "No tomado",
-    ):
-        grupo = [r for r in resultados if r[0] == estado]
-        if not grupo:
+    for status in (AUTO_SAVED, CONFIRMED_SAVED, PREPARED, FAILED, NOT_TAKEN):
+        group = [r for r in results if r[0] == status]
+        if not group:
             continue
-        print(f"{estado}: {len(grupo)}")
-        for _, etiqueta, detalle in grupo:
-            print(f"  - {etiqueta}" + (f"  ({detalle})" if detalle else ""))
+        print(f"{status}: {len(group)}")
+        for _, label, detail in group:
+            print(f"  - {label}" + (f"  ({detail})" if detail else ""))
 
-    return resultados
+    return results

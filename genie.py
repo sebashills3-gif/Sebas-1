@@ -1,31 +1,35 @@
-"""Pulsa el botón "Perform Sanctions Check" de la aplicación Genie, que ya
-debe estar abierta.
+"""Press the "Perform Sanctions Check" button of the Genie application, which
+must already be open.
 
-Genie (Genie_BOT_IM_x64.exe) tiene una ventana auxiliar "GDI+ Window" y su
-ventana real puede no tener un título que sirva para buscarla, así que se
-buscan todas las ventanas del proceso, sin importar su título.
+Genie (Genie_BOT_IM_x64.exe) has an auxiliary "GDI+ Window" and its real
+window may not have a title that is useful for finding it, so all the windows
+of the process are searched, whatever their title.
 
-Requiere Windows y: pip install pywinauto
-Opcional (respaldo por imagen): pip install pyautogui opencv-python pillow
+Requires Windows and: pip install pywinauto
+Optional (image fallback): pip install pyautogui opencv-python pillow
 """
 
 import re
 import time
 from pathlib import Path
 
-NOMBRE_EXE = "genie_bot_im_x64.exe"
+EXE_NAME = "genie_bot_im_x64.exe"
 
-# En la app el botón se llama "Perfrom Sanctions Check" (con la errata), así
-# que el patrón acepta también "Perform Sanction Check".
-TEXTO_BOTON_RE = r"(?i)per\w+\s+sanction"
+# In the app the button is called "Perfrom Sanctions Check" (with the typo),
+# so the pattern also accepts "Perform Sanction Check".
+BUTTON_TEXT_RE = r"(?i)per\w+\s+sanction"
 
-# Respaldo: recorte de pantalla del botón, junto a este archivo.
-IMAGEN_BOTON = Path(__file__).with_name("boton_sanction_check.png")
-ARCHIVO_DIAGNOSTICO = Path(__file__).with_name("genie_diagnostico.txt")
+# Fallback: a screenshot crop of the button, next to this file. The old
+# Spanish file name is still accepted.
+BUTTON_IMAGES = (
+    Path(__file__).with_name("sanction_check_button.png"),
+    Path(__file__).with_name("boton_sanction_check.png"),
+)
+DIAGNOSTIC_FILE = Path(__file__).with_name("genie_diagnostic.txt")
 
 
-def _exe_del_proceso(pid):
-    """Ruta del ejecutable de un proceso, o '' si no se puede leer."""
+def _process_exe(pid):
+    """Path of a process executable, or '' if it cannot be read."""
     import ctypes
     from ctypes import wintypes
 
@@ -38,135 +42,134 @@ def _exe_del_proceso(pid):
     ]
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
 
-    manejador = kernel.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
-    if not manejador:
+    handle = kernel.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
+    if not handle:
         return ""
     try:
         buffer = ctypes.create_unicode_buffer(1024)
-        tamano = wintypes.DWORD(1024)
+        size = wintypes.DWORD(1024)
         if kernel.QueryFullProcessImageNameW(
-            manejador, 0, buffer, ctypes.byref(tamano)
+            handle, 0, buffer, ctypes.byref(size)
         ):
             return buffer.value
         return ""
     finally:
-        kernel.CloseHandle(manejador)
+        kernel.CloseHandle(handle)
 
 
-def _ventanas_de_genie():
-    """Ventanas de nivel superior del proceso de Genie, por backend."""
+def _genie_windows():
+    """Top-level windows of the Genie process, per backend."""
     from pywinauto import Desktop
 
-    resultado = []
+    result = []
 
     for backend in ("uia", "win32"):
-        for ventana in Desktop(backend=backend).windows():
+        for window in Desktop(backend=backend).windows():
             try:
-                exe = _exe_del_proceso(ventana.process_id())
+                exe = _process_exe(window.process_id())
             except Exception:
                 continue
-            if exe.lower().endswith(NOMBRE_EXE):
-                resultado.append((backend, ventana))
+            if exe.lower().endswith(EXE_NAME):
+                result.append((backend, window))
 
-    return resultado
+    return result
 
 
-def _buscar_boton(ventanas):
-    for _, ventana in ventanas:
+def _find_button(windows_found):
+    for _, window in windows_found:
         try:
-            controles = [ventana] + ventana.descendants()
+            controls = [window] + window.descendants()
         except Exception:
             continue
-        for control in controles:
+        for control in controls:
             try:
-                if re.search(TEXTO_BOTON_RE, control.window_text() or ""):
-                    return control, ventana
+                if re.search(BUTTON_TEXT_RE, control.window_text() or ""):
+                    return control, window
             except Exception:
                 continue
     return None, None
 
 
-def _volcar_diagnostico(ventanas):
-    """Guarda en un archivo las ventanas y controles que ve pywinauto."""
-    lineas = [f"Ventanas de {NOMBRE_EXE}: {len(ventanas)}"]
+def _dump_diagnostic(windows_found):
+    """Save to a file the windows and controls that pywinauto sees."""
+    lines = [f"Windows of {EXE_NAME}: {len(windows_found)}"]
 
-    for backend, ventana in ventanas:
-        lineas.append("")
-        lineas.append(
-            f"[{backend}] ventana: título={ventana.window_text()!r} "
-            f"clase={ventana.friendly_class_name()!r} "
-            f"visible={ventana.is_visible()} rect={ventana.rectangle()}"
+    for backend, window in windows_found:
+        lines.append("")
+        lines.append(
+            f"[{backend}] window: title={window.window_text()!r} "
+            f"class={window.friendly_class_name()!r} "
+            f"visible={window.is_visible()} rect={window.rectangle()}"
         )
         try:
-            for control in ventana.descendants():
-                lineas.append(
-                    f"    clase={control.friendly_class_name()!r} "
-                    f"texto={control.window_text()!r} "
+            for control in window.descendants():
+                lines.append(
+                    f"    class={control.friendly_class_name()!r} "
+                    f"text={control.window_text()!r} "
                     f"rect={control.rectangle()}"
                 )
         except Exception as error:
-            lineas.append(f"    (no se pudieron leer los controles: {error})")
+            lines.append(f"    (could not read the controls: {error})")
 
-    ARCHIVO_DIAGNOSTICO.write_text("\n".join(lineas), encoding="utf-8")
-    return ARCHIVO_DIAGNOSTICO
+    DIAGNOSTIC_FILE.write_text("\n".join(lines), encoding="utf-8")
+    return DIAGNOSTIC_FILE
 
 
-def _click_por_imagen():
-    """Respaldo: busca en pantalla el recorte del botón y le da click."""
-    if not IMAGEN_BOTON.exists():
+def _click_by_image():
+    """Fallback: look for the button crop on screen and click it."""
+    image = next((p for p in BUTTON_IMAGES if p.exists()), None)
+    if image is None:
         return False
 
     import pyautogui
 
     try:
-        posicion = pyautogui.locateCenterOnScreen(
-            str(IMAGEN_BOTON), confidence=0.8
-        )
-    except TypeError:  # sin opencv no existe `confidence`
-        posicion = pyautogui.locateCenterOnScreen(str(IMAGEN_BOTON))
+        position = pyautogui.locateCenterOnScreen(str(image), confidence=0.8)
+    except TypeError:  # without opencv there is no `confidence`
+        position = pyautogui.locateCenterOnScreen(str(image))
 
-    if posicion is None:
+    if position is None:
         return False
 
-    pyautogui.click(posicion)
+    pyautogui.click(position)
     return True
 
 
-def hacer_click_sanction_check(timeout_s=30, pausa_s=2):
-    """Busca el botón en las ventanas de Genie y le da click.
+def click_sanction_check(timeout_s=30, pause_s=2):
+    """Find the button in the Genie windows and click it.
 
-    Reintenta durante `timeout_s` segundos por si la ventana tarda en
-    aparecer. Si no lo encuentra, prueba el respaldo por imagen (si existe
-    boton_sanction_check.png) y, si tampoco, guarda un diagnóstico y lanza
-    RuntimeError.
+    It retries for `timeout_s` seconds in case the window takes a while to
+    appear. If it cannot find it, it tries the image fallback (if
+    sanction_check_button.png exists) and, failing that, saves a diagnostic
+    and raises RuntimeError.
     """
-    inicio = time.time()
+    start_time = time.time()
 
     while True:
-        ventanas = _ventanas_de_genie()
-        boton, ventana = _buscar_boton(ventanas)
+        windows_found = _genie_windows()
+        button, window = _find_button(windows_found)
 
-        if boton is not None:
+        if button is not None:
             try:
-                ventana.set_focus()
+                window.set_focus()
             except Exception:
                 pass
-            boton.click_input()
-            print("Click en 'Perform Sanctions Check' realizado.")
+            button.click_input()
+            print("Clicked 'Perform Sanctions Check'.")
             return
 
-        if time.time() - inicio >= timeout_s:
+        if time.time() - start_time >= timeout_s:
             break
-        time.sleep(pausa_s)
+        time.sleep(pause_s)
 
-    if _click_por_imagen():
-        print("Click en 'Perform Sanctions Check' realizado (por imagen).")
+    if _click_by_image():
+        print("Clicked 'Perform Sanctions Check' (by image).")
         return
 
-    mensaje = "No se encontró el botón 'Perform Sanctions Check' en Genie."
-    if ventanas:
-        archivo = _volcar_diagnostico(ventanas)
-        mensaje += f" Diagnóstico guardado en: {archivo}"
+    message = "Could not find the 'Perform Sanctions Check' button in Genie."
+    if windows_found:
+        diagnostic = _dump_diagnostic(windows_found)
+        message += f" Diagnostic saved to: {diagnostic}"
     else:
-        mensaje += f" No hay ventanas visibles del proceso {NOMBRE_EXE}."
-    raise RuntimeError(mensaje)
+        message += f" There are no visible windows of the {EXE_NAME} process."
+    raise RuntimeError(message)
