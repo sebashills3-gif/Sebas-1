@@ -247,7 +247,7 @@ def formatear_celdas(sec):
 
 
 # ============================================================
-# SKELETON 5/80
+# TRANSFORMACIONES ESPECÍFICAS DE 5/80 (y de EUR 3/01, que las reutiliza)
 # ============================================================
 
 _FRACCION_MIXTA = re.compile(r"(?<![\d/.])(\d+)\s+(\d+)/(\d+)(?![\d/])")
@@ -341,27 +341,41 @@ class Skeleton:
         return cumple and no_excluido and sin_combinacion
 
 
+# Identificación compartida por los skeletons de bonos corporativos de tasa
+# fija; cada uno solo cambia la moneda (CRNCY).
+_FILTRO_CORP_FIJO = {
+    IS_UNIT_TRADED: "N",
+    CPN_TYP: "FIXED",
+    MARKET_SECTOR_DES: "Corp",
+    SINKABLE: "N",
+}
+
+# Con cualquiera de estos valores (aunque venga solo) no es un skeleton de
+# estos. Un valor vacío sí pasa.
+_EXCLUSIONES_CORP_FIJO = {
+    SECURITY_TYP: "US DOMESTIC",
+    COLLAT_TYP: ["CERT OF DEPOSIT", "COVERED"],
+    TYPE_OF_BOND: ["Convertible", "Covered"],
+}
+
+_TRANSFORMACIONES_CORP_FIJO = [
+    cupon_fraccion_a_decimal,
+    perpetuo_a_vencimiento,
+]
+
 SKELETONS = [
     Skeleton(
         nombre="5/80",
-        filtro={
-            IS_UNIT_TRADED: "N",
-            CPN_TYP: "FIXED",
-            CRNCY: "USD",
-            MARKET_SECTOR_DES: "Corp",
-            SINKABLE: "N",
-        },
-        # Con cualquiera de estos valores (aunque venga solo) no es 5/80. Un
-        # valor vacío sí pasa.
-        excluye={
-            SECURITY_TYP: "US DOMESTIC",
-            COLLAT_TYP: ["CERT OF DEPOSIT", "COVERED"],
-            TYPE_OF_BOND: ["Convertible", "Covered"],
-        },
-        transformaciones=[
-            cupon_fraccion_a_decimal,
-            perpetuo_a_vencimiento,
-        ],
+        filtro={**_FILTRO_CORP_FIJO, CRNCY: "USD"},
+        excluye=_EXCLUSIONES_CORP_FIJO,
+        transformaciones=_TRANSFORMACIONES_CORP_FIJO,
+    ),
+    # EUR 3/01: moneda EUR, mercado 3, instrumento 01.
+    Skeleton(
+        nombre="EUR 3/01",
+        filtro={**_FILTRO_CORP_FIJO, CRNCY: "EUR"},
+        excluye=_EXCLUSIONES_CORP_FIJO,
+        transformaciones=_TRANSFORMACIONES_CORP_FIJO,
     ),
 ]
 

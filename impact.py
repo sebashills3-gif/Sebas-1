@@ -16,9 +16,24 @@ PROGRAMA = ("NSEX", "HBSI", "")
 # Solo se CREAN los securities de estas entidades; los demás se corren en
 # todo el flujo previo pero no se dan de alta.
 ENTIDADES_ALTA = {"HBSI"}
-MERCADO = "5"
-INSTRUMENTO = "80"
-SKELETON = "5/80"
+
+
+@dataclass(frozen=True)
+class ConfigImpact:
+    """Cómo se da de alta en IMPACT cada skeleton."""
+    mercado: str
+    instrumento: str
+    moneda: str = None          # casilla ici_selectCurrency; None = no se toca
+    llena_nsex05: bool = True   # False: en NSEX05 no se captura nada
+
+
+# Skeletons que sabe crear IMPACT (el nombre es el de skeletons.SKELETONS).
+CONFIG_IMPACT = {
+    "5/80": ConfigImpact(mercado="5", instrumento="80"),
+    "EUR 3/01": ConfigImpact(
+        mercado="3", instrumento="01", moneda="EUR", llena_nsex05=False
+    ),
+}
 
 PAUSA_TRAS_ENTER_S = 1.5
 MAX_ENTER_POR_PANTALLA = 12
@@ -452,21 +467,24 @@ def guardar_automaticamente(page, d):
         avanzar(page, "NSEX06", "SELECCION", {}, d)
 
 
-def alta_5_80(page, sec, ya_en_seleccion=False, guardado_automatico=False):
-    """Llena NSEX02 a NSEX05 para un security 5/80 y deja la última pantalla
-    sin guardar (o, con `guardado_automatico`, la guarda dando Enter en NSEX05
+def alta_security(page, sec, ya_en_seleccion=False, guardado_automatico=False):
+    """Llena NSEX02 a NSEX05 para un security de un skeleton de CONFIG_IMPACT
+    y deja la última pantalla sin guardar (o, con `guardado_automatico`, la guarda dando Enter en NSEX05
     y NSEX06). Devuelve los avisos de datos faltantes (lista).
 
     Con `ya_en_seleccion` se asume que la página ya está en la pantalla de
     selección y se pasa directo a poner mercado e instrumento; si no lo
     está, se navega con changeProgram.
     """
+    config = CONFIG_IMPACT[sec.skeleton]
     d = construir_datos(sec)
 
     if not (ya_en_seleccion and _ya_en_seleccion(page)):
         ir_a_seleccion(page)
-    poner_valor(page, "ici_selectMarket", MERCADO)
-    poner_valor(page, "ici_selectInstrument", INSTRUMENTO)
+    if config.moneda:
+        poner_valor(page, "ici_selectCurrency", config.moneda)
+    poner_valor(page, "ici_selectMarket", config.mercado)
+    poner_valor(page, "ici_selectInstrument", config.instrumento)
     enter(page, "ici_selectInstrument")
     esperar_pantalla(page, "NSEX02")
 
@@ -481,7 +499,8 @@ def alta_5_80(page, sec, ya_en_seleccion=False, guardado_automatico=False):
     avanzar(page, "NSEX04", "NSEX05", {}, d)
 
     esperar_pantalla(page, "NSEX05")
-    llenar(page, campos_nsex05(d))
+    if config.llena_nsex05:
+        llenar(page, campos_nsex05(d))
 
     if guardado_automatico:
         guardar_automaticamente(page, d)
@@ -499,7 +518,8 @@ def _etiqueta(sec):
 
 
 def procesar_securities_impact(page, securities, guardado_automatico=False):
-    """Da de alta los securities 5/80 en IMPACT, uno por uno.
+    """Da de alta en IMPACT los securities de los skeletons de CONFIG_IMPACT
+    (5/80 y EUR 3/01), uno por uno.
 
     Por defecto deja cada uno listo en NSEX05 y espera a que la persona lo
     guarde a mano. Con `guardado_automatico` da Enter para guardarlo (NSEX05
@@ -510,9 +530,10 @@ def procesar_securities_impact(page, securities, guardado_automatico=False):
     pendientes = []
 
     for sec in securities:
-        if sec.skeleton != SKELETON:
+        if sec.skeleton not in CONFIG_IMPACT:
             resultados.append(
-                ("No tomado", _etiqueta(sec), f"no cumple el skeleton {SKELETON}")
+                ("No tomado", _etiqueta(sec),
+                 f"no cumple ningún skeleton ({', '.join(CONFIG_IMPACT)})")
             )
         elif sec.bloqueo:
             resultados.append(("No tomado", _etiqueta(sec), sec.bloqueo))
@@ -538,11 +559,12 @@ def procesar_securities_impact(page, securities, guardado_automatico=False):
 
         print()
         print("=" * 60)
-        print(f"IMPACT: security {i} de {len(pendientes)} - {etiqueta}")
+        print(f"IMPACT: security {i} de {len(pendientes)} - {etiqueta} "
+              f"[{sec.skeleton}]")
         print("=" * 60)
 
         try:
-            avisos = alta_5_80(
+            avisos = alta_security(
                 page,
                 sec,
                 ya_en_seleccion=en_seleccion,
