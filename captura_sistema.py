@@ -876,9 +876,9 @@ def solo_setup(page):
 def mostrar_menu():
     print()
     print("=" * 60)
-    print("¿QUÉ QUIERES HACER AHORA?")
+    print("¿QUÉ QUIERES HACER?")
     print("=" * 60)
-    print("1 - Repetir todo el proceso")
+    print("1 - Todo el proceso")
     print("2 - Todo el proceso sin chequeo manual (IMPACT guarda solo)")
     print("3 - Solo extracción: capturas y Excel filtrados")
     print("4 - Desde BLOOMBOT: Sanctions y creación (elige el Excel filtrado)")
@@ -916,32 +916,8 @@ def main():
         print()
         print("1. Introduce tus credenciales manualmente en Chrome.")
         print("2. Completa MFA si el sistema lo solicita.")
-        print("3. Navega hasta la primera página de la tabla.")
-        print("4. Asegúrate de que la tabla esté visible.")
-        print("5. Regresa a esta consola y pulsa Enter.")
+        print("3. Regresa a esta consola y pulsa Enter para ver el menú.")
         input()
-
-        if not tabla_visible(page):
-            print()
-            print(
-                "No se detectó la tabla con "
-                "'External Trade ID'."
-            )
-            print(
-                "Comprueba que estás en la pantalla correcta."
-            )
-
-            respuesta = input(
-                "¿Quieres continuar de todos modos? (s/n): "
-            ).strip().lower()
-
-            if respuesta != "s":
-                print("Proceso cancelado.")
-                context.close()
-                raise SystemExit(0)
-
-        # Primera corrida: todo el proceso, con chequeo manual en IMPACT
-        proceso_completo(page)
 
         while True:
             mostrar_menu()
