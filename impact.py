@@ -1,5 +1,5 @@
 """Creation of securities in IMPACT (screens NSEX02 to NSEX05) for the
-skeletons listed in IMPACT_CONFIG (5/80 and EUR 3/01).
+skeletons listed in IMPACT_CONFIG (5/80, EUR 3/01 and 8/04).
 
 For each security: navigate with changeProgram (the first time), choose the
 market and instrument of its skeleton, fill the screens with the already
@@ -33,6 +33,7 @@ class ImpactConfig:
 # skeletons.SKELETONS).
 IMPACT_CONFIG = {
     "5/80": ImpactConfig(market="5", instrument="80"),
+    "8/04": ImpactConfig(market="8", instrument="04"),
     "EUR 3/01": ImpactConfig(
         market="3", instrument="01", currency="EUR", fills_nsex05=False
     ),
@@ -530,7 +531,7 @@ def _label(sec):
 
 def process_securities_in_impact(page, securities, auto_save=False):
     """Create in IMPACT the securities of the skeletons in IMPACT_CONFIG
-    (5/80 and EUR 3/01), one by one.
+    (5/80, EUR 3/01 and 8/04), one by one.
 
     By default it leaves each one ready on NSEX05 and waits for the person
     to save it by hand. With `auto_save` it presses Enter to save it (NSEX05

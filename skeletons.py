@@ -250,7 +250,7 @@ def format_cells(sec):
 
 
 # ============================================================
-# SPECIFIC TRANSFORMATIONS OF 5/80 (and of EUR 3/01, which reuses them)
+# SPECIFIC TRANSFORMATIONS OF 5/80 (reused by EUR 3/01 and 8/04)
 # ============================================================
 
 _MIXED_FRACTION = re.compile(r"(?<![\d/.])(\d+)\s+(\d+)/(\d+)(?![\d/])")
@@ -346,24 +346,23 @@ class Skeleton:
         return meets and not_excluded and no_combination
 
 
-# Identification shared by the fixed-rate corporate bond skeletons; each one
-# only changes the currency (CRNCY).
-_FIXED_CORP_CRITERIA = {
+# Identification shared by the fixed-rate bond skeletons; each one only
+# changes the market sector (MARKET_SECTOR_DES) and the currency (CRNCY).
+_FIXED_RATE_CRITERIA = {
     IS_UNIT_TRADED: "N",
     CPN_TYP: "FIXED",
-    MARKET_SECTOR_DES: "Corp",
     SINKABLE: "N",
 }
 
 # With any of these values (even if it comes alone) the security is not one
 # of these skeletons. An empty value does pass.
-_FIXED_CORP_EXCLUSIONS = {
+_FIXED_RATE_EXCLUSIONS = {
     SECURITY_TYP: "US DOMESTIC",
     COLLAT_TYP: ["CERT OF DEPOSIT", "COVERED"],
     TYPE_OF_BOND: ["Convertible", "Covered"],
 }
 
-_FIXED_CORP_TRANSFORMATIONS = [
+_FIXED_RATE_TRANSFORMATIONS = [
     coupon_fraction_to_decimal,
     perpetual_to_maturity,
 ]
@@ -371,16 +370,29 @@ _FIXED_CORP_TRANSFORMATIONS = [
 SKELETONS = [
     Skeleton(
         name="5/80",
-        criteria={**_FIXED_CORP_CRITERIA, CRNCY: "USD"},
-        excludes=_FIXED_CORP_EXCLUSIONS,
-        transformations=_FIXED_CORP_TRANSFORMATIONS,
+        criteria={
+            **_FIXED_RATE_CRITERIA, MARKET_SECTOR_DES: "Corp", CRNCY: "USD",
+        },
+        excludes=_FIXED_RATE_EXCLUSIONS,
+        transformations=_FIXED_RATE_TRANSFORMATIONS,
     ),
     # EUR 3/01: currency EUR, market 3, instrument 01.
     Skeleton(
         name="EUR 3/01",
-        criteria={**_FIXED_CORP_CRITERIA, CRNCY: "EUR"},
-        excludes=_FIXED_CORP_EXCLUSIONS,
-        transformations=_FIXED_CORP_TRANSFORMATIONS,
+        criteria={
+            **_FIXED_RATE_CRITERIA, MARKET_SECTOR_DES: "Corp", CRNCY: "EUR",
+        },
+        excludes=_FIXED_RATE_EXCLUSIONS,
+        transformations=_FIXED_RATE_TRANSFORMATIONS,
+    ),
+    # 8/04: same as 5/80 but for government bonds (Govt instead of Corp).
+    Skeleton(
+        name="8/04",
+        criteria={
+            **_FIXED_RATE_CRITERIA, MARKET_SECTOR_DES: "Govt", CRNCY: "USD",
+        },
+        excludes=_FIXED_RATE_EXCLUSIONS,
+        transformations=_FIXED_RATE_TRANSFORMATIONS,
     ),
 ]
 
