@@ -3,22 +3,23 @@
 * Choose the base Excel with a file picker.
 * Create the folder for the run that starts at BLOOMBOT.
 * Rebuild, from an existing evidence folder, everything needed for the
-  securities set up in IMPACT (BLOOMBOT XLS, filtered Excel with the
-  entities and Sanctions Check PDF).
+  securities set up in IMPACT (BLOOMBOT XLS and Sanctions Check PDF). In
+  this mode every security is assumed to belong to HBSI, so the filtered
+  Excel is not needed.
 """
 
 import shutil
 from datetime import datetime
 from pathlib import Path
 
-from bloombot import get_codes
 from prestaging import read_xls_matrix
 from sanctions_pdf import verify_securities
-from skeletons import process_matrix
+from skeletons import build_securities, process_matrix
 
 FILTERED_NAME = "TUR_requests_filtered.xlsx"
-# Name used by earlier versions; still accepted when reading old folders.
-LEGACY_FILTERED_NAME = "TUR_requests_filtrados.xlsx"
+
+# Entity assumed for every security in the "setup only" mode.
+ASSUMED_ENTITY = "HBSI"
 
 
 # ============================================================
@@ -91,30 +92,20 @@ def _most_recent(paths):
     return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
 
 
-def _find_filtered(folder):
-    """The filtered Excel of a folder (current or legacy name), or None."""
-    for name in (FILTERED_NAME, LEGACY_FILTERED_NAME):
-        candidate = folder / name
-        if candidate.exists():
-            return candidate
-    return None
-
-
 def locate_files(file_path):
     """From the chosen file, look in its folder for what is needed.
 
-    You can choose the BLOOMBOT XLS (GIMP*.xls) or the TUR filtered Excel.
-    Returns {"folder", "xls", "filtered", "pdfs"}; whatever is not found is
-    None (or an empty list).
+    You can choose the BLOOMBOT XLS (GIMP*.xls) or any other Excel of the
+    folder (then the most recent GIMP*.xls of that folder is used). Returns
+    {"folder", "xls", "pdfs"}; whatever is not found is None (or an empty
+    list).
     """
     file_path = Path(file_path)
     folder = file_path.parent
 
     if file_path.suffix.lower() == ".xls":
         xls = file_path
-        filtered = _find_filtered(folder)
     else:
-        filtered = file_path
         xls = _most_recent(
             p for p in folder.iterdir()
             if p.suffix.lower() == ".xls" and p.name.upper().startswith("GIMP")
@@ -127,18 +118,17 @@ def locate_files(file_path):
     return {
         "folder": folder,
         "xls": xls,
-        "filtered": filtered,
         "pdfs": [pdf] if pdf else [],
     }
 
 
 def prepare_setup(file_path):
     """Rebuild the securities ready for IMPACT from an evidence folder: read
-    the BLOOMBOT XLS, classify, assign entities with the filtered Excel and
-    check the Sanctions Check PDF.
+    the BLOOMBOT XLS, classify, assume every security is HBSI and check the
+    Sanctions Check PDF.
 
-    Returns (securities, folder). Raises RuntimeError if something essential
-    is missing.
+    Returns (securities, folder). Raises RuntimeError if the BLOOMBOT XLS
+    cannot be found.
     """
     files = locate_files(file_path)
     folder = files["folder"]
@@ -147,23 +137,18 @@ def prepare_setup(file_path):
         raise RuntimeError(
             f"Could not find the BLOOMBOT XLS (GIMP*.xls) in {folder}."
         )
-    if files["filtered"] is None:
-        raise RuntimeError(
-            f"Could not find {FILTERED_NAME} in {folder}; it is needed to "
-            "know the entity of each security."
-        )
 
     print()
     print(f"Base folder: {folder}")
     print(f"BLOOMBOT XLS: {files['xls'].name}")
-    print(f"Filtered Excel: {files['filtered'].name}")
     print(
         "Sanctions PDF: "
         + (files["pdfs"][0].name if files["pdfs"] else "(none)")
     )
+    print(f"Every security is assumed to belong to {ASSUMED_ENTITY}.")
 
     matrix = read_xls_matrix(files["xls"])
-    _, _, entities = get_codes(files["filtered"])
+    entities = [{ASSUMED_ENTITY} for _ in build_securities(matrix)]
 
     securities = process_matrix(matrix, folder, entities)
     verify_securities(files["pdfs"], matrix, securities, folder)

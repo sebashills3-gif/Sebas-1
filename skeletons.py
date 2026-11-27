@@ -32,6 +32,7 @@ SECURITY_DES = 15
 SECURITY_TYP = 8
 COLLAT_TYP = 9
 TYPE_OF_BOND = 10
+CALC_TYP_DES = 13
 MATURITY_ROW = 19
 DAY_COUNT_ROW = 20
 ID_ISIN = 21
@@ -50,6 +51,7 @@ EXPECTED_MNEMONICS = {
     SECURITY_TYP: "SECURITY_TYP",
     COLLAT_TYP: "COLLAT_TYP",
     TYPE_OF_BOND: "TYPE_OF_BOND",
+    CALC_TYP_DES: "CALC_TYP_DES",
     SECURITY_DES: "SECURITY_DES",
     MATURITY_ROW: "MATURITY",
     DAY_COUNT_ROW: "DAY_CNT_DES",
@@ -311,6 +313,25 @@ def perpetual_to_maturity(sec):
         )
 
 
+@dataclass(frozen=True)
+class Contains:
+    """Criteria value: the cell text must contain `text` somewhere."""
+    text: str
+
+
+def _meets(sec, criteria):
+    """True if the security meets every (row -> expected) of `criteria`.
+    An expected value is an exact text or a Contains(...)."""
+    for row, expected in criteria.items():
+        actual = sec.text(row).upper()
+        if isinstance(expected, Contains):
+            if expected.text.upper() not in actual:
+                return False
+        elif actual != expected.upper():
+            return False
+    return True
+
+
 @dataclass
 class Skeleton:
     name: str
@@ -321,11 +342,14 @@ class Skeleton:
     # Forbidden combinations: each dict (row -> value) excludes the security
     # only if it meets ALL of its conditions at once.
     excluded_combinations: list = field(default_factory=list)
+    # Alternative ways to meet the criteria: each dict is a full set of
+    # criteria; meeting `criteria` OR any variant identifies the skeleton.
+    # The exclusions apply to all of them.
+    variants: list = field(default_factory=list)
 
     def matches(self, sec):
-        meets = all(
-            sec.text(row).upper() == expected.upper()
-            for row, expected in self.criteria.items()
+        meets = _meets(sec, self.criteria) or any(
+            _meets(sec, variant) for variant in self.variants
         )
         not_excluded = all(
             sec.text(row).upper() not in {
@@ -354,6 +378,14 @@ _FIXED_RATE_CRITERIA = {
     SINKABLE: "N",
 }
 
+# A floating-rate bond (CPN_TYP = VARIABLE) whose CALC_TYP_DES contains FIX
+# is treated as fixed. Both conditions are required.
+_VARIABLE_BUT_FIX_CRITERIA = {
+    **_FIXED_RATE_CRITERIA,
+    CPN_TYP: "VARIABLE",
+    CALC_TYP_DES: Contains("FIX"),
+}
+
 # With any of these values (even if it comes alone) the security is not one
 # of these skeletons. An empty value does pass.
 _FIXED_RATE_EXCLUSIONS = {
@@ -362,38 +394,44 @@ _FIXED_RATE_EXCLUSIONS = {
     TYPE_OF_BOND: ["Convertible", "Covered"],
 }
 
+# Government bonds: same exclusions, except US DOMESTIC (it is normal for a
+# US government bond).
+_GOVT_EXCLUSIONS = {
+    key: value for key, value in _FIXED_RATE_EXCLUSIONS.items()
+    if key != SECURITY_TYP
+}
+
 _FIXED_RATE_TRANSFORMATIONS = [
     coupon_fraction_to_decimal,
     perpetual_to_maturity,
 ]
 
-SKELETONS = [
-    Skeleton(
-        name="5/80",
-        criteria={
-            **_FIXED_RATE_CRITERIA, MARKET_SECTOR_DES: "Corp", CRNCY: "USD",
-        },
-        excludes=_FIXED_RATE_EXCLUSIONS,
+
+def _fixed_rate_skeleton(name, sector, currency, excludes, variants=()):
+    """A fixed-rate skeleton for a market sector and a currency."""
+    sector_and_currency = {MARKET_SECTOR_DES: sector, CRNCY: currency}
+    return Skeleton(
+        name=name,
+        criteria={**_FIXED_RATE_CRITERIA, **sector_and_currency},
+        excludes=excludes,
         transformations=_FIXED_RATE_TRANSFORMATIONS,
+        variants=[{**v, **sector_and_currency} for v in variants],
+    )
+
+
+SKELETONS = [
+    _fixed_rate_skeleton(
+        "5/80", "Corp", "USD", _FIXED_RATE_EXCLUSIONS,
+        variants=[_VARIABLE_BUT_FIX_CRITERIA],
     ),
     # EUR 3/01: currency EUR, market 3, instrument 01.
-    Skeleton(
-        name="EUR 3/01",
-        criteria={
-            **_FIXED_RATE_CRITERIA, MARKET_SECTOR_DES: "Corp", CRNCY: "EUR",
-        },
-        excludes=_FIXED_RATE_EXCLUSIONS,
-        transformations=_FIXED_RATE_TRANSFORMATIONS,
+    _fixed_rate_skeleton(
+        "EUR 3/01", "Corp", "EUR", _FIXED_RATE_EXCLUSIONS,
+        variants=[_VARIABLE_BUT_FIX_CRITERIA],
     ),
-    # 8/04: same as 5/80 but for government bonds (Govt instead of Corp).
-    Skeleton(
-        name="8/04",
-        criteria={
-            **_FIXED_RATE_CRITERIA, MARKET_SECTOR_DES: "Govt", CRNCY: "USD",
-        },
-        excludes=_FIXED_RATE_EXCLUSIONS,
-        transformations=_FIXED_RATE_TRANSFORMATIONS,
-    ),
+    # 8/04: same as 5/80 but for government bonds (Govt instead of Corp) and
+    # without the US DOMESTIC exclusion.
+    _fixed_rate_skeleton("8/04", "Govt", "USD", _GOVT_EXCLUSIONS),
 ]
 
 

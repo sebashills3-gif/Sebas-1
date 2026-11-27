@@ -847,7 +847,7 @@ def setup_only(page):
     evidence folder."""
 
     excel_file = choose_file(
-        "Choose the base Excel (BLOOMBOT XLS GIMP*.xls or the filtered Excel)"
+        "Choose the BLOOMBOT XLS (GIMP*.xls)"
     )
 
     if excel_file is None:
@@ -885,7 +885,7 @@ def show_menu():
     print("2 - Full process without manual check (IMPACT saves by itself)")
     print("3 - Extraction only: screenshots and filtered Excel files")
     print("4 - From BLOOMBOT: Sanctions and creation (choose the filtered Excel)")
-    print("5 - Securities set up in IMPACT only (choose the base Excel)")
+    print("5 - Securities set up in IMPACT only (choose the GIMP XLS; assumes HBSI)")
     print("6 - Close the process")
 
 
